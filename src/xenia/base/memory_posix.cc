@@ -117,8 +117,9 @@ PageAccess ToXeniaProtectFlags(const char* protection) {
 bool IsWritableExecutableMemorySupported() {
 #if XE_PLATFORM_APPLE
 #if XE_PLATFORM_IOS
-  // iOS app builds don't have MAP_JIT entitlement in this project setup.
-  // Force the code cache to use the dual-mapping path.
+  // Plain anonymous RWX mappings can appear to succeed on iOS 18.5 while still
+  // producing non-executable guest code pages at runtime. Keep using the
+  // explicit iOS JIT paths in A64CodeCache instead of preferring direct RWX.
   return false;
 #else
   static const bool supported = []() {
