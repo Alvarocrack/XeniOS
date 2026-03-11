@@ -64,16 +64,12 @@
             </array>
         </dict>
     </array>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSSupportsGameMode</key>
-    <true/>
-    <key>LSSupportsOpeningDocumentsInPlace</key>
-    <true/>
-    <key>LSApplicationQueriesSchemes</key>
-    <array>
-        <string>stikjit</string>
-    </array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
     <key>UIApplicationSceneManifest</key>
     <dict>
         <key>UIApplicationSupportsMultipleScenes</key>
