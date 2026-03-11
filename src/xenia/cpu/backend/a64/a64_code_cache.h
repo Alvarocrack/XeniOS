@@ -128,10 +128,11 @@ class A64CodeCache : public CodeCache {
 #else
   static const uintptr_t kIndirectionTableBase = 0x80000000;
 #endif
-  // The code range is 512MB, but we know the total code games will have is
-  // pretty small (dozens of mb at most) and our expansion is reasonablish
-  // so 256MB should be more than enough.
-  static const size_t kGeneratedCodeSize = 0x0FFFFFFF;
+  // iOS 18 single-view W^X publishing may need to isolate each emitted
+  // function onto a fresh page, which increases cache pressure substantially.
+  // Keep ample headroom so larger titles don't exhaust the code cache during
+  // early boot.
+  static const size_t kGeneratedCodeSize = 0x3FFFFFFF;
   static const uintptr_t kGeneratedCodeExecuteBase = 0xA0000000;
   // Used for writing when PageAccess::kExecuteReadWrite is not supported.
   static const uintptr_t kGeneratedCodeWriteBase =
@@ -140,7 +141,7 @@ class A64CodeCache : public CodeCache {
   // This is picked to be high enough to cover whatever we can reasonably
   // expect. If we hit issues with this it probably means some corner case
   // in analysis triggering.
-  static const size_t kMaximumFunctionCount = 100000;
+  static const size_t kMaximumFunctionCount = 250000;
 
   struct UnwindReservation {
     size_t data_size = 0;

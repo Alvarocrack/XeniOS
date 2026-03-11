@@ -334,9 +334,10 @@ X_STATUS Emulator::Setup(
 #if XE_PLATFORM_IOS
     const bool cs_debugged = IsIOSCsDebugged();
     const bool can_map_exec = CanMapIOSExecutePage();
-    // Use executable-memory probing as the authoritative runtime capability
-    // signal instead of hard-coding OS-version policy.
-    const bool jit_available = can_map_exec;
+    // On current iOS sideload flows, a bare RX mapping probe is not enough to
+    // prove guest JIT execution will work. Require a debugger/JIT-enabled
+    // process state as well to avoid booting games into a black screen.
+    const bool jit_available = cs_debugged && can_map_exec;
     if (!jit_available) {
       XELOGW(
           "JIT is not available. Games will not run.\n"
