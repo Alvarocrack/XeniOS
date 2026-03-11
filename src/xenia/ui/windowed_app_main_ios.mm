@@ -190,10 +190,11 @@ static void xe_add_jit_ring_pulse(CALayer* layer, NSString* key, CGFloat end_sca
 // flow without debugger attachment. iOS 26+ requires debugger/broker state.
 // ---------------------------------------------------------------------------
 static BOOL xe_check_jit_available(void) {
-  if (xe_ios_requires_debugger_broker()) {
-    return xe_is_cs_debugged() && xe_can_mmap_exec_page();
-  }
-  return xe_can_mmap_exec_page();
+  // A plain RX mmap probe can succeed on iOS 18.5 while guest JIT execution is
+  // still unavailable. Treat debugger/JIT-enabled process state as part of the
+  // runtime readiness check so the launcher automation doesn't produce false
+  // positives.
+  return xe_is_cs_debugged() && xe_can_mmap_exec_page();
 }
 
 static std::filesystem::path xe_get_ios_documents_path() {
@@ -531,6 +532,11 @@ enum class IOSConfigControlType {
   kAction,
 };
 
+enum class IOSConfigStorage {
+  kConfigVar,
+  kUserDefaults,
+};
+
 enum class IOSConfigAction {
   kNone,
   kViewRecentLog,
@@ -546,6 +552,7 @@ struct IOSConfigItem {
   std::string title;
   std::string subtitle;
   IOSConfigControlType control_type = IOSConfigControlType::kToggle;
+  IOSConfigStorage storage = IOSConfigStorage::kConfigVar;
   bool bool_value = false;
   int64_t choice_value = 0;
   std::string string_value;
@@ -570,11 +577,22 @@ static constexpr IOSFocusNodeId kInGameFocusSettings = 102;
 static constexpr IOSFocusNodeId kInGameFocusLog = 103;
 static constexpr IOSFocusNodeId kInGameFocusExit = 104;
 
+static NSString* const kXeniaAutoOpenStikDebugOnLaunchPreferenceKey =
+    @"ios_auto_open_stikdebug_on_launch";
+static NSString* const kXeniaLastAutoStikDebugAttemptTimestampPreferenceKey =
+    @"ios_last_auto_stikdebug_attempt_timestamp";
+
+constexpr NSTimeInterval kXeniaAutoStikDebugCooldownSeconds = 10.0;
+
 uint64_t GetNowMs() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
+}
+
+NSTimeInterval GetUnixTimeSeconds() {
+  return [[NSDate date] timeIntervalSince1970];
 }
 
 int16_t ToThumbAxis(float value) {
@@ -612,6 +630,19 @@ NSString* DecodeURLComponent(NSString* value) {
     return decoded;
   }
   return value;
+}
+
+static NSURL* xe_stikdebug_enable_jit_url_for_bundle_identifier(NSString* bundle_identifier) {
+  if (!bundle_identifier || bundle_identifier.length == 0) {
+    return nil;
+  }
+  NSURLComponents* components = [[[NSURLComponents alloc] init] autorelease];
+  components.scheme = @"stikjit";
+  components.host = @"enable-jit";
+  components.queryItems = @[
+    [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundle_identifier]
+  ];
+  return components.URL;
 }
 
 bool BuildLaunchPathFromURLValue(NSString* value,
@@ -751,6 +782,42 @@ bool ParseInt64String(const std::string& text, int64_t* value_out) {
   return true;
 }
 
+NSUserDefaults* GetUserDefaults() { return [NSUserDefaults standardUserDefaults]; }
+
+bool GetUserDefaultBool(NSString* key, bool fallback) {
+  if (!key || key.length == 0) {
+    return fallback;
+  }
+  if (![GetUserDefaults() objectForKey:key]) {
+    return fallback;
+  }
+  return [GetUserDefaults() boolForKey:key];
+}
+
+double GetUserDefaultDouble(NSString* key, double fallback) {
+  if (!key || key.length == 0) {
+    return fallback;
+  }
+  if (![GetUserDefaults() objectForKey:key]) {
+    return fallback;
+  }
+  return [GetUserDefaults() doubleForKey:key];
+}
+
+void SetUserDefaultBool(NSString* key, bool value) {
+  if (!key || key.length == 0) {
+    return;
+  }
+  [GetUserDefaults() setBool:value forKey:key];
+}
+
+void SetUserDefaultDouble(NSString* key, double value) {
+  if (!key || key.length == 0) {
+    return;
+  }
+  [GetUserDefaults() setDouble:value forKey:key];
+}
+
 bool SetConfigVarBool(const std::string& key, bool value) {
   cvar::IConfigVar* var = GetConfigVar(key);
   if (!var) {
@@ -807,6 +874,22 @@ void AddBoolSetting(std::vector<IOSConfigItem>& items, const std::string& key,
   item.control_type = IOSConfigControlType::kToggle;
   item.bool_value = fallback;
   ParseBoolString(GetConfigVarString(key, fallback ? "true" : "false"), &item.bool_value);
+  items.push_back(std::move(item));
+}
+
+void AddUserDefaultBoolSetting(std::vector<IOSConfigItem>& items, NSString* key,
+                               const std::string& title,
+                               const std::string& subtitle, bool fallback) {
+  if (!key || key.length == 0) {
+    return;
+  }
+  IOSConfigItem item;
+  item.key = std::string([key UTF8String]);
+  item.title = title;
+  item.subtitle = subtitle;
+  item.control_type = IOSConfigControlType::kToggle;
+  item.storage = IOSConfigStorage::kUserDefaults;
+  item.bool_value = GetUserDefaultBool(key, fallback);
   items.push_back(std::move(item));
 }
 
@@ -3144,6 +3227,21 @@ std::vector<IOSConfigSection> BuildIOSConfigSections() {
     sections.push_back(std::move(compatibility));
   }
 
+  IOSConfigSection automation;
+  automation.title = "Automation";
+  automation.footer =
+      "These options are stored locally in the iOS frontend rather than xenios.config.toml.";
+  AddUserDefaultBoolSetting(
+      automation.items, kXeniaAutoOpenStikDebugOnLaunchPreferenceKey,
+      "Auto-Enable JIT via StikDebug",
+      "On app open, jump into StikDebug with XeniOS's bundle ID so it can enable JIT and "
+      "relaunch XeniOS. Requires StikDebug, a valid pairing file, and your normal VPN / loopback "
+      "setup.",
+      false);
+  if (!automation.items.empty()) {
+    sections.push_back(std::move(automation));
+  }
+
   IOSConfigSection diagnostics;
   diagnostics.title = "Diagnostics";
   diagnostics.footer = "";
@@ -3168,7 +3266,11 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
     for (const IOSConfigItem& item : section.items) {
       switch (item.control_type) {
         case IOSConfigControlType::kToggle:
-          ok &= SetConfigVarBool(item.key, item.bool_value);
+          if (item.storage == IOSConfigStorage::kUserDefaults) {
+            SetUserDefaultBool(ToNSString(item.key), item.bool_value);
+          } else {
+            ok &= SetConfigVarBool(item.key, item.bool_value);
+          }
           break;
         case IOSConfigControlType::kChoiceInt32:
           ok &= SetConfigVarInt32(item.key, static_cast<int32_t>(item.choice_value));
@@ -7656,6 +7758,8 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
 - (void)pollControllerNavigation:(NSTimer*)timer;
 - (BOOL)readNativeControllerState:(xe::hid::X_INPUT_STATE*)out_state;
 - (BOOL)handleExternalLaunchURL:(NSURL*)url;
+- (BOOL)requestAutomaticStikDebugJITHandoff;
+- (void)evaluateAutomaticStikDebugJITHandoffIfNeeded;
 - (void)startCompatFetchIfNeeded;
 - (void)applyCompatDataToDiscoveredGames;
 - (void)presentCompatibilitySheetForIndex:(size_t)game_index;
@@ -9730,6 +9834,70 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
   [self presentViewController:alert animated:YES completion:nil];
 }
 
+- (BOOL)requestAutomaticStikDebugJITHandoff {
+  if (!GetUserDefaultBool(kXeniaAutoOpenStikDebugOnLaunchPreferenceKey, false)) {
+    XELOGI("iOS: Automatic StikDebug handoff skipped (disabled)");
+    return NO;
+  }
+  if (self.gameRunning || self.gameStopInProgress) {
+    XELOGI("iOS: Automatic StikDebug handoff skipped (game already running)");
+    return NO;
+  }
+  if (self.jitAcquired || xe_check_jit_available()) {
+    if (!self.jitAcquired) {
+      [self onJITAcquired];
+    }
+    XELOGI("iOS: Automatic StikDebug handoff skipped (JIT already available)");
+    return NO;
+  }
+
+  const double now = GetUnixTimeSeconds();
+  const double last_attempt =
+      GetUserDefaultDouble(kXeniaLastAutoStikDebugAttemptTimestampPreferenceKey, 0.0);
+  if (last_attempt > 0.0 &&
+      (now - last_attempt) < kXeniaAutoStikDebugCooldownSeconds) {
+    XELOGI("iOS: Skipping automatic StikDebug handoff (cooldown active)");
+    return NO;
+  }
+
+  NSString* bundle_identifier = NSBundle.mainBundle.bundleIdentifier;
+  NSURL* stikdebug_url =
+      xe_stikdebug_enable_jit_url_for_bundle_identifier(bundle_identifier);
+  if (!stikdebug_url) {
+    XELOGW("iOS: Unable to build StikDebug JIT handoff URL");
+    return NO;
+  }
+
+  UIApplication* application = [UIApplication sharedApplication];
+  if (![application canOpenURL:stikdebug_url]) {
+    XELOGW("iOS: StikDebug URL scheme unavailable");
+    self.statusLabel.text = @"StikDebug is not installed or unavailable.";
+    return NO;
+  }
+
+  SetUserDefaultDouble(kXeniaLastAutoStikDebugAttemptTimestampPreferenceKey, now);
+  self.statusLabel.text = @"Opening StikDebug for JIT...";
+  XELOGI("iOS: Opening StikDebug handoff URL {}", stikdebug_url.absoluteString.UTF8String);
+
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   [application
+                       openURL:stikdebug_url
+                       options:@{}
+             completionHandler:^(BOOL success) {
+               if (!success) {
+                 XELOGW("iOS: Failed to open StikDebug handoff URL");
+                 self.statusLabel.text = @"Failed to open StikDebug.";
+               }
+             }];
+                 });
+  return YES;
+}
+
+- (void)evaluateAutomaticStikDebugJITHandoffIfNeeded {
+  [self requestAutomaticStikDebugJITHandoff];
+}
+
 - (BOOL)handleExternalLaunchURL:(NSURL*)url {
   std::filesystem::path launch_path;
   if (!ExtractLaunchPathFromExternalURL(url, &launch_path) ||
@@ -10359,11 +10527,24 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
                              sourceTag:(const char*)source_tag;
 - (XeniaViewController*)xeniaViewController;
 - (BOOL)handleExternalLaunchURL:(NSURL*)url sourceTag:(const char*)source_tag;
+- (void)evaluateAutomaticStikDebugJITHandoffIfNeeded:(const char*)source_tag;
 @end
 
 @implementation XeniaAppDelegate {
   std::unique_ptr<xe::ui::IOSWindowedAppContext> app_context_;
   std::unique_ptr<xe::ui::WindowedApp> app_;
+}
+
+- (void)evaluateAutomaticStikDebugJITHandoffIfNeeded:(const char*)source_tag {
+  XeniaViewController* view_controller = [self xeniaViewController];
+  if (!view_controller) {
+    XELOGW("iOS: Skipping automatic StikDebug handoff evaluation ({}) with no view controller",
+           source_tag ? source_tag : "unknown");
+    return;
+  }
+  XELOGI("iOS: Evaluating automatic StikDebug handoff ({})",
+         source_tag ? source_tag : "unknown");
+  [view_controller evaluateAutomaticStikDebugJITHandoffIfNeeded];
 }
 
 - (BOOL)application:(UIApplication*)application
@@ -10407,6 +10588,8 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
       [self handleExternalLaunchURL:launch_url
                           sourceTag:source_tag ? source_tag : "bootstrap"];
     }
+    [self evaluateAutomaticStikDebugJITHandoffIfNeeded:
+              source_tag ? source_tag : "bootstrapExisting"];
     return YES;
   }
 
@@ -10524,6 +10707,8 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
     [self handleExternalLaunchURL:launch_url
                         sourceTag:source_tag ? source_tag : "bootstrap"];
   }
+  [self evaluateAutomaticStikDebugJITHandoffIfNeeded:
+            source_tag ? source_tag : "bootstrapNew"];
 
   XELOGI("iOS: Application launched successfully");
   return YES;
@@ -10566,6 +10751,11 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
   (void)application;
   (void)options;
   return [self handleExternalLaunchURL:url sourceTag:"openURL"];
+}
+
+- (void)applicationDidBecomeActive:(UIApplication*)application {
+  (void)application;
+  [self evaluateAutomaticStikDebugJITHandoffIfNeeded:"applicationDidBecomeActive"];
 }
 
 - (UISceneConfiguration*)application:(UIApplication*)application
@@ -10644,6 +10834,15 @@ static constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
       (XeniaAppDelegate*)[UIApplication sharedApplication].delegate;
   if (app_delegate) {
     [app_delegate handleExternalLaunchURL:url sourceTag:"sceneOpenURL"];
+  }
+}
+
+- (void)sceneDidBecomeActive:(UIScene*)scene {
+  (void)scene;
+  XeniaAppDelegate* app_delegate =
+      (XeniaAppDelegate*)[UIApplication sharedApplication].delegate;
+  if (app_delegate) {
+    [app_delegate evaluateAutomaticStikDebugJITHandoffIfNeeded:"sceneDidBecomeActive"];
   }
 }
 
