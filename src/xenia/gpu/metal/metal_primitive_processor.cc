@@ -31,21 +31,20 @@ MetalPrimitiveProcessor::MetalPrimitiveProcessor(
 MetalPrimitiveProcessor::~MetalPrimitiveProcessor() { Shutdown(true); }
 
 bool MetalPrimitiveProcessor::Initialize() {
-  // Initialize the base primitive processor
-  // Metal supports all primitive types through conversion
-  if (!InitializeCommon(
-          true,   // full_32bit_vertex_indices_supported
-          false,  // triangle_fans_supported (will convert)
-          false,  // line_loops_supported (will convert)
-          false,  // quad_lists_supported (will convert)
-          true,   // point_sprites_supported_without_vs_expansion
-          true))  // rectangle_lists_supported_without_vs_expansion
+  // MSC path uses mesh shaders / geometry shaders for point sprites and
+  // rectangle lists, so no vertex-shader expansion is needed.
+  if (!InitializeCommon(true,   // full_32bit_vertex_indices_supported
+                        false,  // triangle_fans_supported (will convert)
+                        false,  // line_loops_supported (will convert)
+                        false,  // quad_lists_supported (will convert)
+                        true,   // point_sprites_without_expansion
+                        true))  // rect_lists_without_expansion
   {
     Shutdown();
     return false;
   }
 
-  XELOGI("MetalPrimitiveProcessor initialized successfully");
+  XELOGI("MetalPrimitiveProcessor initialized (MSC path)");
   return true;
 }
 
@@ -62,24 +61,16 @@ void MetalPrimitiveProcessor::Shutdown(bool from_destructor) {
   if (builtin_index_buffer_) {
     builtin_index_buffer_->release();
     builtin_index_buffer_ = nullptr;
-    builtin_index_buffer_gpu_address_ = 0;
     builtin_index_buffer_size_ = 0;
   }
-
   if (!from_destructor) {
     ShutdownCommon();
   }
 }
 
-void MetalPrimitiveProcessor::CompletedSubmissionUpdated() {
-  // Nothing to do for Metal
-}
-
-void MetalPrimitiveProcessor::BeginSubmission() {
-  // Nothing to do for Metal
-}
-
 void MetalPrimitiveProcessor::BeginFrame() {
+  converted_index_buffers_.clear();
+
   // Clean up old frame index buffers
   ++current_frame_;
   uint64_t current_frame = current_frame_;
@@ -99,14 +90,23 @@ void MetalPrimitiveProcessor::BeginFrame() {
       frame_index_buffers_.end());
 }
 
-void MetalPrimitiveProcessor::EndFrame() { ClearPerFrameCache(); }
+void MetalPrimitiveProcessor::EndFrame() {
+  ClearPerFrameCache();
+  converted_index_buffers_.clear();
+}
 
 MTL::Buffer* MetalPrimitiveProcessor::GetConvertedIndexBuffer(
     size_t handle, uint64_t& offset_bytes_out) const {
-  // The handle is actually a pointer to the MTL::Buffer
-  MTL::Buffer* buffer = reinterpret_cast<MTL::Buffer*>(handle);
-  offset_bytes_out = 0;  // We use the full buffer from the start
-  return buffer;
+  if (handle >= converted_index_buffers_.size()) {
+    XELOGE("Converted index buffer handle {} is out of range {}", handle,
+           converted_index_buffers_.size());
+    offset_bytes_out = 0;
+    return nullptr;
+  }
+
+  const ConvertedIndexBufferBinding& binding = converted_index_buffers_[handle];
+  offset_bytes_out = binding.offset_bytes;
+  return binding.buffer;
 }
 
 bool MetalPrimitiveProcessor::InitializeBuiltinIndexBuffer(
@@ -131,9 +131,6 @@ bool MetalPrimitiveProcessor::InitializeBuiltinIndexBuffer(
   // Fill the buffer with built-in indices
   void* buffer_data = builtin_index_buffer_->contents();
   fill_callback(buffer_data);
-
-  // Get GPU address for binding
-  builtin_index_buffer_gpu_address_ = builtin_index_buffer_->gpuAddress();
 
   XELOGI("Created Metal built-in index buffer ({} bytes)", size_bytes);
   return true;
@@ -198,8 +195,8 @@ void* MetalPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
   // Mark buffer as used this frame
   chosen_buffer->last_frame_used = current_frame;
 
-  // Return the buffer handle and CPU mapping
-  backend_handle_out = reinterpret_cast<size_t>(chosen_buffer->buffer);
+  // Return the buffer handle and CPU mapping.
+  uint64_t gpu_offset = 0;
   void* cpu_buffer = chosen_buffer->buffer->contents();
 
   // Apply SIMD co-alignment if requested
@@ -207,7 +204,11 @@ void* MetalPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
     ptrdiff_t offset =
         GetSimdCoalignmentOffset(cpu_buffer, coalignment_original_address);
     cpu_buffer = static_cast<uint8_t*>(cpu_buffer) + offset;
+    gpu_offset += uint64_t(offset);
   }
+
+  backend_handle_out = converted_index_buffers_.size();
+  converted_index_buffers_.push_back({chosen_buffer->buffer, gpu_offset});
 
   return cpu_buffer;
 }

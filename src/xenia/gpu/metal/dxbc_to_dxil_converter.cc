@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Copyright 2025 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -36,7 +36,6 @@ const CLSID kClsidDxbcConverter = {
     0xb752,
     0x4edd,
     {0xa8, 0x85, 0x6f, 0xb7, 0x6e, 0x25, 0xad, 0xdb}};
-
 std::wstring WidenAscii(const std::string& value) {
   std::wstring out;
   out.reserve(value.size());
@@ -85,12 +84,11 @@ bool DxbcToDxilConverter::Initialize() {
   }
   test_converter->Release();
 
-  dxilconv_path_ = "linked";
   is_available_ = true;
   if (extra_options && *extra_options) {
-    XELOGD("DxbcToDxilConverter: Using extra options: {}", extra_options);
+    XELOGI("DxbcToDxilConverter: Using extra options: {}", extra_options);
   } else if (extra_options && !*extra_options) {
-    XELOGD("DxbcToDxilConverter: Extra options disabled via env");
+    XELOGI("DxbcToDxilConverter: Extra options disabled via env");
   } else {
     XELOGI(
         "DxbcToDxilConverter: Using default extra options: "
