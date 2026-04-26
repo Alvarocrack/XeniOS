@@ -384,21 +384,44 @@ NSDictionary* xe_ios_public_release_summary_from_compat_info(NSDictionary* compa
   return xe_compat_entry_has_summary_fields(derived) ? derived : nil;
 }
 
+// Status presence check: "untested" passes xe_compat_entry_has_summary_fields
+// (it's a non-empty string), but it carries no useful information. The
+// preferred-summary picker uses this to skip past untested release summaries
+// when a populated all-channel summary is available.
+static BOOL xe_compat_summary_has_status_data(NSDictionary* summary) {
+  if (!summary) return NO;
+  NSString* status = xe_string_from_object(summary[@"status"]);
+  return status.length > 0 && ![status isEqualToString:@"untested"];
+}
+
 NSDictionary* xe_preferred_summary_from_compat_info(NSDictionary* compat_info) {
-  // Trust the worker-computed release / all summaries first — that is what
-  // xenios.jp displays. Flatten the nested bestReport / latestReport device
-  // fields onto the result so legacy callers see a single flat dictionary.
+  // Match xenios.jp's "release" tab when it has actual data, but fall back to
+  // the all-channel summary when release is untested — otherwise self-built
+  // builds and games whose only reports targeted an older published release
+  // would show "Untested" even though the website's "All" tab has data.
   NSDictionary* summaries = xe_dictionary_from_object(compat_info[@"summaries"]);
   NSDictionary* release_summary = xe_dictionary_from_object(summaries[@"release"]);
-  if (xe_compat_entry_has_summary_fields(release_summary)) {
+  NSDictionary* all_summary = xe_dictionary_from_object(summaries[@"all"]);
+  if (xe_compat_summary_has_status_data(release_summary)) {
     return xe_compat_flatten_summary_detail_fields(release_summary);
   }
-  NSDictionary* all_summary = xe_dictionary_from_object(summaries[@"all"]);
-  if (xe_compat_entry_has_summary_fields(all_summary)) {
+  if (xe_compat_summary_has_status_data(all_summary)) {
     return xe_compat_flatten_summary_detail_fields(all_summary);
   }
   // Older feeds carry a top-level status/perf/notes block with no nested
   // summaries dictionary; treat the entry itself as the summary in that case.
+  if (xe_compat_summary_has_status_data(compat_info)) {
+    return compat_info;
+  }
+  // No populated summary anywhere — but if either pre-built summary at least
+  // exists, surface the release one so callers see the canonical "untested"
+  // dictionary the website would display.
+  if (xe_compat_entry_has_summary_fields(release_summary)) {
+    return xe_compat_flatten_summary_detail_fields(release_summary);
+  }
+  if (xe_compat_entry_has_summary_fields(all_summary)) {
+    return xe_compat_flatten_summary_detail_fields(all_summary);
+  }
   if (xe_compat_entry_has_summary_fields(compat_info)) {
     return compat_info;
   }
