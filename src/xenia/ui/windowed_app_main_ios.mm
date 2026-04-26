@@ -55,6 +55,8 @@
 #include "xenia/hid/input.h"
 #include "xenia/ui/apple_ui_flags.h"
 #include "xenia/ui/apple_ui_navigation.h"
+#include "xenia/ui/ios_choice_list_view_controller.h"
+#include "xenia/ui/ios_config_models.h"
 #include "xenia/ui/ios_game_art.h"
 #include "xenia/ui/ios_game_tile_cell.h"
 #include "xenia/ui/ios_landscape_navigation_controller.h"
@@ -114,49 +116,6 @@ static void xe_open_external_url_string(NSString* url_string) {
 }
 
 namespace {
-
-enum class IOSConfigControlType {
-  kToggle,
-  kChoiceInt32,
-  kChoiceUInt64,
-  kChoiceString,
-  kAction,
-};
-
-enum class IOSConfigStorage {
-  kConfigVar,
-  kUserDefaults,
-};
-
-enum class IOSConfigAction {
-  kNone,
-  kViewRecentLog,
-};
-
-struct IOSConfigChoice {
-  std::string title;
-  int64_t value = 0;
-};
-
-struct IOSConfigItem {
-  std::string key;
-  std::string title;
-  std::string subtitle;
-  IOSConfigControlType control_type = IOSConfigControlType::kToggle;
-  IOSConfigStorage storage = IOSConfigStorage::kConfigVar;
-  bool bool_value = false;
-  int64_t choice_value = 0;
-  std::string string_value;
-  IOSConfigAction action = IOSConfigAction::kNone;
-  std::vector<IOSConfigChoice> choices;
-  std::vector<std::string> choice_string_values;
-};
-
-struct IOSConfigSection {
-  std::string title;
-  std::string footer;
-  std::vector<IOSConfigItem> items;
-};
 
 using IOSFocusNodeId = xe::ui::apple::FocusNodeId;
 static constexpr IOSFocusNodeId kLauncherFocusSettings = 1;
@@ -2765,21 +2724,11 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
 @interface XeniaConfigViewController : UITableViewController
 @end
 
-typedef void (^IOSChoiceSelectionHandler)(int64_t value);
-
 @protocol XeniaGameContentHost <NSObject>
 - (BOOL)installTitleUpdateAtPath:(NSString*)path
                           status:(NSString**)status_out
                   notTitleUpdate:(BOOL*)not_title_update_out;
 - (void)refreshImportedGames;
-@end
-
-@interface XeniaChoiceListViewController : UITableViewController
-- (instancetype)initWithTitle:(NSString*)title
-                     subtitle:(NSString*)subtitle
-                      choices:(const std::vector<IOSConfigChoice>&)choices
-                selectedValue:(int64_t)selectedValue
-                  onSelection:(IOSChoiceSelectionHandler)onSelection;
 @end
 
 @interface XeniaGameContentViewController : UITableViewController <UIDocumentPickerDelegate>
@@ -2798,103 +2747,6 @@ typedef void (^IOSChoiceSelectionHandler)(int64_t value);
 @interface XeniaCompatReportViewController
     : UITableViewController <PHPickerViewControllerDelegate, UITextViewDelegate>
 - (instancetype)initWithTitleID:(uint32_t)title_id title:(NSString*)title;
-@end
-
-@implementation XeniaChoiceListViewController {
-  std::vector<IOSConfigChoice> choices_;
-  int64_t selected_value_;
-  NSString* subtitle_;
-  IOSChoiceSelectionHandler on_selection_;
-}
-
-- (instancetype)initWithTitle:(NSString*)title
-                     subtitle:(NSString*)subtitle
-                      choices:(const std::vector<IOSConfigChoice>&)choices
-                selectedValue:(int64_t)selectedValue
-                  onSelection:(IOSChoiceSelectionHandler)onSelection {
-  self = [super initWithStyle:UITableViewStyleInsetGrouped];
-  if (self) {
-    self.title = title;
-    subtitle_ = [subtitle copy];
-    choices_ = choices;
-    selected_value_ = selectedValue;
-    on_selection_ = [onSelection copy];
-  }
-  return self;
-}
-
-- (void)viewDidLoad {
-  [super viewDidLoad];
-  self.tableView.backgroundColor = [UIColor systemBackgroundColor];
-  self.tableView.separatorInset = UIEdgeInsetsMake(0, 16, 0, 16);
-
-  if (subtitle_.length > 0) {
-    UILabel* header_label = [[UILabel alloc] initWithFrame:CGRectZero];
-    header_label.text = subtitle_;
-    header_label.textColor = [XeniaTheme textSecondary];
-    header_label.font = [UIFont systemFontOfSize:13];
-    header_label.numberOfLines = 0;
-    header_label.textAlignment = NSTextAlignmentLeft;
-    header_label.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UIView* header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 56)];
-    [header addSubview:header_label];
-    [NSLayoutConstraint activateConstraints:@[
-      [header_label.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:18],
-      [header_label.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-18],
-      [header_label.topAnchor constraintEqualToAnchor:header.topAnchor constant:8],
-      [header_label.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-8],
-    ]];
-    self.tableView.tableHeaderView = header;
-  }
-}
-
-- (NSInteger)tableView:(UITableView* __unused)tableView
-    numberOfRowsInSection:(NSInteger)__unused section {
-  return static_cast<NSInteger>(choices_.size());
-}
-
-- (UITableViewCell*)tableView:(UITableView*)tableView
-        cellForRowAtIndexPath:(NSIndexPath*)indexPath {
-  static NSString* const kChoiceCellIdentifier = @"XeniaChoiceCell";
-  UITableViewCell* cell = [tableView dequeueReusableCellWithIdentifier:kChoiceCellIdentifier];
-  if (!cell) {
-    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
-                                  reuseIdentifier:kChoiceCellIdentifier];
-  }
-  if (indexPath.row < 0 || indexPath.row >= static_cast<NSInteger>(choices_.size())) {
-    cell.textLabel.text = @"";
-    cell.accessoryType = UITableViewCellAccessoryNone;
-    return cell;
-  }
-  const IOSConfigChoice& choice = choices_[indexPath.row];
-  cell.textLabel.text = ToNSString(choice.title);
-  cell.accessoryType = (choice.value == selected_value_) ? UITableViewCellAccessoryCheckmark
-                                                         : UITableViewCellAccessoryNone;
-  return cell;
-}
-
-- (void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)indexPath {
-  if (indexPath.row < 0 || indexPath.row >= static_cast<NSInteger>(choices_.size())) {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    return;
-  }
-  const IOSConfigChoice& choice = choices_[indexPath.row];
-  selected_value_ = choice.value;
-  if (on_selection_) {
-    on_selection_(selected_value_);
-  }
-  [self.navigationController popViewControllerAnimated:YES];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
-}
-
 @end
 
 @implementation XeniaGameContentViewController {
