@@ -26,6 +26,10 @@ project("xenia-ui")
   filter("system:ios")
     files({
       "file_picker_ios.mm",
+      "ios_game_art.mm",
+      "ios_metal_view.mm",
+      "ios_system_utils.mm",
+      "ios_theme.mm",
       "surface_ios.mm",
       "window_ios.mm",
       "windowed_app_context_ios.mm",
