@@ -63,13 +63,7 @@ const CompatTaxonomyEntry kCompatPerfs[] = {
 };
 
 UIColor* ColorFromTaxonomy(const CompatTaxonomyEntry& entry) {
-  if (!entry.hex_color) {
-    return [XeniaTheme textMuted];
-  }
-  return [UIColor colorWithRed:((entry.hex_color >> 16) & 0xFF) / 255.0
-                         green:((entry.hex_color >> 8) & 0xFF) / 255.0
-                          blue:(entry.hex_color & 0xFF) / 255.0
-                         alpha:1.0];
+  return entry.hex_color ? XEColorFromHexRGB(entry.hex_color) : [XeniaTheme textMuted];
 }
 
 const CompatTaxonomyEntry* FindByCode(const CompatTaxonomyEntry* entries, size_t count,

@@ -23,6 +23,13 @@ NSString* XEFormatTitleIDHexLower(uint32_t title_id) {
   return [NSString stringWithFormat:@"%08x", title_id];
 }
 
+UIColor* XEColorFromHexRGB(uint32_t rgb) {
+  return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
+                         green:((rgb >> 8) & 0xFF) / 255.0
+                          blue:(rgb & 0xFF) / 255.0
+                         alpha:1.0];
+}
+
 void XEPresentOKAlert(UIViewController* presenter, NSString* title, NSString* message) {
   if (!presenter) {
     return;

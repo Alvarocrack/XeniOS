@@ -25,6 +25,9 @@ NSString* ToNSString(const std::string& value);
 NSString* XEFormatTitleIDHexUpper(uint32_t title_id);
 NSString* XEFormatTitleIDHexLower(uint32_t title_id);
 
+// Builds a fully opaque UIColor from a 0xRRGGBB packed value.
+UIColor* XEColorFromHexRGB(uint32_t rgb);
+
 // Presents a one-button "OK" alert. No-ops when `presenter` is nil.
 void XEPresentOKAlert(UIViewController* presenter, NSString* title, NSString* message);
 

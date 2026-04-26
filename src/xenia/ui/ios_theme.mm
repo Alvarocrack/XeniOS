@@ -13,45 +13,47 @@
 #include <cmath>
 #include <cstring>
 
+#import "xenia/ui/ios_view_helpers.h"
+
 @implementation XeniaTheme
 // No static caching — this file is compiled under MRC (manual reference
 // counting), so static locals would hold dangling pointers after the
 // autorelease pool drains. UIColor creation is cheap; callers retain.
 + (UIColor*)bgPrimary {
-  return [UIColor colorWithRed:0x09 / 255.0 green:0x09 / 255.0 blue:0x0b / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x09090b);
 }
 + (UIColor*)bgSurface {
-  return [UIColor colorWithRed:0x18 / 255.0 green:0x18 / 255.0 blue:0x1b / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x18181b);
 }
 + (UIColor*)bgSurface2 {
-  return [UIColor colorWithRed:0x27 / 255.0 green:0x27 / 255.0 blue:0x2a / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x27272a);
 }
 + (UIColor*)bgSurface3 {
-  return [UIColor colorWithRed:0x3f / 255.0 green:0x3f / 255.0 blue:0x46 / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x3f3f46);
 }
 + (UIColor*)textPrimary {
-  return [UIColor colorWithRed:0xfa / 255.0 green:0xfa / 255.0 blue:0xfa / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0xfafafa);
 }
 + (UIColor*)textSecondary {
-  return [UIColor colorWithRed:0xa1 / 255.0 green:0xa1 / 255.0 blue:0xaa / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0xa1a1aa);
 }
 + (UIColor*)textMuted {
-  return [UIColor colorWithRed:0x71 / 255.0 green:0x71 / 255.0 blue:0x7a / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x71717a);
 }
 + (UIColor*)accent {
-  return [UIColor colorWithRed:0x34 / 255.0 green:0xd3 / 255.0 blue:0x99 / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x34d399);
 }
 + (UIColor*)accentHover {
-  return [UIColor colorWithRed:0x6e / 255.0 green:0xe7 / 255.0 blue:0xb7 / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x6ee7b7);
 }
 + (UIColor*)accentFg {
-  return [UIColor colorWithRed:0x09 / 255.0 green:0x09 / 255.0 blue:0x0b / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0x09090b);
 }
 + (UIColor*)statusError {
-  return [UIColor colorWithRed:0xf8 / 255.0 green:0x71 / 255.0 blue:0x71 / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0xf87171);
 }
 + (UIColor*)statusWarning {
-  return [UIColor colorWithRed:0xfb / 255.0 green:0xbf / 255.0 blue:0x24 / 255.0 alpha:1.0];
+  return XEColorFromHexRGB(0xfbbf24);
 }
 + (UIColor*)border {
   return [UIColor colorWithWhite:1.0 alpha:0.06];
