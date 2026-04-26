@@ -26,6 +26,7 @@ project("xenia-ui")
   filter("system:ios")
     files({
       "file_picker_ios.mm",
+      "ios_app_delegate.mm",
       "ios_choice_list_view_controller.mm",
       "ios_compat_data.mm",
       "ios_compat_report_view_controller.mm",
@@ -38,6 +39,7 @@ project("xenia-ui")
       "ios_game_tile_cell.mm",
       "ios_landscape_navigation_controller.mm",
       "ios_log_view_controller.mm",
+      "ios_main_view_controller.mm",
       "ios_metal_view.mm",
       "ios_profile_view_controller.mm",
       "ios_system_utils.mm",
