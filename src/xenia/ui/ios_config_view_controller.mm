@@ -25,10 +25,6 @@
 
 namespace {
 
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
 NSString* const kXeniOSWebsiteURL = @"https://xenios.jp";
 NSString* const kXeniOSDiscordURL = @"https://discord.gg/QwcTtNKTGf";
 NSString* const kXeniOSGitHubURL = @"https://github.com/xenios-jp/XeniOS";
@@ -330,14 +326,6 @@ void OpenExternalURLString(NSString* url_string) {
 - (void)viewSafeAreaInsetsDidChange {
   [super viewSafeAreaInsetsDidChange];
   [self updateTableHeaderAndFooterLayout];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 - (void)markPendingChanges {

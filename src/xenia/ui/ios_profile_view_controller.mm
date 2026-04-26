@@ -9,19 +9,9 @@
 
 #import "xenia/ui/ios_profile_view_controller.h"
 
-#include <string>
 #include <vector>
 
-#import "xenia/ui/ios_system_utils.h"
 #import "xenia/ui/ios_theme.h"
-
-namespace {
-
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
-}  // namespace
 
 @implementation XeniaProfileViewController {
   xe::ui::IOSWindowedAppContext* app_context_;
@@ -53,14 +43,6 @@ NSString* ToNSString(const std::string& value) {
 - (void)viewWillAppear:(BOOL)animated {
   [super viewWillAppear:animated];
   [self reloadProfiles];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 - (void)doneTapped:(id)sender {

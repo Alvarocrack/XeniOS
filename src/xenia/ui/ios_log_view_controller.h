@@ -13,11 +13,12 @@
 #import <UIKit/UIKit.h>
 
 #include "xenia/ui/apple_ui_navigation.h"
+#include "xenia/ui/ios_view_helpers.h"
 
 // Live log viewer presented as a sheet from the launcher and from the
 // in-game overlay. Tails xenia.log every 0.5s, supports refresh / share /
 // gamepad navigation (LB/RB to scroll, X share, Y refresh).
-@interface XeniaLogViewController : UIViewController
+@interface XeniaLogViewController : XESheetViewController
 - (BOOL)handleControllerActions:(const xe::ui::apple::ControllerActionSet&)actions;
 @end
 

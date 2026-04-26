@@ -14,24 +14,6 @@
 #import "xenia/ui/ios_system_utils.h"
 #import "xenia/ui/ios_theme.h"
 
-namespace {
-
-void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* message) {
-  if (!presenter) {
-    return;
-  }
-  UIAlertController* alert =
-      [UIAlertController alertControllerWithTitle:title ?: @"Notice"
-                                          message:message ?: @""
-                                   preferredStyle:UIAlertControllerStyleAlert];
-  [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                            style:UIAlertActionStyleCancel
-                                          handler:nil]];
-  [presenter presentViewController:alert animated:YES completion:nil];
-}
-
-}  // namespace
-
 @implementation XeniaCompatReportViewController {
   uint32_t title_id_;
   NSString* game_title_;
@@ -90,14 +72,6 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
                                            selector:@selector(keyboardWillHide:)
                                                name:UIKeyboardWillHideNotification
                                              object:nil];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 - (void)scrollNotesEditorIntoViewAnimated:(BOOL)animated {
@@ -331,7 +305,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
 }
 
 - (void)showAlertWithTitle:(NSString*)title message:(NSString*)message {
-  PresentOKAlert(self, title, message);
+  XEPresentOKAlert(self, title, message);
 }
 
 - (void)finishSuccessfulSubmissionWithIssueURL:(NSString*)issue_url
@@ -422,7 +396,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
   NSString* device_display = xe_device_display_name();
   NSDictionary* build_info = xe_current_compat_report_build_info();
   NSDictionary* payload = @{
-    @"titleId" : [NSString stringWithFormat:@"%08X", title_id_],
+    @"titleId" : XEFormatTitleIDHexUpper(title_id_),
     @"title" : game_title_ ?: @"",
     @"status" : xe_compat_statuses()[selected_status_],
     @"perf" : xe_compat_perfs()[selected_perf_],
@@ -685,7 +659,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
         cell.detailTextLabel.text = game_title_;
       } else {
         cell.textLabel.text = @"Title ID";
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%08X", title_id_];
+        cell.detailTextLabel.text = XEFormatTitleIDHexUpper(title_id_);
       }
     } else {
       NSDictionary* build_info = xe_current_compat_report_build_info();

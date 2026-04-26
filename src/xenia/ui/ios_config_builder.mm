@@ -22,11 +22,9 @@
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
 
-namespace {
+#import "xenia/ui/ios_view_helpers.h"
 
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
+namespace {
 
 std::string TrimAscii(std::string value) {
   size_t start = 0;
@@ -191,40 +189,8 @@ std::filesystem::path TakePendingExternalLaunchPathPreference() {
   return std::filesystem::path([path_string UTF8String]).lexically_normal();
 }
 
-static bool SetConfigVarBool(const std::string& key, bool value) {
-  cvar::IConfigVar* var = GetConfigVar(key);
-  if (!var) {
-    XELOGW("iOS settings: missing config var '{}'", key);
-    return false;
-  }
-  toml::value node(value);
-  var->LoadConfigValue(&node);
-  return true;
-}
-
-static bool SetConfigVarInt32(const std::string& key, int32_t value) {
-  cvar::IConfigVar* var = GetConfigVar(key);
-  if (!var) {
-    XELOGW("iOS settings: missing config var '{}'", key);
-    return false;
-  }
-  toml::value node(value);
-  var->LoadConfigValue(&node);
-  return true;
-}
-
-static bool SetConfigVarUInt64(const std::string& key, uint64_t value) {
-  cvar::IConfigVar* var = GetConfigVar(key);
-  if (!var) {
-    XELOGW("iOS settings: missing config var '{}'", key);
-    return false;
-  }
-  toml::value node(value);
-  var->LoadConfigValue(&node);
-  return true;
-}
-
-static bool SetConfigVarString(const std::string& key, const std::string& value) {
+template <typename T>
+static bool SetConfigVarValue(const std::string& key, T value) {
   cvar::IConfigVar* var = GetConfigVar(key);
   if (!var) {
     XELOGW("iOS settings: missing config var '{}'", key);
@@ -523,7 +489,7 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
           if (item.storage == IOSConfigStorage::kUserDefaults) {
             SetUserDefaultBool(ToNSString(item.key), item.bool_value);
           } else {
-            ok &= SetConfigVarBool(item.key, item.bool_value);
+            ok &= SetConfigVarValue(item.key, item.bool_value);
           }
           break;
         case IOSConfigControlType::kChoiceInt32:
@@ -532,7 +498,7 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
             ok = false;
             break;
           }
-          ok &= SetConfigVarInt32(item.key, static_cast<int32_t>(item.choice_value));
+          ok &= SetConfigVarValue(item.key, static_cast<int32_t>(item.choice_value));
           break;
         case IOSConfigControlType::kChoiceUInt64:
           if (item.storage != IOSConfigStorage::kConfigVar) {
@@ -540,7 +506,7 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
             ok = false;
             break;
           }
-          ok &= SetConfigVarUInt64(item.key, static_cast<uint64_t>(item.choice_value));
+          ok &= SetConfigVarValue(item.key, static_cast<uint64_t>(item.choice_value));
           break;
         case IOSConfigControlType::kChoiceString:
           if (item.storage != IOSConfigStorage::kConfigVar) {
@@ -555,7 +521,7 @@ bool ApplyIOSConfigSections(const std::vector<IOSConfigSection>& sections) {
             ok = false;
             break;
           }
-          ok &= SetConfigVarString(
+          ok &= SetConfigVarValue(
               item.key, item.choice_string_values[static_cast<size_t>(item.choice_value)]);
           break;
         case IOSConfigControlType::kAction:

@@ -16,13 +16,14 @@
 #include <vector>
 
 #include "xenia/ui/ios_config_models.h"
+#include "xenia/ui/ios_view_helpers.h"
 
 typedef void (^IOSChoiceSelectionHandler)(int64_t value);
 
 // Pushed onto the settings nav stack to pick a single value from a list of
 // IOSConfigChoice rows. Confirms the new selection back to the caller via
 // IOSChoiceSelectionHandler and pops itself.
-@interface XeniaChoiceListViewController : UITableViewController
+@interface XeniaChoiceListViewController : XESheetTableViewController
 - (instancetype)initWithTitle:(NSString*)title
                      subtitle:(NSString*)subtitle
                       choices:(const std::vector<IOSConfigChoice>&)choices

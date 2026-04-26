@@ -24,10 +24,6 @@
 
 namespace {
 
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
 constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
 
 }  // namespace
@@ -840,14 +836,6 @@ constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
   [self layoutHeroHeaderIfNeeded];
 }
 
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
-}
-
 - (void)doneTapped:(id)__unused sender {
   hero_background_view_.hidden = YES;
   [hero_background_view_ removeFromSuperview];
@@ -879,7 +867,7 @@ constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
   NSDictionary* next_info = xe_dictionary_from_object(notification.userInfo[@"compatInfo"]);
   if (!next_info) {
     NSDictionary* cached_by_title_id = xe_load_cached_compat_data();
-    NSString* title_id_string = [NSString stringWithFormat:@"%08X", title_id_];
+    NSString* title_id_string = XEFormatTitleIDHexUpper(title_id_);
     next_info = xe_dictionary_from_object(cached_by_title_id[title_id_string]);
   }
   if (!next_info) {

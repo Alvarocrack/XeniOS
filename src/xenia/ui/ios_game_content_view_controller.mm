@@ -12,7 +12,6 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <filesystem>
-#include <string>
 #include <system_error>
 #include <vector>
 
@@ -20,30 +19,7 @@
 #include "xenia/xbox.h"
 
 #import "xenia/ui/ios_content_management.h"
-#import "xenia/ui/ios_system_utils.h"
 #import "xenia/ui/ios_theme.h"
-
-namespace {
-
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
-void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* message) {
-  if (!presenter) {
-    return;
-  }
-  UIAlertController* alert =
-      [UIAlertController alertControllerWithTitle:title ?: @"Notice"
-                                          message:message ?: @""
-                                   preferredStyle:UIAlertControllerStyleAlert];
-  [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                            style:UIAlertActionStyleCancel
-                                          handler:nil]];
-  [presenter presentViewController:alert animated:YES completion:nil];
-}
-
-}  // namespace
 
 @implementation XeniaGameContentViewController {
   uint32_t title_id_;
@@ -83,14 +59,6 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
 - (void)viewWillAppear:(BOOL)animated {
   [super viewWillAppear:animated];
   [self reloadInstalledContent];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 - (void)doneTapped:(id)__unused sender {
@@ -240,7 +208,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
                               std::error_code ec;
                               std::filesystem::remove_all(entry_path, ec);
                               if (ec) {
-                                PresentOKAlert(
+                                XEPresentOKAlert(
                                     self, @"Delete Failed",
                                     [NSString stringWithFormat:@"Failed deleting %@: %s",
                                                                display_name, ec.message().c_str()]);
@@ -273,8 +241,8 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
     if (access_granted) {
       [url stopAccessingSecurityScopedResource];
     }
-    PresentOKAlert(self, @"Invalid Package",
-                   validation_error ?: @"Could not read the selected content package.");
+    XEPresentOKAlert(self, @"Invalid Package",
+                     validation_error ?: @"Could not read the selected content package.");
     return;
   }
 
@@ -282,7 +250,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
     if (access_granted) {
       [url stopAccessingSecurityScopedResource];
     }
-    PresentOKAlert(
+    XEPresentOKAlert(
         self, @"Wrong Game",
         [NSString stringWithFormat:@"This package is for title %08X, but the current game is %08X.",
                                    package_info.title_id, title_id_]);
@@ -326,7 +294,7 @@ void PresentOKAlert(UIViewController* presenter, NSString* title, NSString* mess
   if (install_success) {
     [self refreshLauncherContentState];
   }
-  PresentOKAlert(self, result_title, result_message);
+  XEPresentOKAlert(self, result_title, result_message);
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController* __unused)controller {

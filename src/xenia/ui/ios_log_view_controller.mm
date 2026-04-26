@@ -23,10 +23,6 @@ DECLARE_path(log_file);
 
 namespace {
 
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
 std::filesystem::path GetLogFilePath() {
   if (!cvars::log_file.empty()) {
     return cvars::log_file;
@@ -166,14 +162,6 @@ NSString* DecodeLogBytesToNSString(const std::string& content) {
 
 - (void)dealloc {
   [self stopAutoRefresh];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 - (void)reloadLogTapped:(id)sender {

@@ -18,16 +18,9 @@
 
 #import "xenia/ui/ios_main_view_controller.h"
 #import "xenia/ui/ios_system_utils.h"
+#import "xenia/ui/ios_view_helpers.h"
 
 DECLARE_path(log_file);
-
-namespace {
-
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
-}  // namespace
 
 @implementation XeniaAppDelegate {
   std::unique_ptr<xe::ui::IOSWindowedAppContext> app_context_;

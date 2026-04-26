@@ -9,18 +9,7 @@
 
 #import "xenia/ui/ios_choice_list_view_controller.h"
 
-#include <string>
-
-#import "xenia/ui/ios_system_utils.h"
 #import "xenia/ui/ios_theme.h"
-
-namespace {
-
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
-}
-
-}  // namespace
 
 @implementation XeniaChoiceListViewController {
   std::vector<IOSConfigChoice> choices_;
@@ -107,14 +96,6 @@ NSString* ToNSString(const std::string& value) {
     on_selection_(selected_value_);
   }
   [self.navigationController popViewControllerAnimated:YES];
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-  return UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-  return xe_current_interface_orientation(self.view);
 }
 
 @end

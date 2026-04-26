@@ -14,6 +14,8 @@
 
 #include <cstdint>
 
+#include "xenia/ui/ios_view_helpers.h"
+
 // Hosts the Manage Content sheet. The launcher's main view controller adopts
 // this protocol so the sheet can ask it to install a freshly-imported title
 // update via the same code path that the library's import flow uses.
@@ -27,7 +29,7 @@
 // Per-game content management sheet: lists installed title updates and DLC
 // for `title_id`, and adds new ones via UIDocumentPicker. Calls back into the
 // launcher (`host`) to refresh the library when installs succeed.
-@interface XeniaGameContentViewController : UITableViewController <UIDocumentPickerDelegate>
+@interface XeniaGameContentViewController : XESheetTableViewController <UIDocumentPickerDelegate>
 - (instancetype)initWithTitleID:(uint32_t)title_id
                           title:(NSString*)title
                            host:(id<XeniaGameContentHost>)host;

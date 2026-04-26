@@ -44,6 +44,7 @@ project("xenia-ui")
       "ios_profile_view_controller.mm",
       "ios_system_utils.mm",
       "ios_theme.mm",
+      "ios_view_helpers.mm",
       "surface_ios.mm",
       "window_ios.mm",
       "windowed_app_context_ios.mm",

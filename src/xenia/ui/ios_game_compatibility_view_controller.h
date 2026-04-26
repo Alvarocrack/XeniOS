@@ -14,11 +14,13 @@
 
 #include <cstdint>
 
+#include "xenia/ui/ios_view_helpers.h"
+
 // Per-game compatibility hero sheet. Renders the cover/background hero card
 // with status / perf pills, build pill and the most recent app-submitted
 // reports + GitHub discussion summary, plus animated radial-glow accents
 // keyed off the cover artwork's palette.
-@interface XeniaGameCompatibilityViewController : UITableViewController
+@interface XeniaGameCompatibilityViewController : XESheetTableViewController
 - (instancetype)initWithTitleID:(uint32_t)title_id
                           title:(NSString*)title
                      compatData:(NSDictionary*)compat_data;

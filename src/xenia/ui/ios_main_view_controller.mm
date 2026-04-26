@@ -60,6 +60,7 @@
 #import "xenia/ui/ios_profile_view_controller.h"
 #import "xenia/ui/ios_system_utils.h"
 #import "xenia/ui/ios_theme.h"
+#import "xenia/ui/ios_view_helpers.h"
 #import "xenia/ui/windowed_app_context_ios.h"
 
 DECLARE_path(log_file);
@@ -106,10 +107,6 @@ std::string TrimAscii(std::string value) {
     --end;
   }
   return value.substr(start, end - start);
-}
-
-NSString* ToNSString(const std::string& value) {
-  return [NSString stringWithUTF8String:value.c_str()];
 }
 
 NSString* DecodeURLComponent(NSString* value) {
@@ -540,20 +537,6 @@ static NSURL* xe_stikdebug_enable_jit_url_for_bundle_identifier(NSString* bundle
   components.queryItems = @[ [NSURLQueryItem queryItemWithName:@"bundle-id"
                                                          value:bundle_identifier] ];
   return components.URL;
-}
-
-static void xe_present_ok_alert(UIViewController* presenter, NSString* title, NSString* message) {
-  if (!presenter) {
-    return;
-  }
-  UIAlertController* alert =
-      [UIAlertController alertControllerWithTitle:title ?: @"Notice"
-                                          message:message ?: @""
-                                   preferredStyle:UIAlertControllerStyleAlert];
-  [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                            style:UIAlertActionStyleCancel
-                                          handler:nil]];
-  [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 static NSString* xe_normalize_game_title_for_ui(NSString* title) {
@@ -2695,7 +2678,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
             continue;
           }
           if (game.title_id && title_name_cache) {
-            NSString* key = [NSString stringWithFormat:@"%08x", game.title_id];
+            NSString* key = XEFormatTitleIDHexLower(game.title_id);
             NSString* cached = [title_name_cache objectForKey:key];
             if (cached.length > 0) {
               game.title = NormalizeGameTitleForUI(std::string([cached UTF8String]));
@@ -2760,7 +2743,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
     if (!compat_data_ || !game.title_id) {
       continue;
     }
-    NSString* key = [NSString stringWithFormat:@"%08X", game.title_id];
+    NSString* key = XEFormatTitleIDHexUpper(game.title_id);
     NSDictionary* info = [compat_data_ objectForKey:key];
     if (!info) {
       continue;
@@ -3123,9 +3106,8 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
     if (header && header->content_metadata.data_file_count > 0 &&
         !HasContentSidecarDataDirectory(game_path)) {
       self.statusLabel.text = @"Selected game is missing its .data folder.";
-      xe_present_ok_alert(
-          self, @"Missing Game Data",
-          @"This package needs its matching .data folder before it can be launched.");
+      XEPresentOKAlert(self, @"Missing Game Data",
+                       @"This package needs its matching .data folder before it can be launched.");
       return;
     }
   }
@@ -3203,14 +3185,13 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
 
   const IOSDiscoveredGame& game = discovered_games_[game_index];
   if (!game.title_id) {
-    xe_present_ok_alert(self, @"Unavailable",
-                        @"This item does not expose a title ID, so compatibility details "
-                        @"cannot be loaded.");
+    XEPresentOKAlert(self, @"Unavailable",
+                     @"This item does not expose a title ID, so compatibility details "
+                     @"cannot be loaded.");
     return;
   }
 
-  NSDictionary* compat_data =
-      [compat_data_ objectForKey:[NSString stringWithFormat:@"%08X", game.title_id]];
+  NSDictionary* compat_data = [compat_data_ objectForKey:XEFormatTitleIDHexUpper(game.title_id)];
   NSString* game_title =
       game.title.empty() ? ToNSString(game.path.stem().string()) : ToNSString(game.title);
   UIImage* hero_artwork = xe_cached_game_art(game.title_id);
@@ -3262,7 +3243,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
 
   const IOSDiscoveredGame& game = discovered_games_[game_index];
   if (!game.title_id) {
-    xe_present_ok_alert(
+    XEPresentOKAlert(
         self, @"Unavailable",
         @"This item does not expose a title ID, so installed content cannot be managed.");
     return;
@@ -3576,7 +3557,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
 
     if (imported_path.empty()) {
       NSString* message = import_error.localizedDescription ?: @"Failed to import selected game.";
-      xe_present_ok_alert(self, @"Import Failed", message);
+      XEPresentOKAlert(self, @"Import Failed", message);
       return;
     }
 
@@ -3616,7 +3597,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
           NSString* message = status.empty() ? @"Installed title update." : ToNSString(status);
           self.statusLabel.text = message;
           [self refreshImportedGames];
-          xe_present_ok_alert(self, @"Title Update Installed", message);
+          XEPresentOKAlert(self, @"Title Update Installed", message);
           return;
         }
 
@@ -3627,7 +3608,7 @@ bool BuildDiscoveredGameFromPath(const std::filesystem::path& path, IOSDiscovere
           NSString* message =
               status.empty() ? @"Title update installation failed." : ToNSString(status);
           self.statusLabel.text = message;
-          xe_present_ok_alert(self, @"Installation Failed", message);
+          XEPresentOKAlert(self, @"Installation Failed", message);
           return;
         }
 

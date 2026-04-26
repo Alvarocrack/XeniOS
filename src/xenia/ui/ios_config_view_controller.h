@@ -12,11 +12,13 @@
 
 #import <UIKit/UIKit.h>
 
+#include "xenia/ui/ios_view_helpers.h"
+
 // Settings sheet shown from the launcher and from the in-game overlay. Each
 // row maps to either a Xenia cvar or an iOS NSUserDefaults key; rows are
 // constructed by ios_config_builder, and Save persists every dirty row back
 // through ApplyIOSConfigSections.
-@interface XeniaConfigViewController : UITableViewController
+@interface XeniaConfigViewController : XESheetTableViewController
 @end
 
 #endif  // XENIA_UI_IOS_CONFIG_VIEW_CONTROLLER_H_

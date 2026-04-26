@@ -12,6 +12,7 @@
 
 #import <UIKit/UIKit.h>
 
+#include "xenia/ui/ios_view_helpers.h"
 #include "xenia/ui/windowed_app_context_ios.h"
 
 typedef void (^IOSProfileStatusHandler)(NSString* status_message);
@@ -19,7 +20,7 @@ typedef void (^IOSProfileStatusHandler)(NSString* status_message);
 // Local profile management sheet: create new gamertags and sign existing
 // profiles into emulation slots. Status messages are forwarded back to the
 // presenter via the IOSProfileStatusHandler block.
-@interface XeniaProfileViewController : UITableViewController
+@interface XeniaProfileViewController : XESheetTableViewController
 - (instancetype)initWithAppContext:(xe::ui::IOSWindowedAppContext*)app_context
                           onStatus:(IOSProfileStatusHandler)on_status;
 @end

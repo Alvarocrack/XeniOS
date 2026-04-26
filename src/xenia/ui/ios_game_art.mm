@@ -9,6 +9,8 @@
 
 #import "xenia/ui/ios_game_art.h"
 
+#import "xenia/ui/ios_view_helpers.h"
+
 namespace {
 
 NSString* xe_game_art_cache_dir(void) {
@@ -25,9 +27,7 @@ NSString* xe_game_art_cache_dir(void) {
   return dir;
 }
 
-NSString* xe_game_art_hex(uint32_t title_id) {
-  return [NSString stringWithFormat:@"%08x", title_id];
-}
+NSString* xe_game_art_hex(uint32_t title_id) { return XEFormatTitleIDHexLower(title_id); }
 
 NSMutableSet* xe_game_art_inflight_ids(void) {
   static NSMutableSet* inflight;
@@ -155,7 +155,7 @@ void xe_fetch_game_background_art(uint32_t title_id, void (^completion)(UIImage*
     if (completion) completion(nil);
     return;
   }
-  NSString* hex_upper = [[NSString stringWithFormat:@"%08X", title_id] uppercaseString];
+  NSString* hex_upper = XEFormatTitleIDHexUpper(title_id);
   NSString* url_str = [NSString stringWithFormat:@"https://raw.githubusercontent.com/xenia-manager/"
                                                  @"x360db/main/titles/%@/artwork/background.jpg",
                                                  hex_upper];
