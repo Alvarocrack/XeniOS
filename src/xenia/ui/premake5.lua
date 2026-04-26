@@ -29,6 +29,8 @@ project("xenia-ui")
       "ios_choice_list_view_controller.mm",
       "ios_compat_data.mm",
       "ios_compat_report_view_controller.mm",
+      "ios_config_builder.mm",
+      "ios_config_view_controller.mm",
       "ios_content_management.mm",
       "ios_game_art.mm",
       "ios_game_compatibility_view_controller.mm",
