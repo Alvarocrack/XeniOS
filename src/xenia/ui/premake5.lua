@@ -30,6 +30,7 @@ project("xenia-ui")
       "ios_compat_data.mm",
       "ios_content_management.mm",
       "ios_game_art.mm",
+      "ios_game_content_view_controller.mm",
       "ios_game_tile_cell.mm",
       "ios_landscape_navigation_controller.mm",
       "ios_log_view_controller.mm",
