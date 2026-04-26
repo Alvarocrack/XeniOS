@@ -27,6 +27,7 @@ project("xenia-ui")
     files({
       "file_picker_ios.mm",
       "ios_choice_list_view_controller.mm",
+      "ios_content_management.mm",
       "ios_game_art.mm",
       "ios_game_tile_cell.mm",
       "ios_landscape_navigation_controller.mm",
