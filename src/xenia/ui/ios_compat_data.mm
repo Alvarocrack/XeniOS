@@ -188,29 +188,6 @@ static NSInteger xe_compat_status_rank(NSString* status) {
   return entry ? entry->rank : 0;
 }
 
-static NSString* xe_compat_build_fingerprint(NSDictionary* build_info) {
-  if (!build_info) {
-    return nil;
-  }
-  NSArray<NSString*>* fields = @[
-    xe_string_from_object(build_info[@"buildId"]) ?: @"",
-    xe_string_from_object(build_info[@"appVersion"]) ?: @"",
-    xe_string_from_object(build_info[@"buildNumber"]) ?: @"",
-    xe_string_from_object(build_info[@"stage"]) ?: @"",
-    xe_string_from_object(build_info[@"commitShort"]) ?: @"",
-  ];
-  NSMutableArray<NSString*>* parts = [NSMutableArray arrayWithCapacity:fields.count];
-  for (NSString* field in fields) {
-    if (field.length > 0) {
-      [parts addObject:[field lowercaseString]];
-    }
-  }
-  if (parts.count == 0) {
-    return nil;
-  }
-  return [parts componentsJoinedByString:@"|"];
-}
-
 static BOOL xe_compat_date_is_newer(NSString* candidate, NSString* baseline) {
   if (candidate.length == 0) {
     return NO;
@@ -239,6 +216,22 @@ static NSDictionary* xe_compat_newest_report(NSArray<NSDictionary*>* reports) {
   return newest;
 }
 
+// Strict "newest by date" with no rank tiebreak — mirrors the worker's
+// latestReportForReports (data/compatibility.json's summaries.* are produced
+// by this rule).
+static NSDictionary* xe_compat_latest_report(NSArray<NSDictionary*>* reports) {
+  NSDictionary* latest = nil;
+  NSString* latest_date = @"";
+  for (NSDictionary* report in reports) {
+    NSString* date = xe_string_from_object(report[@"date"]) ?: @"";
+    if (!latest || xe_compat_date_is_newer(date, latest_date)) {
+      latest = report;
+      latest_date = date;
+    }
+  }
+  return latest;
+}
+
 static NSDictionary* xe_compat_best_report(NSArray<NSDictionary*>* reports) {
   NSDictionary* best = nil;
   NSInteger best_rank = -1;
@@ -257,223 +250,163 @@ static NSDictionary* xe_compat_best_report(NSArray<NSDictionary*>* reports) {
   return best;
 }
 
-static BOOL xe_compat_report_affects_release(NSDictionary* report) {
-  NSDictionary* build_info = xe_dictionary_from_object(report[@"build"]);
-  NSString* channel = xe_string_from_object(build_info[@"channel"]);
-  NSNumber* official = [build_info[@"official"] isKindOfClass:[NSNumber class]]
-                           ? (NSNumber*)build_info[@"official"]
-                           : nil;
-  if ([channel isEqualToString:@"preview"]) {
-    return NO;
+// Mirrors the compat worker's reportMatchesSummaryChannel for "release":
+// strict buildId match against the currently-published release build, with a
+// legacy fallback that accepts reports missing build metadata or carrying
+// channel="release". See worker/src/index.ts (xenios-jp/xenios.jp).
+static BOOL xe_compat_release_filter_matches(NSDictionary* report,
+                                             NSDictionary* current_release_build) {
+  NSDictionary* build = xe_dictionary_from_object(report[@"build"]);
+  NSString* current_build_id = xe_string_from_object(current_release_build[@"buildId"]);
+  if (current_build_id.length > 0) {
+    NSString* report_channel = xe_string_from_object(build[@"channel"]);
+    NSString* report_build_id = xe_string_from_object(build[@"buildId"]);
+    return [report_channel isEqualToString:@"release"] &&
+           [report_build_id isEqualToString:current_build_id];
   }
-  if ([channel isEqualToString:@"self-built"]) {
-    return NO;
-  }
-  if (official && !official.boolValue) {
-    return NO;
-  }
-  return YES;
+  if (!build) return YES;
+  NSString* channel = xe_string_from_object(build[@"channel"]);
+  if (channel.length == 0) return YES;
+  return [channel isEqualToString:@"release"];
 }
 
-static NSArray<NSDictionary*>* xe_compat_release_evidence_reports(NSDictionary* compat_info,
-                                                                  NSString* platform) {
-  NSArray* reports = [compat_info[@"reports"] isKindOfClass:[NSArray class]]
-                         ? (NSArray*)compat_info[@"reports"]
-                         : nil;
-  if (!reports || reports.count == 0) {
-    return nil;
-  }
-
-  NSMutableArray<NSDictionary*>* release_like_reports = [NSMutableArray array];
-  for (id raw_report in reports) {
-    NSDictionary* report = xe_dictionary_from_object(raw_report);
-    if (!report) {
-      continue;
+// Mirrors the compat worker's buildSummaryForChannel — produces summaries in
+// the exact shape that data/compatibility.json's summaries.* fields use
+// (channel, status, perf, notes, updatedAt, reportCount, latestReport,
+// bestReport). Pass `current_release_build` from the release-builds manifest
+// when summarising the release channel; pass nil for "all".
+static NSDictionary* xe_compat_summarize_reports_for_channel(NSArray<NSDictionary*>* reports,
+                                                             NSDictionary* current_release_build,
+                                                             NSString* channel) {
+  NSMutableArray<NSDictionary*>* matching = [NSMutableArray arrayWithCapacity:reports.count];
+  if ([channel isEqualToString:@"all"]) {
+    for (id raw in reports) {
+      NSDictionary* report = xe_dictionary_from_object(raw);
+      if (report) [matching addObject:report];
     }
-    NSString* report_platform = xe_string_from_object(report[@"platform"]);
-    if (platform.length > 0 && ![report_platform isEqualToString:platform]) {
-      continue;
-    }
-    if (xe_compat_report_affects_release(report)) {
-      [release_like_reports addObject:report];
-    }
-  }
-
-  if (release_like_reports.count == 0) {
-    return nil;
-  }
-
-  NSMutableDictionary<NSString*, NSMutableArray<NSDictionary*>*>* explicit_release_groups =
-      [NSMutableDictionary dictionary];
-  for (NSDictionary* report in release_like_reports) {
-    NSDictionary* build_info = xe_dictionary_from_object(report[@"build"]);
-    NSString* channel = xe_string_from_object(build_info[@"channel"]);
-    NSNumber* official = [build_info[@"official"] isKindOfClass:[NSNumber class]]
-                             ? (NSNumber*)build_info[@"official"]
-                             : nil;
-    NSString* fingerprint = xe_compat_build_fingerprint(build_info);
-    if (![channel isEqualToString:@"release"] || (official && !official.boolValue) ||
-        fingerprint.length == 0) {
-      continue;
-    }
-    NSMutableArray<NSDictionary*>* group = explicit_release_groups[fingerprint];
-    if (!group) {
-      group = [NSMutableArray array];
-      explicit_release_groups[fingerprint] = group;
-    }
-    [group addObject:report];
-  }
-
-  if (explicit_release_groups.count > 0) {
-    NSArray<NSDictionary*>* newest_group = nil;
-    NSString* newest_group_date = @"";
-    for (NSArray<NSDictionary*>* group in [explicit_release_groups allValues]) {
-      NSDictionary* newest_report = xe_compat_newest_report(group);
-      NSString* newest_date = xe_string_from_object(newest_report[@"date"]) ?: @"";
-      if (!newest_group || xe_compat_date_is_newer(newest_date, newest_group_date)) {
-        newest_group = group;
-        newest_group_date = newest_date;
+  } else {
+    for (id raw in reports) {
+      NSDictionary* report = xe_dictionary_from_object(raw);
+      if (report && xe_compat_release_filter_matches(report, current_release_build)) {
+        [matching addObject:report];
       }
     }
-    return newest_group;
   }
 
-  NSMutableArray<NSDictionary*>* legacy_release_reports = [NSMutableArray array];
-  for (NSDictionary* report in release_like_reports) {
-    if (!xe_dictionary_from_object(report[@"build"])) {
-      [legacy_release_reports addObject:report];
-    }
-  }
-  return legacy_release_reports.count > 0 ? legacy_release_reports : nil;
-}
-
-static NSString* xe_derive_public_release_status(NSArray<NSDictionary*>* reports) {
-  if (reports.count == 0) {
-    return @"untested";
-  }
-  NSString* best_status = @"nothing";
-  NSInteger best_rank = 0;
-  BOOL has_non_playable = NO;
-  for (NSDictionary* report in reports) {
-    NSString* status = xe_string_from_object(report[@"status"]) ?: @"nothing";
-    NSInteger rank = xe_compat_status_rank(status);
-    if (rank > best_rank) {
-      best_rank = rank;
-      best_status = status;
-    }
-    if (![status isEqualToString:@"playable"]) {
-      has_non_playable = YES;
-    }
-  }
-  if ([best_status isEqualToString:@"playable"] && has_non_playable) {
-    return @"ingame";
-  }
-  return best_status;
-}
-
-static NSString* xe_derive_public_release_perf(NSArray<NSDictionary*>* reports, NSString* status) {
-  if (reports.count == 0 || [status isEqualToString:@"untested"] ||
-      [status isEqualToString:@"nothing"]) {
-    return @"n/a";
-  }
-  BOOL has_ok = NO;
-  BOOL has_great = NO;
-  for (NSDictionary* report in reports) {
-    NSString* perf = xe_string_from_object(report[@"perf"]);
-    if ([perf isEqualToString:@"poor"]) {
-      return @"poor";
-    }
-    if ([perf isEqualToString:@"ok"]) {
-      has_ok = YES;
-    } else if ([perf isEqualToString:@"great"]) {
-      has_great = YES;
-    }
-  }
-  if (has_ok) {
-    return @"ok";
-  }
-  if (has_great) {
-    return @"great";
-  }
-  return @"n/a";
-}
-
-NSDictionary* xe_ios_public_release_summary_from_compat_info(NSDictionary* compat_info) {
-  // Match the website's compatibility table for iOS:
-  // 1. Consider only iOS reports that affect the public release verdict.
-  //    Preview and self-built reports are excluded, while legacy reports with
-  //    no build metadata still count as release-track evidence.
-  // 2. If explicit official release-build reports exist, use only the newest
-  //    matching build group; otherwise fall back to legacy release-track reports.
-  // 3. Derive the public status from the best release-track report, but
-  //    downgrade Playable to In-Game when mixed release outcomes exist so the
-  //    badge stays conservative, just like the site.
-  // 4. Derive perf conservatively from the same release-track evidence, with
-  //    any Poor report forcing the public perf tier to Poor.
-  //
-  // TODO(reality): Re-evaluate this mirror logic periodically against xenios.jp
-  // so the app stays aligned if the website changes its release-summary rules.
-  // Ideally this derivation should move into the GitHub Actions worker so the
-  // website and app consume the same published verdict instead of mirroring
-  // logic in two places.
-  NSArray<NSDictionary*>* reports = xe_compat_release_evidence_reports(compat_info, @"ios");
-  if (!reports || reports.count == 0) {
-    return nil;
-  }
-
-  NSString* status = xe_derive_public_release_status(reports);
-  NSString* perf = xe_derive_public_release_perf(reports, status);
-  NSDictionary* newest_report = xe_compat_newest_report(reports);
-  NSDictionary* best_report = xe_compat_best_report(reports);
-  NSDictionary* detail_report = best_report ?: newest_report;
+  NSDictionary* best_report = xe_compat_best_report(matching);
+  NSDictionary* latest_report = xe_compat_latest_report(matching);
 
   NSMutableDictionary* summary = [NSMutableDictionary dictionary];
-  summary[@"status"] = status;
-  summary[@"perf"] = perf;
-  summary[@"reportCount"] = @(reports.count);
+  summary[@"channel"] = channel ?: @"all";
+  summary[@"status"] =
+      best_report ? (xe_string_from_object(best_report[@"status"]) ?: @"untested") : @"untested";
+  NSString* best_perf = xe_string_from_object(best_report[@"perf"]);
+  summary[@"perf"] = best_perf.length > 0 ? best_perf : (id)[NSNull null];
+  summary[@"notes"] = xe_string_from_object(latest_report[@"notes"]) ?: @"";
+  NSString* latest_date = xe_string_from_object(latest_report[@"date"]);
+  summary[@"updatedAt"] = latest_date.length > 0 ? latest_date : (id)[NSNull null];
+  summary[@"date"] = summary[@"updatedAt"];
+  summary[@"reportCount"] = @(matching.count);
+  summary[@"latestReport"] = latest_report ?: (id)[NSNull null];
+  summary[@"bestReport"] = best_report ?: (id)[NSNull null];
 
-  NSString* updated_at = xe_string_from_object(newest_report[@"date"]);
-  if (updated_at.length > 0) {
-    summary[@"updatedAt"] = updated_at;
-    summary[@"date"] = updated_at;
-  }
-
-  NSString* notes = xe_string_from_object(newest_report[@"notes"]);
-  if (notes.length > 0) {
-    summary[@"notes"] = notes;
-  }
-
-  if (detail_report) {
+  if (best_report) {
     for (NSString* key in @[ @"device", @"platform", @"osVersion", @"arch", @"gpuBackend" ]) {
-      NSString* value = xe_string_from_object(detail_report[key]);
+      NSString* value = xe_string_from_object(best_report[key]);
       if (value.length > 0) {
         summary[key] = value;
       }
     }
-    NSDictionary* build_info = xe_dictionary_from_object(newest_report[@"build"]);
+    NSDictionary* build_info = xe_dictionary_from_object(best_report[@"build"]);
     if (build_info) {
       summary[@"build"] = build_info;
     }
   }
-
   return summary;
 }
 
+// Worker-built summaries leave device / platform / osVersion / arch /
+// gpuBackend / build inside the nested bestReport (and latestReport) so the
+// summary stays compact. The iOS hero card reads those at the top level —
+// flatten them when handing the dict to UI code so older locally-derived
+// summaries and worker-built summaries look the same to callers.
+static NSDictionary* xe_compat_flatten_summary_detail_fields(NSDictionary* summary) {
+  if (!summary) return nil;
+  NSDictionary* best = xe_dictionary_from_object(summary[@"bestReport"]);
+  NSDictionary* latest = xe_dictionary_from_object(summary[@"latestReport"]);
+  NSDictionary* detail = best ?: latest;
+  if (!detail) {
+    return summary;
+  }
+  NSMutableDictionary* flattened = [[summary mutableCopy] autorelease];
+  for (NSString* key in
+       @[ @"device", @"deviceMachine", @"platform", @"osVersion", @"arch", @"gpuBackend" ]) {
+    if (xe_string_from_object(flattened[key]).length > 0) continue;
+    NSString* value = xe_string_from_object(detail[key]);
+    if (value.length > 0) {
+      flattened[key] = value;
+    }
+  }
+  if (!xe_dictionary_from_object(flattened[@"build"])) {
+    NSDictionary* build = xe_dictionary_from_object(detail[@"build"]);
+    if (build) flattened[@"build"] = build;
+  }
+  return flattened;
+}
+
+NSDictionary* xe_ios_public_release_summary_from_compat_info(NSDictionary* compat_info) {
+  // The website (and the cloudflare worker that produces
+  // data/compatibility.json) ships pre-computed release / all summaries on
+  // every entry. Trust those: they are the canonical verdict that xenios.jp
+  // displays. Only fall back to local derivation when an older feed lacks
+  // them, and even then mirror the worker's algorithm exactly:
+  //   * status  = bestReport.status (highest rank, latest date as tie-break)
+  //   * perf    = bestReport.perf  (no "worst-of-all" downgrade)
+  //   * notes   = latestReport.notes
+  //   * updated = latestReport.date (date-only, no rank tie-break)
+  //   * release filter = report.build.buildId == current release buildId,
+  //                      with legacy reports (no build / no channel) admitted
+  //                      and channel=="release" admitted when no manifest is
+  //                      available.
+  NSDictionary* summaries = xe_dictionary_from_object(compat_info[@"summaries"]);
+  NSDictionary* prebuilt_release = xe_dictionary_from_object(summaries[@"release"]);
+  if (xe_compat_entry_has_summary_fields(prebuilt_release)) {
+    return xe_compat_flatten_summary_detail_fields(prebuilt_release);
+  }
+
+  NSArray* raw_reports = compat_info[@"reports"];
+  NSArray<NSDictionary*>* reports =
+      [raw_reports isKindOfClass:[NSArray class]] ? (NSArray<NSDictionary*>*)raw_reports : nil;
+  if (reports.count == 0) {
+    return nil;
+  }
+  NSDictionary* derived = xe_compat_summarize_reports_for_channel(reports, nil, @"release");
+  return xe_compat_entry_has_summary_fields(derived) ? derived : nil;
+}
+
 NSDictionary* xe_preferred_summary_from_compat_info(NSDictionary* compat_info) {
-  NSDictionary* ios_public_release = xe_ios_public_release_summary_from_compat_info(compat_info);
-  if (ios_public_release) {
-    return ios_public_release;
+  // Trust the worker-computed release / all summaries first — that is what
+  // xenios.jp displays. Flatten the nested bestReport / latestReport device
+  // fields onto the result so legacy callers see a single flat dictionary.
+  NSDictionary* summaries = xe_dictionary_from_object(compat_info[@"summaries"]);
+  NSDictionary* release_summary = xe_dictionary_from_object(summaries[@"release"]);
+  if (xe_compat_entry_has_summary_fields(release_summary)) {
+    return xe_compat_flatten_summary_detail_fields(release_summary);
   }
-  NSDictionary* release = xe_release_summary_from_compat_info(compat_info);
-  if (release) {
-    return release;
+  NSDictionary* all_summary = xe_dictionary_from_object(summaries[@"all"]);
+  if (xe_compat_entry_has_summary_fields(all_summary)) {
+    return xe_compat_flatten_summary_detail_fields(all_summary);
   }
+  // Older feeds carry a top-level status/perf/notes block with no nested
+  // summaries dictionary; treat the entry itself as the summary in that case.
   if (xe_compat_entry_has_summary_fields(compat_info)) {
     return compat_info;
   }
-  NSDictionary* all = xe_compat_summary_named(compat_info, @"all");
-  if (all) {
-    return all;
+  // Last resort: derive a release summary from the raw reports (still
+  // following the website's algorithm).
+  NSDictionary* derived = xe_ios_public_release_summary_from_compat_info(compat_info);
+  if (derived) {
+    return derived;
   }
   return xe_compat_summary_named(compat_info, @"preview");
 }

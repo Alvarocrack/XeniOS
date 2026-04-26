@@ -1223,8 +1223,12 @@ constexpr NSInteger kXeniaDiscussionPreviewCount = 3;
   cell.contentView.backgroundColor = [UIColor clearColor];
 
   NSDictionary* summary_source = xe_preferred_summary_from_compat_info(compat_info_);
-  NSDictionary* release_summary = xe_release_summary_from_compat_info(compat_info_);
-  BOOL using_release_summary = summary_source && summary_source == release_summary;
+  // The worker tags both prebuilt summaries and our local fallback derivation
+  // with `channel`. xenios.jp uses the same field to switch its "RELEASE
+  // SUMMARY" header, so mirror that check here instead of relying on pointer
+  // identity.
+  BOOL using_release_summary =
+      [xe_string_from_object(summary_source[@"channel"]) isEqualToString:@"release"];
   NSDictionary* details_source = summary_source ?: [self latestDiscussionReport];
 
   NSString* status = xe_string_from_object(details_source[@"status"]);
