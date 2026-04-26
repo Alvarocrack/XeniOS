@@ -30,6 +30,7 @@ project("xenia-ui")
       "ios_landscape_navigation_controller.mm",
       "ios_log_view_controller.mm",
       "ios_metal_view.mm",
+      "ios_profile_view_controller.mm",
       "ios_system_utils.mm",
       "ios_theme.mm",
       "surface_ios.mm",
