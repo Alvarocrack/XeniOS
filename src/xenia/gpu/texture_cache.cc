@@ -431,24 +431,93 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
 bool TextureCache::AnyUsedTextureRequestWorkPending(
     uint32_t used_texture_mask) const {
+  return GetUsedTextureRequestWorkMask(used_texture_mask) != 0;
+}
+
+uint32_t TextureCache::GetUsedTextureRequestWorkMask(
+    uint32_t used_texture_mask) const {
   if (!used_texture_mask) {
-    return false;
+    return 0;
   }
   // Any used slot that is out of sync needs work.
-  if (used_texture_mask & ~texture_bindings_in_sync_) {
-    return true;
-  }
+  uint32_t work_mask = used_texture_mask & ~texture_bindings_in_sync_;
   // Any in-sync slot whose backing texture data is outdated also needs work.
   uint32_t used_in_sync = used_texture_mask & texture_bindings_in_sync_;
   uint32_t index = 0;
   while (xe::bit_scan_forward(used_in_sync, &index)) {
+    uint32_t index_bit = UINT32_C(1) << index;
     used_in_sync = xe::clear_lowest_bit(used_in_sync);
     const TextureBinding& binding = texture_bindings_[index];
     if (binding.key.is_valid && IsBindingOutdatedForUse(binding)) {
-      return true;
+      work_mask |= index_bit;
     }
   }
-  return false;
+  return work_mask;
+}
+
+uint32_t TextureCache::GetUsedTextureRangeOverlapMask(
+    uint32_t used_texture_mask, uint32_t start, uint32_t length) const {
+  if (!used_texture_mask || !length) {
+    return 0;
+  }
+  start &= 0x1FFFFFFF;
+  length = std::min(length, 0x20000000 - start);
+  if (!length) {
+    return 0;
+  }
+  const uint64_t range_start = start;
+  const uint64_t range_end = range_start + length;
+  auto overlaps = [&](uint32_t texture_start, uint32_t texture_length) {
+    if (!texture_length) {
+      return false;
+    }
+    const uint64_t texture_end = uint64_t(texture_start) + texture_length;
+    return uint64_t(texture_start) < range_end && texture_end > range_start;
+  };
+  const auto& regs = register_file();
+  uint32_t overlap_mask = 0;
+  uint32_t remaining_bits = used_texture_mask;
+  uint32_t index = 0;
+  while (xe::bit_scan_forward(remaining_bits, &index)) {
+    const uint32_t index_bit = UINT32_C(1) << index;
+    remaining_bits = xe::clear_lowest_bit(remaining_bits);
+    TextureKey key;
+    texture_util::TextureGuestLayout computed_layout;
+    const texture_util::TextureGuestLayout* layout = nullptr;
+    const TextureBinding& binding = texture_bindings_[index];
+    if ((texture_bindings_in_sync_ & index_bit) && binding.key.is_valid) {
+      key = binding.key;
+      const Texture* texture =
+          binding.texture ? binding.texture : binding.texture_signed;
+      if (texture) {
+        layout = &texture->guest_layout();
+      }
+    } else {
+      uint8_t swizzled_signs = 0;
+      BindingInfoFromFetchConstant(regs.GetTextureFetch(index), key,
+                                   &swizzled_signs);
+    }
+    if (!key.is_valid) {
+      continue;
+    }
+    if (!layout) {
+      computed_layout = key.GetGuestLayout();
+      layout = &computed_layout;
+    }
+    if (key.base_page &&
+        overlaps(key.base_page << 12,
+                 xe::align(layout->base.level_data_extent_bytes,
+                           UINT32_C(16)))) {
+      overlap_mask |= index_bit;
+      continue;
+    }
+    if (key.mip_page &&
+        overlaps(key.mip_page << 12,
+                 xe::align(layout->mips_total_extent_bytes, UINT32_C(16)))) {
+      overlap_mask |= index_bit;
+    }
+  }
+  return overlap_mask;
 }
 
 bool TextureCache::IsBindingOutdatedForUse(
@@ -649,6 +718,25 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
+}
+
+bool TextureCache::DestroyOldestTextureIfUnused(
+    uint64_t completed_submission_index) {
+  Texture* texture = texture_used_first_;
+  if (!texture ||
+      texture->last_usage_submission_index() > completed_submission_index) {
+    return false;
+  }
+  ResetTextureBindings();
+  auto found_texture_it = textures_.find(texture->key());
+  assert_true(found_texture_it != textures_.end());
+  if (found_texture_it == textures_.end()) {
+    return false;
+  }
+  assert_true(found_texture_it->second.get() == texture);
+  textures_.erase(found_texture_it);
+  COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  return true;
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {

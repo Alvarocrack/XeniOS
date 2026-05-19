@@ -128,6 +128,11 @@ class TextureCache {
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
   bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
+  uint32_t GetUsedTextureRequestWorkMask(uint32_t used_texture_mask) const;
+  uint32_t GetUsedTextureRangeOverlapMask(uint32_t used_texture_mask,
+                                          uint32_t start,
+                                          uint32_t length) const;
+  size_t GetTotalTextureCount() const { return textures_.size(); }
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -551,6 +556,7 @@ class TextureCache {
   // to the implementation that are used in their destructor, and will become
   // invalid if the implementation is destroyed before the texture.
   void DestroyAllTextures(bool from_destructor = false);
+  bool DestroyOldestTextureIfUnused(uint64_t completed_submission_index);
 
   // Whether the signed version of the texture has a different representation on
   // the host than its unsigned version (for example, if it's a fixed-point
