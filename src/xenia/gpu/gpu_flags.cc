@@ -217,6 +217,21 @@ DEFINE_int32(anisotropic_override, -1,
              "  5 = Force 16x anisotropic filtering",
              "GPU");
 
+DEFINE_bool(metal_shader_disk_cache, true,
+            "Cache compiled Metal shader libraries (metallib) to disk when "
+            "store_shaders is enabled.",
+            "Metal");
+
+DEFINE_bool(metal_pipeline_binary_archive, true,
+            "Use MTLBinaryArchive for Metal pipeline compilation caching. "
+            "Requires store_shaders and a compatible OS/driver.",
+            "Metal");
+
+DEFINE_bool(metal_pipeline_disk_cache, true,
+            "Store Metal render pipeline descriptor keys to disk so the binary "
+            "archive can be prewarmed on the next run.",
+            "Metal");
+
 DEFINE_bool(
     ac6_ground_fix, false,
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "

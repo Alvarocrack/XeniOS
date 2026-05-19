@@ -70,6 +70,10 @@ DECLARE_bool(readback_resolve_half_pixel_offset);
 
 DECLARE_bool(gpu_3d_to_2d_texture);
 
+DECLARE_bool(metal_shader_disk_cache);
+DECLARE_bool(metal_pipeline_binary_archive);
+DECLARE_bool(metal_pipeline_disk_cache);
+
 DECLARE_bool(ac6_ground_fix);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
