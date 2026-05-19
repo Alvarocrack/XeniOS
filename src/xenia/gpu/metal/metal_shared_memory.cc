@@ -33,7 +33,9 @@ bool MetalSharedMemory::Initialize() {
   // Try to alias guest memory on unified-memory devices and fall back to a
   // dedicated shared buffer when not supported.
   // Initialize base class
-  InitializeCommon();
+  if (!InitializeCommon()) {
+    return false;
+  }
 
   const ui::metal::MetalProvider& provider =
       command_processor_.GetMetalProvider();

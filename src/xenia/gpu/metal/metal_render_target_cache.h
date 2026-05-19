@@ -11,12 +11,12 @@
 #define XENIA_GPU_METAL_METAL_RENDER_TARGET_CACHE_H_
 
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/trace_writer.h"
@@ -24,6 +24,8 @@
 #include "xenia/memory.h"
 
 #include "third_party/metal-cpp/Metal/Metal.hpp"
+
+struct IRDescriptorTableEntry;
 
 namespace xe {
 namespace gpu {
@@ -151,7 +153,19 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
 
   // Metal-specific methods
   MTL::RenderPassDescriptor* GetRenderPassDescriptor(
-      uint32_t expected_sample_count = 1);
+      uint32_t expected_sample_count = 1,
+      bool fallback_depth_attachment_required = false);
+  bool IsRenderPassDescriptorCompatible(
+      MTL::RenderPassDescriptor* pass_descriptor,
+      uint32_t expected_sample_count = 1,
+      bool fallback_depth_attachment_required = false) const;
+  bool HasPendingDrawPassTransfers() const {
+    return pending_draw_pass_transfer_mask_ != 0;
+  }
+  bool EncodePendingDrawPassTransfers(
+      MTL::RenderCommandEncoder* encoder,
+      MTL::RenderPassDescriptor* pass_descriptor);
+  bool FlushPendingDrawPassTransfers();
 
   bool IsRenderPassDescriptorDirty() const {
     return render_pass_descriptor_dirty_;
@@ -166,6 +180,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::Texture* GetColorTargetForDraw(uint32_t index) const;
   MTL::Texture* GetDepthTargetForDraw() const;
   MTL::Texture* GetDummyColorTargetForDraw() const;
+  double GetDepthTargetClearDepth() const;
 
   // Get the last REAL (non-dummy) render targets for capture
   MTL::Texture* GetLastRealColorTarget(uint32_t index) const;
@@ -184,6 +199,10 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   void RestoreEdramSnapshot(const void* snapshot);
 
   MTL::Buffer* GetEdramBuffer() const { return edram_buffer_; }
+  bool WriteEdramUintPow2BindlessDescriptor(
+      IRDescriptorTableEntry* entry, uint32_t element_size_bytes_pow2) const;
+  void UseBindlessResources(MetalCommandProcessor& command_processor,
+                            MTL::ResourceUsage usage) const;
 
   // Resolve (copy) render targets to shared memory
   bool Resolve(Memory& memory, uint32_t& written_address,
@@ -199,32 +218,34 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;
+  void RequestPixelShaderInterlockBarrier() override;
 
  private:
-  void RecordRenderTargetViewCreated();
-
   static uint32_t GetMetalEdramDumpFormat(RenderTargetKey key);
   MTL::Library* GetOrCreateEdramLoadLibrary(bool msaa);
   MTL::RenderPipelineState* GetOrCreateEdramLoadPipeline(
       MTL::PixelFormat dest_format, uint32_t sample_count);
+  bool InitializeEdramBufferViews();
+  void ReleaseEdramBufferViews();
+  MTL::Texture* GetEdramUintPow2BufferView(
+      uint32_t element_size_bytes_pow2) const;
 
   MetalCommandProcessor& command_processor_;
   TraceWriter* trace_writer_;
 
-  std::atomic<uint64_t> render_target_views_created_{0};
-
   // Metal device reference
   MTL::Device* device_ = nullptr;
-  bool gamma_render_target_as_srgb_ = false;
   bool gamma_render_target_as_unorm16_ = false;
 
   std::unique_ptr<MetalHeapPool> render_target_heap_pool_;
 
   // EDRAM buffer (10MB embedded DRAM)
   MTL::Buffer* edram_buffer_ = nullptr;
+  MTL::Texture* edram_r32_uint_buffer_view_ = nullptr;
+  MTL::Texture* edram_r32g32_uint_buffer_view_ = nullptr;
+  MTL::Texture* edram_r32g32b32a32_uint_buffer_view_ = nullptr;
 
   // EDRAM compute shaders for tile operations
-  MTL::ComputePipelineState* edram_load_pipeline_ = nullptr;   // Tiled → Linear
   MTL::ComputePipelineState* edram_store_pipeline_ = nullptr;  // Linear → Tiled
   std::unordered_map<uint64_t, MTL::RenderPipelineState*> edram_load_pipelines_;
   MTL::Library* edram_load_library_ = nullptr;
@@ -235,10 +256,22 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::ComputePipelineState* edram_dump_color_32bpp_1xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_color_32bpp_2xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_color_32bpp_4xmsaa_pipeline_ = nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_1xmsaa_pipeline_ =
+      nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_2xmsaa_pipeline_ =
+      nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_4xmsaa_pipeline_ =
+      nullptr;
   // Color, 64bpp.
   MTL::ComputePipelineState* edram_dump_color_64bpp_1xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_color_64bpp_2xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_color_64bpp_4xmsaa_pipeline_ = nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_1xmsaa_pipeline_ =
+      nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_2xmsaa_pipeline_ =
+      nullptr;
+  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_4xmsaa_pipeline_ =
+      nullptr;
   // Depth (D24x / D24FS8 encoded as 32bpp in EDRAM snapshot).
   MTL::ComputePipelineState* edram_dump_depth_32bpp_1xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
@@ -267,6 +300,24 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       nullptr;
   MTL::ComputePipelineState* resolve_fast_64bpp_4xmsaa_scaled_pipeline_ =
       nullptr;
+
+  // Direct host resolve compute shaders (host RT -> shared/scaled resolve
+  // memory) for fast and full color copies plus depth copies.
+  static constexpr size_t kDirectHostResolveBppCount = 2;     // 32, 64
+  static constexpr size_t kDirectHostResolveMsaaCount = 3;    // 1x, 2x, 4x
+  static constexpr size_t kDirectHostResolveScaledCount = 2;  // false, true
+  static constexpr size_t kDirectHostResolveSourceCount = 2;  // float, uint
+  static constexpr size_t kDirectHostResolveFullDestCount =
+      5;  // 8, 16, 32, 64, 128
+  MTL::ComputePipelineState* direct_host_resolve_pipelines_
+      [kDirectHostResolveBppCount][kDirectHostResolveMsaaCount]
+      [kDirectHostResolveScaledCount][kDirectHostResolveSourceCount] = {};
+  MTL::ComputePipelineState* direct_host_color_full_resolve_pipelines_
+      [kDirectHostResolveMsaaCount][kDirectHostResolveScaledCount]
+      [kDirectHostResolveSourceCount][kDirectHostResolveFullDestCount] = {};
+  MTL::ComputePipelineState*
+      direct_host_depth_resolve_pipelines_[kDirectHostResolveMsaaCount]
+                                          [kDirectHostResolveScaledCount] = {};
 
   // Host depth store compute shaders (1x/2x/4x MSAA).
   MTL::ComputePipelineState* host_depth_store_pipelines_[3] = {};
@@ -352,6 +403,82 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     };
   };
 
+  using TransferColorAttachmentFormats =
+      std::array<MTL::PixelFormat, xenos::kMaxColorRenderTargets>;
+
+  struct TransferPipelineKey {
+    TransferShaderKey shader_key;
+    uint32_t color_attachment_index = 0;
+    uint32_t native_stencil_output = 0;
+    TransferColorAttachmentFormats color_attachment_formats = {};
+    MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid;
+    MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid;
+
+    bool operator==(const TransferPipelineKey& other) const {
+      return shader_key == other.shader_key &&
+             color_attachment_index == other.color_attachment_index &&
+             native_stencil_output == other.native_stencil_output &&
+             color_attachment_formats == other.color_attachment_formats &&
+             depth_attachment_format == other.depth_attachment_format &&
+             stencil_attachment_format == other.stencil_attachment_format;
+    }
+
+    struct Hasher {
+      size_t operator()(const TransferPipelineKey& key) const {
+        auto combine = [](size_t seed, size_t value) {
+          return seed ^ (value + 0x9E3779B9 + (seed << 6) + (seed >> 2));
+        };
+        size_t h = TransferShaderKey::Hasher()(key.shader_key);
+        h = combine(h, key.color_attachment_index);
+        h = combine(h, key.native_stencil_output);
+        h = combine(h, size_t(key.depth_attachment_format));
+        h = combine(h, size_t(key.stencil_attachment_format));
+        for (MTL::PixelFormat color_format : key.color_attachment_formats) {
+          h = combine(h, size_t(color_format));
+        }
+        return h;
+      }
+    };
+  };
+
+  struct TransferClearPipelineKey {
+    uint32_t color_attachment_index = 0;
+    uint32_t sample_count = 1;
+    uint32_t dest_is_uint = 0;
+    uint32_t is_depth = 0;
+    TransferColorAttachmentFormats color_attachment_formats = {};
+    MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid;
+    MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid;
+
+    bool operator==(const TransferClearPipelineKey& other) const {
+      return color_attachment_index == other.color_attachment_index &&
+             sample_count == other.sample_count &&
+             dest_is_uint == other.dest_is_uint &&
+             is_depth == other.is_depth &&
+             color_attachment_formats == other.color_attachment_formats &&
+             depth_attachment_format == other.depth_attachment_format &&
+             stencil_attachment_format == other.stencil_attachment_format;
+    }
+
+    struct Hasher {
+      size_t operator()(const TransferClearPipelineKey& key) const {
+        auto combine = [](size_t seed, size_t value) {
+          return seed ^ (value + 0x9E3779B9 + (seed << 6) + (seed >> 2));
+        };
+        size_t h = key.color_attachment_index;
+        h = combine(h, key.sample_count);
+        h = combine(h, key.dest_is_uint);
+        h = combine(h, key.is_depth);
+        h = combine(h, size_t(key.depth_attachment_format));
+        h = combine(h, size_t(key.stencil_attachment_format));
+        for (MTL::PixelFormat color_format : key.color_attachment_formats) {
+          h = combine(h, size_t(color_format));
+        }
+        return h;
+      }
+    };
+  };
+
   struct TransferInvocation {
     Transfer transfer;
     TransferShaderKey shader_key;
@@ -381,29 +508,70 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     }
   };
 
-  std::unordered_map<TransferShaderKey, MTL::RenderPipelineState*,
-                     TransferShaderKey::Hasher>
+  enum class DrawPassTransferRejectionReason : uint32_t {
+    kNone,
+    kInvalidTargetSlot,
+    kNoDestination,
+    kDepthDestination,
+    kDestinationFormatOrTexture,
+    kUnsupportedSource,
+    kHostDepthSelfSource,
+    kHostDepthSourceActiveInDrawPass,
+    kSelfSource,
+    kDepthToColorSourceActiveInDrawPass,
+    kSourceTextureConflict,
+    kSourceFormatMismatch,
+    kSourceActiveInDrawPass,
+    kInvalidRectangles,
+    kCount,
+  };
+
+  static constexpr size_t kDrawPassTransferRejectionReasonCount =
+      size_t(DrawPassTransferRejectionReason::kCount);
+
+  enum class DirectHostResolveRejectionReason : uint32_t {
+    kNotHostPath,
+    kSourceTypeMismatch,
+    kCopyShaderNotFast,
+    kCopyShaderFull8bpp,
+    kCopyShaderFull16bpp,
+    kCopyShaderFull32bpp,
+    kCopyShaderFull64bpp,
+    kCopyShaderFull128bpp,
+    kCopyShaderUnknown,
+    kExpBias,
+    kSampleSelect,
+    kFormatNotBitwise,
+    kMissingTexture,
+    kSourceFormatMismatch,
+    kMissingPipeline,
+    kSourceCoverage,
+    kDispatchAlignment,
+    kSourceFormatNotPackable,
+    kGammaColor,
+    kGammaAsUnorm16,
+    kCount,
+  };
+
+
+  std::unordered_map<TransferPipelineKey, MTL::RenderPipelineState*,
+                     TransferPipelineKey::Hasher>
       transfer_pipelines_;
-  std::unordered_map<TransferShaderKey, MTL::RenderPipelineState*,
-                     TransferShaderKey::Hasher>
-      transfer_tile_pipelines_;
   std::vector<TransferInvocation> transfer_invocations_;
   MTL::Library* transfer_library_ = nullptr;
-  std::unordered_map<uint32_t, MTL::RenderPipelineState*>
+  std::unordered_map<TransferClearPipelineKey, MTL::RenderPipelineState*,
+                     TransferClearPipelineKey::Hasher>
       transfer_clear_pipelines_;
-  static constexpr uint32_t kTransferInstanceBufferCount = 3;
-  std::array<MTL::Buffer*, kTransferInstanceBufferCount>
-      transfer_tile_instance_buffers_ = {};
-  std::array<size_t, kTransferInstanceBufferCount>
-      transfer_tile_instance_buffer_sizes_ = {};
-  std::array<std::vector<MTL::Buffer*>, kTransferInstanceBufferCount>
-      transfer_tile_instance_retired_buffers_ = {};
-  uint64_t transfer_tile_instance_buffer_frame_id_ = 0;
-  size_t transfer_tile_instance_buffer_offset_ = 0;
+  std::array<RenderTarget*, 1 + xenos::kMaxColorRenderTargets>
+      pending_draw_pass_render_targets_ = {};
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets>
+      pending_draw_pass_transfers_;
+  uint32_t pending_draw_pass_transfer_mask_ = 0;
   MTL::DepthStencilState* transfer_depth_state_ = nullptr;
   MTL::DepthStencilState* transfer_depth_state_none_ = nullptr;
   MTL::DepthStencilState* transfer_depth_clear_state_ = nullptr;
   MTL::DepthStencilState* transfer_stencil_clear_state_ = nullptr;
+  MTL::DepthStencilState* transfer_stencil_output_state_ = nullptr;
   MTL::DepthStencilState* transfer_stencil_bit_states_[8] = {};
   MTL::Buffer* transfer_dummy_buffer_ = nullptr;
   MTL::Texture* transfer_dummy_color_float_[3] = {};
@@ -428,6 +596,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::RenderPassDescriptor* cached_render_pass_descriptor_ = nullptr;
   bool render_pass_descriptor_dirty_ = true;
   uint32_t cached_render_pass_descriptor_sample_count_ = 0;
+  bool cached_render_pass_descriptor_fallback_depth_required_ = false;
 
   // Dummy render target for when no render targets are bound
   struct DummyColorTargetEntry {
@@ -453,6 +622,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::Texture* CreateDepthTexture(uint32_t width, uint32_t height,
                                    xenos::DepthRenderTargetFormat format,
                                    uint32_t samples);
+  MTL::Texture* CreateTransientDepthTexture(uint32_t width, uint32_t height,
+                                            uint32_t samples);
   MTL::Texture* GetStencilTextureView(MetalRenderTarget* render_target);
 
   MTL::PixelFormat GetColorResourcePixelFormat(
@@ -463,6 +634,19 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       xenos::ColorRenderTargetFormat format, bool* is_integer_out) const;
   MTL::PixelFormat GetDepthPixelFormat(
       xenos::DepthRenderTargetFormat format) const;
+  TransferShaderKey GetColorToColorTransferShaderKey(
+      RenderTargetKey source_key, RenderTargetKey dest_key) const;
+  bool GetActiveTransferAttachmentFormats(
+      MTL::RenderPassDescriptor* pass_descriptor,
+      TransferColorAttachmentFormats& color_attachment_formats_out,
+      MTL::PixelFormat& depth_attachment_format_out,
+      MTL::PixelFormat& stencil_attachment_format_out) const;
+  DrawPassTransferRejectionReason GetDrawPassTransferRejectionReason(
+      uint32_t render_target_index, RenderTarget* const* render_targets,
+      const std::vector<Transfer>& transfers) const;
+  bool PreflightPendingDrawPassTransfers(
+      MTL::RenderPassDescriptor* pass_descriptor);
+  void ClearPendingDrawPassTransfers();
 
   // EDRAM compute shader setup
   bool InitializeEdramComputeShaders();
@@ -472,10 +656,17 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   // D3D12RenderTargetCache::GetOrCreateTransferPipelines.
   MTL::RenderPipelineState* GetOrCreateTransferPipelines(
       const TransferShaderKey& key, MTL::PixelFormat dest_format,
-      bool dest_is_uint, bool tile_instanced);
+      bool dest_is_uint, bool native_stencil_output,
+      uint32_t color_attachment_index = 0,
+      const TransferColorAttachmentFormats* color_attachment_formats = nullptr,
+      MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid,
+      MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid);
   MTL::RenderPipelineState* GetOrCreateTransferClearPipeline(
       MTL::PixelFormat dest_format, bool dest_is_uint, bool is_depth,
-      uint32_t sample_count);
+      uint32_t sample_count, uint32_t color_attachment_index = 0,
+      const TransferColorAttachmentFormats* color_attachment_formats = nullptr,
+      MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid,
+      MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid);
   MTL::Library* GetOrCreateTransferLibrary();
   MTL::Texture* GetTransferDummyTexture(MTL::PixelFormat format,
                                         uint32_t sample_count);
@@ -488,33 +679,65 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::DepthStencilState* GetTransferNoDepthStencilState();
   MTL::DepthStencilState* GetTransferDepthClearState();
   MTL::DepthStencilState* GetTransferStencilClearState();
+  MTL::DepthStencilState* GetTransferStencilOutputState();
   MTL::DepthStencilState* GetTransferStencilBitState(uint32_t bit);
 
   // EDRAM tile operations
-
-  void LoadTiledData(MTL::CommandBuffer* command_buffer, MTL::Texture* texture,
-                     uint32_t edram_base, uint32_t pitch_tiles,
-                     uint32_t height_tiles, bool is_depth);
 
   void StoreTiledData(MTL::CommandBuffer* command_buffer, MTL::Texture* texture,
                       uint32_t edram_base, uint32_t pitch_tiles,
                       uint32_t height_tiles, bool is_depth);
 
-  // Ownership transfer support - copies data between render targets when
-  // EDRAM regions are aliased between different RT configurations.
-  // This mirrors D3D12/Vulkan's PerformTransfersAndResolveClears.
-  void PerformTransfersAndResolveClears(
+  // Host render backend transfer/resolve boundary.
+  //
+  // Ownership transfer support -- copies data between render targets when
+  // EDRAM regions are aliased between different RT configurations.  This
+  // mirrors D3D12/Vulkan's PerformTransfersAndResolveClears and is the sole
+  // transfer execution entry point used by both the draw path (via Update)
+  // and the copy path (via Resolve).  All host-side transfer and resolve-
+  // clear work flows through this method; no transfer operations bypass the
+  // render target cache.
+  bool PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
       const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
-      MTL::CommandBuffer* command_buffer = nullptr);
+      MTL::CommandBuffer* command_buffer = nullptr,
+      MTL::RenderCommandEncoder* active_render_encoder = nullptr,
+      MTL::RenderPassDescriptor* active_render_pass_descriptor = nullptr);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                          uint32_t dump_rows, uint32_t dump_pitch,
-                         MTL::CommandBuffer* command_buffer = nullptr);
+                         MTL::CommandBuffer* command_buffer = nullptr,
+                         const char* encoder_label = nullptr);
+
+  bool TryDirectHostResolveCopy(
+      const draw_util::ResolveInfo& resolve_info,
+      const draw_util::ResolveCopyShaderConstants& copy_constants,
+      draw_util::ResolveCopyShaderIndex copy_shader, uint32_t dump_base,
+      uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
+      MTL::CommandBuffer* command_buffer, uint32_t& written_address,
+      uint32_t& written_length);
+  struct ResolveDestinationBuffer {
+    MTL::Buffer* buffer = nullptr;
+    size_t offset = 0;
+    size_t length = 0;
+  };
+  bool PrepareResolveDestinationBuffer(
+      const draw_util::ResolveInfo& resolve_info, bool draw_resolution_scaled,
+      ResolveDestinationBuffer& destination);
+  MTL::ComputePipelineState* GetDirectHostResolvePipeline(
+      bool is_64bpp, xenos::MsaaSamples msaa_samples, bool scaled,
+      bool source_is_uint) const;
+  MTL::ComputePipelineState* GetDirectHostColorFullResolvePipeline(
+      xenos::MsaaSamples msaa_samples, bool scaled, bool source_is_uint,
+      draw_util::ResolveCopyShaderIndex copy_shader) const;
+  MTL::ComputePipelineState* GetDirectHostDepthResolvePipeline(
+      xenos::MsaaSamples msaa_samples, bool scaled) const;
+  void RecordDirectHostResolveRejection(
+      DirectHostResolveRejectionReason reason);
 };
 
 }  // namespace metal
