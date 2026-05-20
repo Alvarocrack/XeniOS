@@ -62,7 +62,7 @@ namespace metal {
 
 class MetalGraphicsSystem;
 
-class MetalCommandProcessor : public CommandProcessor {
+class MetalCommandProcessor final : public CommandProcessor {
  protected:
 #define OVERRIDING_BASE_CMDPROCESSOR
 #include "../pm4_command_processor_declare.h"
@@ -207,24 +207,6 @@ class MetalCommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
 
-  // ===========================================================================
-  // Host render backend boundary.
-  //
-  // The methods below define the host-specific draw, copy/resolve, and
-  // transfer entry points that IssueDraw / IssueCopy delegate to.  They are
-  // virtual so a future strict-path backend can override them without
-  // touching the guest-facing command processor logic.
-  //
-  // Draw path:   PrepareDrawConstants -> BeginRenderEncoderForDraw
-  //              -> ApplyDrawDynamicState -> PopulateBindlessTables
-  //              -> DispatchDraw
-  // Copy path:   EndRenderEncoder -> Resolve
-  // Transfer:    MetalRenderTargetCache::PerformTransfersAndResolveClears
-  //              (sole transfer execution entry point; called from both the
-  //              draw path via Update and the copy path via Resolve -- no
-  //              transfer operations bypass the render target cache)
-  // ===========================================================================
-
   // Per-draw uniform buffer coordinates passed between IssueDraw sub-methods.
   struct UniformBufferInfo {
     struct Cbv {
@@ -266,7 +248,7 @@ class MetalCommandProcessor : public CommandProcessor {
 
   // Host draw path — prepare per-draw dynamic state and upload constant buffers
   // before entering the Metal render encoder.
-  virtual bool PrepareDrawConstants(
+  bool PrepareDrawConstants(
       const RegisterFile& regs, Shader* vertex_shader, Shader* pixel_shader,
       MetalShader* metal_vertex_shader, MetalShader* metal_pixel_shader,
       bool shared_memory_is_uav,

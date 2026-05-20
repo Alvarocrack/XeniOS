@@ -1856,7 +1856,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Configure render targets via MetalRenderTargetCache, similar to D3D12.
   // Update() may internally call PerformTransfersAndResolveClears for EDRAM
   // ownership transfers -- this is the draw-path transfer entry point and
-  // is part of the host render backend boundary (see header comment).
+  // no transfer operations bypass the render target cache.
   if (render_target_cache_) {
     auto normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
     uint32_t ps_writes_color_targets =
@@ -1885,9 +1885,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // MSC (DXBC -> DXIL -> Metal IR) draw path.
   //
   // Guest-facing work (shader analysis, translation, pipeline lookup,
-  // shared-memory sync) is performed here.  The host-specific draw
-  // backend (PrepareDrawConstants / PopulateBindlessTables / DispatchDraw) is
-  // invoked at the end of this block.
+  // shared-memory sync) is performed here. Metal draw helpers are invoked at
+  // the end of this block.
   // =========================================================================
   // Cast to MSC-specific shader types for the rest of this path.
   auto* metal_vertex_shader = static_cast<MetalShader*>(vertex_shader);
@@ -2409,13 +2408,10 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   // =========================================================================
-  // Host render backend draw entry point.
+  // Metal draw dispatch.
   //
-  // The host methods below form the draw path.  IssueDraw
-  // handles guest-facing validation, shader translation, pipeline lookup,
-  // and shared-memory synchronisation above; the host backend is
-  // responsible only for applying prepared dynamic state, populating
-  // descriptors, and dispatching the Metal draw call.
+  // IssueDraw handled guest-facing validation, shader translation, pipeline
+  // lookup, and shared-memory synchronisation above.
   // =========================================================================
 
   if (prepare_uniforms) {
