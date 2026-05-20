@@ -4481,52 +4481,141 @@ void MetalCommandProcessor::WriteFastRegisterRangeFromRing(
 void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
                                                         uint32_t* base,
                                                         uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
   uint64_t changed = 0;
   uint64_t unchanged = 0;
   uint64_t dirty = 0;
-  bool vertex_dirty = false;
-  bool pixel_dirty = false;
   uint32_t* register_values = register_file_->values;
-  for (uint32_t i = 0; i < num_registers; ++i) {
-    const uint32_t index = start_index + i;
-    const uint32_t value = xe::load_and_swap<uint32_t>(base + i);
-    const uint32_t old_value = register_values[index];
-    register_values[index] = value;
-    if (old_value == value) {
-      ++unchanged;
-      continue;
-    }
-    ++changed;
 
-    uint32_t float_constant_index =
-        (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
-    if (float_constant_index >= 256) {
-      uint32_t rel = float_constant_index & 0xFF;
-      if (current_float_constant_map_pixel_[rel >> 6] &
-          (uint64_t(1) << (rel & 63))) {
-        pixel_dirty = true;
-        ++dirty;
-      }
-    } else if (current_float_constant_map_vertex_[float_constant_index >> 6] &
-               (uint64_t(1) << (float_constant_index & 63))) {
-      vertex_dirty = true;
-      ++dirty;
-    }
-  }
+  const uint32_t dword_start =
+      start_index - XE_GPU_REG_SHADER_CONSTANT_000_X;
+  const uint32_t dword_end = dword_start + num_registers;
+  const uint32_t first_constant = dword_start >> 2;
+  const uint32_t last_constant = (dword_end - 1) >> 2;
+
+  auto bit_range_mask = [](uint32_t first_bit, uint32_t end_bit) {
+    assert_true(first_bit < end_bit && end_bit <= 64);
+    const uint64_t low_mask = first_bit ? (~UINT64_C(0) << first_bit)
+                                        : ~UINT64_C(0);
+    const uint64_t high_mask =
+        end_bit == 64 ? ~UINT64_C(0) : ((UINT64_C(1) << end_bit) - 1);
+    return low_mask & high_mask;
+  };
+
+  auto check_stage_constants =
+      [&](bool& binding_up_to_date, const uint64_t* constant_map,
+          uint32_t stage_first_constant, uint64_t& dirty_stage_counter,
+          uint64_t& already_dirty_counter, uint64_t& unused_range_counter) {
+        constexpr uint32_t kStageFloatConstantCount = 256;
+        const uint32_t stage_constant_end =
+            stage_first_constant + kStageFloatConstantCount;
+        const uint32_t check_first_constant =
+            std::max(first_constant, stage_first_constant);
+        const uint32_t check_constant_end =
+            std::min(last_constant + 1, stage_constant_end);
+        if (check_first_constant >= check_constant_end) {
+          return;
+        }
+        if (!binding_up_to_date) {
+          ++already_dirty_counter;
+          return;
+        }
+
+        bool used_constant_touched = false;
+        bool stage_dirty = false;
+        const uint32_t relative_first_constant =
+            check_first_constant - stage_first_constant;
+        const uint32_t relative_constant_end =
+            check_constant_end - stage_first_constant;
+        const uint32_t first_map_word = relative_first_constant >> 6;
+        const uint32_t last_map_word = (relative_constant_end - 1) >> 6;
+        for (uint32_t map_word = first_map_word; map_word <= last_map_word;
+             ++map_word) {
+          const uint32_t word_first_bit =
+              map_word == first_map_word ? (relative_first_constant & 63) : 0;
+          const uint32_t word_end_bit =
+              map_word == last_map_word
+                  ? ((relative_constant_end - 1) & 63) + 1
+                  : 64;
+          uint64_t constants_in_word =
+              constant_map[map_word] & bit_range_mask(word_first_bit,
+                                                      word_end_bit);
+          uint32_t relative_constant_in_word;
+          while (xe::bit_scan_forward(constants_in_word,
+                                      &relative_constant_in_word)) {
+            constants_in_word = xe::clear_lowest_bit(constants_in_word);
+            used_constant_touched = true;
+            const uint32_t constant_index =
+                stage_first_constant + (map_word << 6) +
+                relative_constant_in_word;
+            const uint32_t constant_dword_start = constant_index << 2;
+            const uint32_t constant_dword_end = constant_dword_start + 4;
+            const uint32_t compare_dword_start =
+                std::max(dword_start, constant_dword_start);
+            const uint32_t compare_dword_end =
+                std::min(dword_end, constant_dword_end);
+            for (uint32_t dword = compare_dword_start;
+                 dword < compare_dword_end; ++dword) {
+              ++backend_telemetry_.register_write_float_dwords_compared;
+              const uint32_t value =
+                  xe::load_and_swap<uint32_t>(base + (dword - dword_start));
+              const uint32_t old_value =
+                  register_values[XE_GPU_REG_SHADER_CONSTANT_000_X + dword];
+              if (old_value == value) {
+                ++unchanged;
+                continue;
+              }
+              ++changed;
+              ++dirty;
+              stage_dirty = true;
+              break;
+            }
+            if (stage_dirty) {
+              break;
+            }
+          }
+          if (stage_dirty) {
+            break;
+          }
+        }
+
+        if (!used_constant_touched) {
+          ++unused_range_counter;
+        }
+        if (stage_dirty) {
+          binding_up_to_date = false;
+          ++dirty_stage_counter;
+        }
+      };
+
+  // Match D3D12's bulk-copy shape, but keep Metal's existing exact dirty
+  // suppression for used constants to avoid creating avoidable MSC root
+  // argument churn from redundant writes.
+  check_stage_constants(cbuffer_binding_float_vertex_.up_to_date,
+                        current_float_constant_map_vertex_, 0,
+                        backend_telemetry_.register_write_float_dirty_vertex,
+                        backend_telemetry_
+                            .register_write_float_stage_already_dirty_vertex,
+                        backend_telemetry_
+                            .register_write_float_range_unused_vertex);
+  check_stage_constants(cbuffer_binding_float_pixel_.up_to_date,
+                        current_float_constant_map_pixel_, 256,
+                        backend_telemetry_.register_write_float_dirty_pixel,
+                        backend_telemetry_
+                            .register_write_float_stage_already_dirty_pixel,
+                        backend_telemetry_
+                            .register_write_float_range_unused_pixel);
+
+  xe::copy_and_swap_32_unaligned(&register_values[start_index], base,
+                                 num_registers);
+
   backend_telemetry_.register_write_float_total += num_registers;
   backend_telemetry_.register_write_float_changed += changed;
   backend_telemetry_.register_write_float_unchanged += unchanged;
   backend_telemetry_.register_write_float_dirty += dirty;
   backend_telemetry_.register_write_float_dwords_copied += num_registers;
-  backend_telemetry_.register_write_float_dwords_compared += num_registers;
-  if (vertex_dirty) {
-    cbuffer_binding_float_vertex_.up_to_date = false;
-    ++backend_telemetry_.register_write_float_dirty_vertex;
-  }
-  if (pixel_dirty) {
-    cbuffer_binding_float_pixel_.up_to_date = false;
-    ++backend_telemetry_.register_write_float_dirty_pixel;
-  }
 }
 
 void MetalCommandProcessor::WriteBoolLoopConstantsFromMem(
