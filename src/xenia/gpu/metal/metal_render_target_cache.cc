@@ -2403,10 +2403,22 @@ bool MetalRenderTargetCache::Update(
       }
       DrawPassTransferRejectionReason draw_pass_rejection =
           GetDrawPassTransferRejectionReason(i, accumulated_targets, transfers);
+      PendingDrawPassTransferPlan& pending_plan =
+          pending_draw_pass_transfer_plans_[i];
+      pending_plan = PendingDrawPassTransferPlan();
+      pending_plan.render_target = accumulated_targets[i];
+      pending_plan.rejection_reason = draw_pass_rejection;
       if (draw_pass_rejection == DrawPassTransferRejectionReason::kNone) {
         pending_draw_pass_render_targets_[i] = accumulated_targets[i];
         pending_draw_pass_transfers_[i] = transfers;
         pending_draw_pass_transfer_mask_ |= uint32_t(1) << i;
+        pending_draw_pass_preflighted_transfer_mask_ = 0;
+        pending_plan.full_overwrite =
+            PendingDrawPassTransfersFullyOverwriteTarget(
+                i, accumulated_targets[i], transfers);
+        if (pending_plan.full_overwrite) {
+          pending_draw_pass_full_overwrite_mask_ |= uint32_t(1) << i;
+        }
         auto* dest_metal_rt =
             static_cast<MetalRenderTarget*>(accumulated_targets[i]);
         if (dest_metal_rt->needs_initial_clear()) {
@@ -2420,6 +2432,12 @@ bool MetalRenderTargetCache::Update(
     PerformTransfersAndResolveClears(
         1 + xenos::kMaxColorRenderTargets, accumulated_targets,
         fallback_transfers.data(), nullptr, nullptr, nullptr);
+    if (HasPendingDrawPassTransfers() &&
+        !EnsurePendingDrawPassTransfersPreflighted()) {
+      if (!FlushPendingDrawPassTransfers()) {
+        return false;
+      }
+    }
   } else {
     PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                      accumulated_targets, update_transfers,
@@ -2439,7 +2457,10 @@ void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
     transfers.clear();
   }
   pending_draw_pass_render_targets_.fill(nullptr);
+  pending_draw_pass_transfer_plans_.fill(PendingDrawPassTransferPlan());
   pending_draw_pass_transfer_mask_ = 0;
+  pending_draw_pass_full_overwrite_mask_ = 0;
+  pending_draw_pass_preflighted_transfer_mask_ = 0;
 }
 
 MetalRenderTargetCache::DrawPassTransferRejectionReason
@@ -2576,14 +2597,59 @@ MetalRenderTargetCache::GetDrawPassTransferRejectionReason(
   return DrawPassTransferRejectionReason::kNone;
 }
 
+bool MetalRenderTargetCache::PendingDrawPassTransfersFullyOverwriteTarget(
+    uint32_t render_target_index, RenderTarget* render_target,
+    const std::vector<Transfer>& transfers) const {
+  if (!render_target || transfers.empty() ||
+      render_target_index > xenos::kMaxColorRenderTargets) {
+    return false;
+  }
+
+  auto* dest_metal_rt = static_cast<MetalRenderTarget*>(render_target);
+  RenderTargetKey dest_key = dest_metal_rt->key();
+  if (dest_key.is_depth != (render_target_index == 0)) {
+    return false;
+  }
+
+  MTL::Texture* dest_texture = dest_metal_rt->draw_texture();
+  if (!dest_texture) {
+    return false;
+  }
+  uint32_t dest_width = uint32_t(dest_texture->width());
+  uint32_t dest_height = uint32_t(dest_texture->height());
+  if (!dest_width || !dest_height) {
+    return false;
+  }
+
+  auto is_full_target_rectangle =
+      [&](const Transfer::Rectangle& rect) -> bool {
+    uint32_t scaled_x = rect.x_pixels * draw_resolution_scale_x();
+    uint32_t scaled_y = rect.y_pixels * draw_resolution_scale_y();
+    uint32_t scaled_width = rect.width_pixels * draw_resolution_scale_x();
+    uint32_t scaled_height = rect.height_pixels * draw_resolution_scale_y();
+    return !scaled_x && !scaled_y && scaled_width == dest_width &&
+           scaled_height == dest_height;
+  };
+
+  for (const Transfer& transfer : transfers) {
+    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+    uint32_t rectangle_count = transfer.GetRectangles(
+        dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
+        dest_key.Is64bpp(), rectangles, nullptr);
+    if (rectangle_count != 1 || !is_full_target_rectangle(rectangles[0])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool MetalRenderTargetCache::GetActiveTransferAttachmentFormats(
     MTL::RenderPassDescriptor* pass_descriptor,
-    TransferColorAttachmentFormats& color_attachment_formats_out,
-    MTL::PixelFormat& depth_attachment_format_out,
-    MTL::PixelFormat& stencil_attachment_format_out) const {
-  color_attachment_formats_out.fill(MTL::PixelFormatInvalid);
-  depth_attachment_format_out = MTL::PixelFormatInvalid;
-  stencil_attachment_format_out = MTL::PixelFormatInvalid;
+    TransferAttachmentFormats& attachment_formats_out) const {
+  attachment_formats_out.color_attachment_formats.fill(
+      MTL::PixelFormatInvalid);
+  attachment_formats_out.depth_attachment_format = MTL::PixelFormatInvalid;
+  attachment_formats_out.stencil_attachment_format = MTL::PixelFormatInvalid;
   if (!pass_descriptor) {
     return false;
   }
@@ -2595,40 +2661,67 @@ bool MetalRenderTargetCache::GetActiveTransferAttachmentFormats(
       MTL::Texture* texture =
           color_attachment ? color_attachment->texture() : nullptr;
       if (texture) {
-        color_attachment_formats_out[i] = texture->pixelFormat();
+        attachment_formats_out.color_attachment_formats[i] =
+            texture->pixelFormat();
       }
     }
   }
 
   if (auto* depth_attachment = pass_descriptor->depthAttachment()) {
     if (MTL::Texture* texture = depth_attachment->texture()) {
-      depth_attachment_format_out = texture->pixelFormat();
+      attachment_formats_out.depth_attachment_format = texture->pixelFormat();
     }
   }
   if (auto* stencil_attachment = pass_descriptor->stencilAttachment()) {
     if (MTL::Texture* texture = stencil_attachment->texture()) {
-      stencil_attachment_format_out = texture->pixelFormat();
+      attachment_formats_out.stencil_attachment_format = texture->pixelFormat();
+    }
+  }
+  return true;
+}
+
+bool MetalRenderTargetCache::GetCurrentTransferAttachmentFormats(
+    TransferAttachmentFormats& attachment_formats_out) const {
+  attachment_formats_out.color_attachment_formats.fill(
+      MTL::PixelFormatInvalid);
+  attachment_formats_out.depth_attachment_format = MTL::PixelFormatInvalid;
+  attachment_formats_out.stencil_attachment_format = MTL::PixelFormatInvalid;
+
+  bool has_color_attachment = false;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    MTL::Texture* texture =
+        current_color_targets_[i] ? current_color_targets_[i]->draw_texture()
+                                  : nullptr;
+    if (!texture) {
+      continue;
+    }
+    attachment_formats_out.color_attachment_formats[i] =
+        texture->pixelFormat();
+    has_color_attachment = true;
+  }
+  if (!has_color_attachment) {
+    attachment_formats_out.color_attachment_formats[0] =
+        GetColorDrawPixelFormat(xenos::ColorRenderTargetFormat::k_8_8_8_8);
+  }
+
+  MTL::Texture* depth_texture =
+      current_depth_target_ ? current_depth_target_->draw_texture() : nullptr;
+  if (depth_texture) {
+    MTL::PixelFormat depth_pixel_format = depth_texture->pixelFormat();
+    attachment_formats_out.depth_attachment_format = depth_pixel_format;
+    if (depth_pixel_format == MTL::PixelFormatDepth32Float_Stencil8 ||
+        depth_pixel_format == MTL::PixelFormatDepth24Unorm_Stencil8 ||
+        depth_pixel_format == MTL::PixelFormatX32_Stencil8) {
+      attachment_formats_out.stencil_attachment_format = depth_pixel_format;
     }
   }
   return true;
 }
 
 bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
-    MTL::RenderPassDescriptor* pass_descriptor) {
+    const TransferAttachmentFormats& attachment_formats) {
   if (!HasPendingDrawPassTransfers()) {
     return true;
-  }
-  if (!pass_descriptor) {
-    return false;
-  }
-
-  TransferColorAttachmentFormats color_attachment_formats;
-  MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid;
-  MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid;
-  if (!GetActiveTransferAttachmentFormats(
-          pass_descriptor, color_attachment_formats, depth_attachment_format,
-          stencil_attachment_format)) {
-    return false;
   }
 
   // Shared RenderTargetCache state uses slot 0 for depth and slots 1..4 for
@@ -2652,22 +2745,16 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
       if (i != 0) {
         return false;
       }
-      auto* depth_attachment = pass_descriptor->depthAttachment();
-      MTL::Texture* depth_texture =
-          depth_attachment ? depth_attachment->texture() : nullptr;
       dest_format = GetDepthPixelFormat(dest_key.GetDepthFormat());
-      if (!depth_texture || depth_texture != dest_metal_rt->draw_texture() ||
-          depth_attachment_format != dest_format ||
+      MTL::Texture* depth_texture = dest_metal_rt->draw_texture();
+      if (!depth_texture || depth_texture->pixelFormat() != dest_format ||
+          attachment_formats.depth_attachment_format != dest_format ||
           !GetTransferDepthStencilState(true)) {
         return false;
       }
       if (dest_format == MTL::PixelFormatDepth32Float_Stencil8 ||
           dest_format == MTL::PixelFormatDepth24Unorm_Stencil8) {
-        auto* stencil_attachment = pass_descriptor->stencilAttachment();
-        MTL::Texture* stencil_texture =
-            stencil_attachment ? stencil_attachment->texture() : nullptr;
-        if (stencil_texture != depth_texture ||
-            stencil_attachment_format != dest_format ||
+        if (attachment_formats.stencil_attachment_format != dest_format ||
             !GetTransferStencilClearState()) {
           return false;
         }
@@ -2683,11 +2770,11 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
         }
       }
       uint32_t sample_count = MsaaSamplesToCount(dest_key.msaa_samples);
-      if (!GetOrCreateTransferClearPipeline(dest_format, false, true,
-                                            sample_count, 0,
-                                            &color_attachment_formats,
-                                            depth_attachment_format,
-                                            stencil_attachment_format)) {
+      if (!GetOrCreateTransferClearPipeline(
+              dest_format, false, true, sample_count, 0,
+              &attachment_formats.color_attachment_formats,
+              attachment_formats.depth_attachment_format,
+              attachment_formats.stencil_attachment_format)) {
         return false;
       }
     } else {
@@ -2695,13 +2782,7 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
         return false;
       }
       color_attachment_index = i - 1;
-      auto* color_attachment =
-          pass_descriptor->colorAttachments()
-              ? pass_descriptor->colorAttachments()->object(
-                    color_attachment_index)
-              : nullptr;
-      MTL::Texture* attachment_texture =
-          color_attachment ? color_attachment->texture() : nullptr;
+      MTL::Texture* attachment_texture = dest_metal_rt->draw_texture();
       if (!attachment_texture ||
           attachment_texture != dest_metal_rt->draw_texture()) {
         return false;
@@ -2709,7 +2790,8 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
       dest_format = GetColorOwnershipTransferPixelFormat(
           dest_key.GetColorFormat(), &dest_is_uint);
       if (dest_is_uint ||
-          color_attachment_formats[color_attachment_index] != dest_format ||
+          attachment_formats.color_attachment_formats[color_attachment_index] !=
+              dest_format ||
           dest_metal_rt->transfer_texture() != attachment_texture ||
           !GetTransferNoDepthStencilState()) {
         return false;
@@ -2774,8 +2856,9 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
           false, false, dest_sample_id_from_sample_default);
       if (!GetOrCreateTransferPipelines(
               shader_key, dest_format, false, false, color_attachment_index,
-              &color_attachment_formats, depth_attachment_format,
-              stencil_attachment_format)) {
+              &attachment_formats.color_attachment_formats,
+              attachment_formats.depth_attachment_format,
+              attachment_formats.stencil_attachment_format)) {
         return false;
       }
       if (dest_key.is_depth) {
@@ -2787,13 +2870,17 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
             GetTransferStencilOutputState() &&
             GetOrCreateTransferPipelines(
                 stencil_shader_key, dest_format, false, true,
-                color_attachment_index, &color_attachment_formats,
-                depth_attachment_format, stencil_attachment_format);
+                color_attachment_index,
+                &attachment_formats.color_attachment_formats,
+                attachment_formats.depth_attachment_format,
+                attachment_formats.stencil_attachment_format);
         if (!native_stencil_output_ready &&
             !GetOrCreateTransferPipelines(
                 stencil_shader_key, dest_format, false, false,
-                color_attachment_index, &color_attachment_formats,
-                depth_attachment_format, stencil_attachment_format)) {
+                color_attachment_index,
+                &attachment_formats.color_attachment_formats,
+                attachment_formats.depth_attachment_format,
+                attachment_formats.stencil_attachment_format)) {
           return false;
         }
       }
@@ -2801,6 +2888,50 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
   }
 
   return true;
+}
+
+bool MetalRenderTargetCache::EnsurePendingDrawPassTransfersPreflighted() {
+  if (!HasPendingDrawPassTransfers()) {
+    return true;
+  }
+  if (pending_draw_pass_preflighted_transfer_mask_ ==
+      pending_draw_pass_transfer_mask_) {
+    return true;
+  }
+
+  TransferAttachmentFormats attachment_formats;
+  if (!GetCurrentTransferAttachmentFormats(attachment_formats) ||
+      !PreflightPendingDrawPassTransfers(attachment_formats)) {
+    pending_draw_pass_preflighted_transfer_mask_ = 0;
+    for (PendingDrawPassTransferPlan& plan : pending_draw_pass_transfer_plans_) {
+      plan.preflighted = false;
+      plan.load_action_safe = false;
+    }
+    return false;
+  }
+
+  pending_draw_pass_preflighted_transfer_mask_ =
+      pending_draw_pass_transfer_mask_;
+  for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
+    if (!(pending_draw_pass_transfer_mask_ & (uint32_t(1) << i))) {
+      continue;
+    }
+    PendingDrawPassTransferPlan& plan = pending_draw_pass_transfer_plans_[i];
+    plan.attachment_formats = attachment_formats;
+    plan.preflighted = true;
+    plan.load_action_safe = plan.full_overwrite;
+  }
+  return true;
+}
+
+bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
+    MTL::RenderPassDescriptor* pass_descriptor) {
+  TransferAttachmentFormats attachment_formats;
+  if (!GetActiveTransferAttachmentFormats(pass_descriptor,
+                                          attachment_formats)) {
+    return false;
+  }
+  return PreflightPendingDrawPassTransfers(attachment_formats);
 }
 
 bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
@@ -5229,13 +5360,10 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       (resolve_clear_needed || !active_render_pass_descriptor)) {
     return false;
   }
-  TransferColorAttachmentFormats active_color_attachment_formats;
-  MTL::PixelFormat active_depth_attachment_format = MTL::PixelFormatInvalid;
-  MTL::PixelFormat active_stencil_attachment_format = MTL::PixelFormatInvalid;
+  TransferAttachmentFormats active_attachment_formats;
   if (use_active_render_encoder &&
       !GetActiveTransferAttachmentFormats(
-          active_render_pass_descriptor, active_color_attachment_formats,
-          active_depth_attachment_format, active_stencil_attachment_format)) {
+          active_render_pass_descriptor, active_attachment_formats)) {
     return false;
   }
   bool any_work = false;
@@ -5437,7 +5565,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     }
     if (use_active_render_encoder) {
       if (dest_is_depth) {
-        if (i != 0 || active_depth_attachment_format != dest_pixel_format) {
+        if (i != 0 ||
+            active_attachment_formats.depth_attachment_format !=
+                dest_pixel_format) {
           return false;
         }
         auto* depth_attachment =
@@ -5454,7 +5584,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           MTL::Texture* stencil_texture =
               stencil_attachment ? stencil_attachment->texture() : nullptr;
           if (stencil_texture != depth_texture ||
-              active_stencil_attachment_format != dest_pixel_format) {
+              active_attachment_formats.stencil_attachment_format !=
+                  dest_pixel_format) {
             return false;
           }
         }
@@ -5463,7 +5594,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           return false;
         }
         active_color_attachment_index = i - 1;
-        if (active_color_attachment_formats[active_color_attachment_index] !=
+        if (active_attachment_formats
+                .color_attachment_formats[active_color_attachment_index] !=
             dest_pixel_format) {
           return false;
         }
@@ -5934,13 +6066,16 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             GetOrCreateTransferClearPipeline(dest_pixel_format, false, true,
                                              dest_sample_count, 0,
                                              use_active_render_encoder
-                                                 ? &active_color_attachment_formats
+                                                 ? &active_attachment_formats
+                                                        .color_attachment_formats
                                                  : nullptr,
                                              use_active_render_encoder
-                                                 ? active_depth_attachment_format
+                                                 ? active_attachment_formats
+                                                        .depth_attachment_format
                                                  : MTL::PixelFormatInvalid,
                                              use_active_render_encoder
-                                                 ? active_stencil_attachment_format
+                                                 ? active_attachment_formats
+                                                        .stencil_attachment_format
                                                  : MTL::PixelFormatInvalid);
         MTL::DepthStencilState* stencil_clear_state =
             GetTransferStencilClearState();
@@ -6355,24 +6490,30 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           MTL::RenderPipelineState* pipeline = GetOrCreateTransferPipelines(
               shader_key, dest_pixel_format, dest_is_uint,
               use_native_stencil_output, active_color_attachment_index,
-              use_active_render_encoder ? &active_color_attachment_formats
-                                        : nullptr,
-              use_active_render_encoder ? active_depth_attachment_format
-                                        : MTL::PixelFormatInvalid,
-              use_active_render_encoder ? active_stencil_attachment_format
-                                        : MTL::PixelFormatInvalid);
+              use_active_render_encoder
+                  ? &active_attachment_formats.color_attachment_formats
+                  : nullptr,
+              use_active_render_encoder
+                  ? active_attachment_formats.depth_attachment_format
+                  : MTL::PixelFormatInvalid,
+              use_active_render_encoder
+                  ? active_attachment_formats.stencil_attachment_format
+                  : MTL::PixelFormatInvalid);
           if (!pipeline && use_native_stencil_output) {
             use_native_stencil_output = false;
             native_stencil_output_state = nullptr;
             pipeline = GetOrCreateTransferPipelines(
                 shader_key, dest_pixel_format, dest_is_uint, false,
                 active_color_attachment_index,
-                use_active_render_encoder ? &active_color_attachment_formats
-                                          : nullptr,
-                use_active_render_encoder ? active_depth_attachment_format
-                                          : MTL::PixelFormatInvalid,
-                use_active_render_encoder ? active_stencil_attachment_format
-                                          : MTL::PixelFormatInvalid);
+                use_active_render_encoder
+                    ? &active_attachment_formats.color_attachment_formats
+                    : nullptr,
+                use_active_render_encoder
+                    ? active_attachment_formats.depth_attachment_format
+                    : MTL::PixelFormatInvalid,
+                use_active_render_encoder
+                    ? active_attachment_formats.stencil_attachment_format
+                    : MTL::PixelFormatInvalid);
           }
           if (!pipeline) {
             continue;

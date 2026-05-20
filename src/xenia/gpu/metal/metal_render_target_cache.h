@@ -376,6 +376,12 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   using TransferColorAttachmentFormats =
       std::array<MTL::PixelFormat, xenos::kMaxColorRenderTargets>;
 
+  struct TransferAttachmentFormats {
+    TransferColorAttachmentFormats color_attachment_formats = {};
+    MTL::PixelFormat depth_attachment_format = MTL::PixelFormatInvalid;
+    MTL::PixelFormat stencil_attachment_format = MTL::PixelFormatInvalid;
+  };
+
   struct TransferPipelineKey {
     TransferShaderKey shader_key;
     uint32_t color_attachment_index = 0;
@@ -495,6 +501,16 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     kInvalidRectangles,
   };
 
+  struct PendingDrawPassTransferPlan {
+    RenderTarget* render_target = nullptr;
+    DrawPassTransferRejectionReason rejection_reason =
+        DrawPassTransferRejectionReason::kNoDestination;
+    TransferAttachmentFormats attachment_formats = {};
+    bool full_overwrite = false;
+    bool preflighted = false;
+    bool load_action_safe = false;
+  };
+
   std::unordered_map<TransferPipelineKey, MTL::RenderPipelineState*,
                      TransferPipelineKey::Hasher>
       transfer_pipelines_;
@@ -507,7 +523,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       pending_draw_pass_render_targets_ = {};
   std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets>
       pending_draw_pass_transfers_;
+  std::array<PendingDrawPassTransferPlan, 1 + xenos::kMaxColorRenderTargets>
+      pending_draw_pass_transfer_plans_ = {};
   uint32_t pending_draw_pass_transfer_mask_ = 0;
+  uint32_t pending_draw_pass_full_overwrite_mask_ = 0;
+  uint32_t pending_draw_pass_preflighted_transfer_mask_ = 0;
   MTL::DepthStencilState* transfer_depth_state_ = nullptr;
   MTL::DepthStencilState* transfer_depth_state_none_ = nullptr;
   MTL::DepthStencilState* transfer_depth_clear_state_ = nullptr;
@@ -579,12 +599,18 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       bool dest_sample_id_from_sample_default) const;
   bool GetActiveTransferAttachmentFormats(
       MTL::RenderPassDescriptor* pass_descriptor,
-      TransferColorAttachmentFormats& color_attachment_formats_out,
-      MTL::PixelFormat& depth_attachment_format_out,
-      MTL::PixelFormat& stencil_attachment_format_out) const;
+      TransferAttachmentFormats& attachment_formats_out) const;
+  bool GetCurrentTransferAttachmentFormats(
+      TransferAttachmentFormats& attachment_formats_out) const;
   DrawPassTransferRejectionReason GetDrawPassTransferRejectionReason(
       uint32_t render_target_index, RenderTarget* const* render_targets,
       const std::vector<Transfer>& transfers) const;
+  bool PendingDrawPassTransfersFullyOverwriteTarget(
+      uint32_t render_target_index, RenderTarget* render_target,
+      const std::vector<Transfer>& transfers) const;
+  bool EnsurePendingDrawPassTransfersPreflighted();
+  bool PreflightPendingDrawPassTransfers(
+      const TransferAttachmentFormats& attachment_formats);
   bool PreflightPendingDrawPassTransfers(
       MTL::RenderPassDescriptor* pass_descriptor);
   void ClearPendingDrawPassTransfers();
