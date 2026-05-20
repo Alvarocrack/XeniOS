@@ -747,6 +747,29 @@ class MetalCommandProcessor final : public CommandProcessor {
     size_t size = 0;
     bool up_to_date = false;
   };
+  struct StageRootArgumentKey {
+    std::array<uint64_t, kTopLevelABSlotsPerTable> pointers = {};
+    std::array<size_t, kCbvSlotCount> cbv_sizes = {};
+
+    bool operator==(const StageRootArgumentKey& other) const {
+      return pointers == other.pointers && cbv_sizes == other.cbv_sizes;
+    }
+    bool operator!=(const StageRootArgumentKey& other) const {
+      return !(*this == other);
+    }
+  };
+  struct StageRootArgumentAllocation {
+    MTL::Buffer* buffer = nullptr;
+    NS::UInteger offset = 0;
+    uint64_t gpu_address = 0;
+    StageRootArgumentKey key = {};
+    bool valid = false;
+  };
+  StageRootArgumentKey BuildStageRootArgumentKey(
+      const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
+      bool shared_memory_is_uav) const;
+  void WriteStageRootArgumentTable(uint64_t* top_level_ptrs,
+                                   const StageRootArgumentKey& key) const;
   ConstantBufferBinding cbuffer_binding_system_;
   ConstantBufferBinding cbuffer_binding_float_vertex_;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
@@ -782,9 +805,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t current_bindless_stable_resources_serial_ = 0;
   uint64_t render_encoder_bindless_table_resources_serial_ = 0;
   uint64_t render_encoder_bindless_stable_resources_serial_ = 0;
-  MTL::Buffer* current_bindless_top_level_buffer_ = nullptr;
-  NS::UInteger current_bindless_top_level_offset_ = 0;
-  uint64_t current_bindless_top_level_gpu_address_ = 0;
+  std::array<StageRootArgumentAllocation, kStageCount>
+      current_bindless_stage_root_arguments_ = {};
   std::array<std::array<uint64_t, kCbvSlotCount>, kStageCount>
       current_bindless_cbv_gpu_addresses_ = {};
   std::array<std::array<size_t, kCbvSlotCount>, kStageCount>

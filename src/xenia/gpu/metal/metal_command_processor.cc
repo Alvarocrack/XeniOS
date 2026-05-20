@@ -628,9 +628,7 @@ MetalCommandProcessor::~MetalCommandProcessor() {
   current_bindless_stable_resources_serial_ = 0;
   render_encoder_bindless_table_resources_serial_ = 0;
   render_encoder_bindless_stable_resources_serial_ = 0;
-  current_bindless_top_level_buffer_ = nullptr;
-  current_bindless_top_level_offset_ = 0;
-  current_bindless_top_level_gpu_address_ = 0;
+  current_bindless_stage_root_arguments_ = {};
   current_bindless_stable_resources_valid_ = false;
   current_bindless_stable_shared_memory_is_uav_ = false;
   current_bindless_stable_shared_memory_usage_bits_ = 0;
@@ -3312,6 +3310,54 @@ void MetalCommandProcessor::ApplyDrawDynamicState(
   }
 }
 
+MetalCommandProcessor::StageRootArgumentKey
+MetalCommandProcessor::BuildStageRootArgumentKey(
+    const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
+    bool shared_memory_is_uav) const {
+  StageRootArgumentKey key;
+  constexpr uint64_t kDescriptorEntrySize = sizeof(IRDescriptorTableEntry);
+  uint64_t view_heap_gpu = view_bindless_heap_->gpuAddress();
+  uint64_t sampler_heap_gpu = sampler_bindless_heap_->gpuAddress();
+  uint64_t system_view_gpu = system_view_tables_->gpuAddress();
+  uint64_t srv_space0_gpu =
+      system_view_gpu + (shared_memory_is_uav
+                             ? kSystemViewTableSRVNull
+                             : kSystemViewTableSRVSharedMemory) *
+                            kDescriptorEntrySize;
+  uint64_t uav_space0_gpu =
+      system_view_gpu + (shared_memory_is_uav
+                             ? kSystemViewTableUAVSharedMemoryStart
+                             : kSystemViewTableUAVNullStart) *
+                            kDescriptorEntrySize;
+  uint64_t null_uav_gpu =
+      system_view_gpu + kSystemViewTableUAVNullStart * kDescriptorEntrySize;
+
+  key.pointers[kTopLevelABSlotSRVSpace0] = srv_space0_gpu;
+  key.pointers[kTopLevelABSlotSRVSpace1] = view_heap_gpu;
+  key.pointers[kTopLevelABSlotSRVSpace2] = view_heap_gpu;
+  key.pointers[kTopLevelABSlotSRVSpace3] = view_heap_gpu;
+  key.pointers[kTopLevelABSlotSRVSpace10] = view_heap_gpu;
+  key.pointers[kTopLevelABSlotUAVSpace0] = uav_space0_gpu;
+  key.pointers[kTopLevelABSlotUAVSpace1] = null_uav_gpu;
+  key.pointers[kTopLevelABSlotUAVSpace2] = null_uav_gpu;
+  key.pointers[kTopLevelABSlotUAVSpace3] = null_uav_gpu;
+  key.pointers[kTopLevelABSlotSamplerSpace0] = sampler_heap_gpu;
+
+  for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
+    const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
+    key.pointers[kTopLevelABSlotCBVSystem + cbv] =
+        uniform_cbv.gpu_address ? uniform_cbv.gpu_address
+                                : null_buffer_->gpuAddress();
+    key.cbv_sizes[cbv] = uniform_cbv.size;
+  }
+  return key;
+}
+
+void MetalCommandProcessor::WriteStageRootArgumentTable(
+    uint64_t* top_level_ptrs, const StageRootArgumentKey& key) const {
+  std::memcpy(top_level_ptrs, key.pointers.data(), kTopLevelABBytesPerTable);
+}
+
 bool MetalCommandProcessor::PopulateBindlessTables(
     MetalShader* metal_vertex_shader, MetalShader* metal_pixel_shader,
     bool shared_memory_is_uav, MTL::ResourceUsage shared_memory_usage,
@@ -3395,28 +3441,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       return false;
     }
 
-    constexpr uint64_t kDescriptorEntrySize = sizeof(IRDescriptorTableEntry);
-    uint64_t view_heap_gpu = view_bindless_heap_->gpuAddress();
-    uint64_t sampler_heap_gpu = sampler_bindless_heap_->gpuAddress();
-    uint64_t system_view_gpu = system_view_tables_->gpuAddress();
-    uint64_t srv_space0_gpu =
-        system_view_gpu + (shared_memory_is_uav
-                               ? kSystemViewTableSRVNull
-                               : kSystemViewTableSRVSharedMemory) *
-                              kDescriptorEntrySize;
-    uint64_t uav_space0_gpu =
-        system_view_gpu + (shared_memory_is_uav
-                               ? kSystemViewTableUAVSharedMemoryStart
-                               : kSystemViewTableUAVNullStart) *
-                              kDescriptorEntrySize;
-    uint64_t null_uav_gpu =
-        system_view_gpu + kSystemViewTableUAVNullStart * kDescriptorEntrySize;
-
     auto write_top_level_root_arguments =
         [&](size_t stage_index,
             const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>&
                 uniform_cbvs) {
-          if (stage_index < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+          if (stage_index <
+              BackendTelemetryStats::kBindlessTelemetryStageCount) {
             ++backend_telemetry_
                   .bindless_stage_top_level_allocations[stage_index];
             backend_telemetry_.bindless_stage_top_level_bytes[stage_index] +=
@@ -3425,36 +3455,23 @@ bool MetalCommandProcessor::PopulateBindlessTables(
           auto* top_level_ptrs = reinterpret_cast<uint64_t*>(
               reinterpret_cast<uint8_t*>(top_level_entries_all) +
               stage_index * kTopLevelABBytesPerTable);
-          std::memset(top_level_ptrs, 0, kTopLevelABBytesPerTable);
-
-          top_level_ptrs[kTopLevelABSlotSRVSpace0] = srv_space0_gpu;
-          top_level_ptrs[kTopLevelABSlotSRVSpace1] = view_heap_gpu;
-          top_level_ptrs[kTopLevelABSlotSRVSpace2] = view_heap_gpu;
-          top_level_ptrs[kTopLevelABSlotSRVSpace3] = view_heap_gpu;
-          top_level_ptrs[kTopLevelABSlotSRVSpace10] = view_heap_gpu;
-          top_level_ptrs[kTopLevelABSlotUAVSpace0] = uav_space0_gpu;
-          top_level_ptrs[kTopLevelABSlotUAVSpace1] = null_uav_gpu;
-          top_level_ptrs[kTopLevelABSlotUAVSpace2] = null_uav_gpu;
-          top_level_ptrs[kTopLevelABSlotUAVSpace3] = null_uav_gpu;
-          top_level_ptrs[kTopLevelABSlotSamplerSpace0] = sampler_heap_gpu;
-
-          auto write_root_cbv = [&](TopLevelABSlot slot,
-                                    const UniformBufferInfo::Cbv& uniform_cbv) {
+          StageRootArgumentKey key =
+              BuildStageRootArgumentKey(uniform_cbvs, shared_memory_is_uav);
+          WriteStageRootArgumentTable(top_level_ptrs, key);
+          current_bindless_stage_root_arguments_[stage_index] = {
+              top_level_buffer,
+              static_cast<NS::UInteger>(
+                  top_level_offset + stage_index * kTopLevelABBytesPerTable),
+              top_level_gpu_address + stage_index * kTopLevelABBytesPerTable,
+              key,
+              true};
+          for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
             ++backend_telemetry_.bindless_root_cbv_pointer_writes;
             if (stage_index <
                 BackendTelemetryStats::kBindlessTelemetryStageCount) {
               ++backend_telemetry_
                     .bindless_stage_root_cbv_pointer_writes[stage_index];
             }
-            top_level_ptrs[slot] =
-                uniform_cbv.gpu_address ? uniform_cbv.gpu_address
-                                        : null_buffer_->gpuAddress();
-          };
-          for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
-            const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
-            write_root_cbv(static_cast<TopLevelABSlot>(
-                               kTopLevelABSlotCBVSystem + cbv),
-                           uniform_cbv);
           }
         };
 
@@ -3462,10 +3479,6 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     write_top_level_root_arguments(kStagePixel, uniforms.cbvs[kStagePixel]);
 
     current_bindless_table_valid_ = true;
-    current_bindless_top_level_buffer_ = top_level_buffer;
-    current_bindless_top_level_offset_ =
-        static_cast<NS::UInteger>(top_level_offset);
-    current_bindless_top_level_gpu_address_ = top_level_gpu_address;
     for (size_t stage = 0; stage < kStageCount; ++stage) {
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         current_bindless_cbv_gpu_addresses_[stage][cbv] =
@@ -3570,8 +3583,26 @@ bool MetalCommandProcessor::PopulateBindlessTables(
 
   if (render_encoder_bindless_table_resources_serial_ !=
       current_bindless_table_serial_) {
-    UseRenderEncoderResource(current_bindless_top_level_buffer_,
-                             MTL::ResourceUsageRead);
+    for (const StageRootArgumentAllocation& allocation :
+         current_bindless_stage_root_arguments_) {
+      if (!allocation.valid || !allocation.buffer) {
+        continue;
+      }
+      bool already_used = false;
+      for (const StageRootArgumentAllocation& previous :
+           current_bindless_stage_root_arguments_) {
+        if (&previous == &allocation) {
+          break;
+        }
+        if (previous.valid && previous.buffer == allocation.buffer) {
+          already_used = true;
+          break;
+        }
+      }
+      if (!already_used) {
+        UseRenderEncoderResource(allocation.buffer, MTL::ResourceUsageRead);
+      }
+    }
     std::array<MTL::Buffer*, kStageCount * kCbvSlotCount>
         uniform_buffers_for_encoder;
     uint32_t uniform_buffer_count = 0;
@@ -3579,7 +3610,15 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       if (!uniform_buffer) {
         return;
       }
-      if (uniform_buffer == current_bindless_top_level_buffer_) {
+      bool is_stage_root_argument_buffer = false;
+      for (const StageRootArgumentAllocation& allocation :
+           current_bindless_stage_root_arguments_) {
+        if (allocation.valid && allocation.buffer == uniform_buffer) {
+          is_stage_root_argument_buffer = true;
+          break;
+        }
+      }
+      if (is_stage_root_argument_buffer) {
         return;
       }
       for (uint32_t i = 0; i < uniform_buffer_count; ++i) {
@@ -3605,29 +3644,29 @@ bool MetalCommandProcessor::PopulateBindlessTables(
         current_bindless_table_serial_;
   }
 
-  const NS::UInteger top_level_offset_vertex =
-      current_bindless_top_level_offset_ +
-      NS::UInteger(kStageVertex * kTopLevelABBytesPerTable);
-  const NS::UInteger top_level_offset_pixel =
-      current_bindless_top_level_offset_ +
-      NS::UInteger(kStagePixel * kTopLevelABBytesPerTable);
+  const StageRootArgumentAllocation& vertex_root_arguments =
+      current_bindless_stage_root_arguments_[kStageVertex];
+  const StageRootArgumentAllocation& pixel_root_arguments =
+      current_bindless_stage_root_arguments_[kStagePixel];
+  assert_true(vertex_root_arguments.valid);
+  assert_true(pixel_root_arguments.valid);
   if (use_geometry_emulation || use_tessellation_emulation) {
-    SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
-                                 top_level_offset_vertex,
+    SetRenderEncoderObjectBuffer(vertex_root_arguments.buffer,
+                                 vertex_root_arguments.offset,
                                  kIRArgumentBufferBindPoint);
-    SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
-                               top_level_offset_vertex,
+    SetRenderEncoderMeshBuffer(vertex_root_arguments.buffer,
+                               vertex_root_arguments.offset,
                                kIRArgumentBufferBindPoint);
-    SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
-                                   top_level_offset_pixel,
+    SetRenderEncoderFragmentBuffer(pixel_root_arguments.buffer,
+                                   pixel_root_arguments.offset,
                                    kIRArgumentBufferBindPoint);
 
     if (use_tessellation_emulation) {
-      SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
-                                   top_level_offset_vertex,
+      SetRenderEncoderObjectBuffer(vertex_root_arguments.buffer,
+                                   vertex_root_arguments.offset,
                                    kIRArgumentBufferHullDomainBindPoint);
-      SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
-                                 top_level_offset_vertex,
+      SetRenderEncoderMeshBuffer(vertex_root_arguments.buffer,
+                                 vertex_root_arguments.offset,
                                  kIRArgumentBufferHullDomainBindPoint);
     }
 
@@ -3647,11 +3686,11 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       heap_binds_set_on_encoder_ = true;
     }
   } else {
-    SetRenderEncoderVertexBuffer(current_bindless_top_level_buffer_,
-                                 top_level_offset_vertex,
+    SetRenderEncoderVertexBuffer(vertex_root_arguments.buffer,
+                                 vertex_root_arguments.offset,
                                  kIRArgumentBufferBindPoint);
-    SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
-                                   top_level_offset_pixel,
+    SetRenderEncoderFragmentBuffer(pixel_root_arguments.buffer,
+                                   pixel_root_arguments.offset,
                                    kIRArgumentBufferBindPoint);
 
     if (!heap_binds_set_on_encoder_) {
@@ -5560,6 +5599,7 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_bindless_stable_resources_serial_ = 0;
     render_encoder_bindless_table_resources_serial_ = 0;
     render_encoder_bindless_stable_resources_serial_ = 0;
+    current_bindless_stage_root_arguments_ = {};
     current_bindless_stable_resources_valid_ = false;
     current_bindless_stable_shared_memory_is_uav_ = false;
     current_bindless_stable_shared_memory_usage_bits_ = 0;
