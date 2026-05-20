@@ -4311,6 +4311,9 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format);
     if (resolve_color_format ==
         xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+      // TODO(xenios-jp): Support direct host gamma resolves only once the
+      // shader can mirror the dump path's linear RGBA16Unorm host storage to
+      // guest PWL-gamma RGBA8 conversion.
       return reject();
     }
     if (copy_shader_is_fast) {
