@@ -364,6 +364,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   struct BackendTelemetryStats {
     static constexpr size_t kBindlessTelemetryStageCount = 2;
     static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 5;
+    static constexpr size_t kRenderEncoderBufferTelemetryStageCount = 4;
 
     uint64_t swaps = 0;
     uint64_t draw_calls = 0;
@@ -455,6 +456,16 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t bindless_table_allocations = 0;
     uint64_t bindless_table_bytes = 0;
     uint64_t bindless_root_cbv_pointer_writes = 0;
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_cbv_match_hits = {};
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_cbv_match_misses = {};
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_top_level_allocations = {};
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_top_level_bytes = {};
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_root_cbv_pointer_writes = {};
     std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
                kBindlessTelemetryStageCount>
         bindless_table_miss_cbv_slots = {};
@@ -472,6 +483,16 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_encoder_use_heap_calls = 0;
     uint64_t render_encoder_use_heap_redundant = 0;
     uint64_t render_encoder_use_heap_driver_calls = 0;
+    std::array<uint64_t, kRenderEncoderBufferTelemetryStageCount>
+        render_encoder_buffer_full_binds = {};
+    std::array<uint64_t, kRenderEncoderBufferTelemetryStageCount>
+        render_encoder_buffer_offset_binds = {};
+    std::array<uint64_t, kRenderEncoderBufferTelemetryStageCount>
+        render_encoder_buffer_skipped_binds = {};
+    std::array<uint64_t, kRenderEncoderBufferTelemetryStageCount>
+        render_encoder_buffer_null_binds = {};
+    std::array<uint64_t, kRenderEncoderBufferTelemetryStageCount>
+        render_encoder_buffer_untracked_full_binds = {};
   };
 
   void FlushCommandBufferAndWait(uint64_t timeout_ns, const char* context);

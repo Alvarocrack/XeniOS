@@ -545,6 +545,32 @@ const char* BindlessCbvSlotName(size_t stage, size_t slot) {
   return label;
 }
 
+const char* BindlessStageName(size_t stage) {
+  switch (stage) {
+    case 0:
+      return "vs";
+    case 1:
+      return "ps";
+    default:
+      return "invalid";
+  }
+}
+
+const char* RenderEncoderBufferStageName(size_t stage) {
+  switch (stage) {
+    case 0:
+      return "vertex";
+    case 1:
+      return "fragment";
+    case 2:
+      return "object";
+    case 3:
+      return "mesh";
+    default:
+      return "invalid";
+  }
+}
+
 }  // namespace
 
 MetalCommandProcessor::MetalCommandProcessor(
@@ -3301,19 +3327,29 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   bool bindless_cbvs_match = current_bindless_table_valid_;
   bool bindless_table_invalid = !current_bindless_table_valid_;
   bool bindless_cbv_mismatch = false;
-  for (size_t stage = 0; stage < kStageCount && current_bindless_table_valid_;
-       ++stage) {
+  for (size_t stage = 0; stage < kStageCount; ++stage) {
+    bool stage_cbvs_match = current_bindless_table_valid_;
     for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
       const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
-      if (current_bindless_cbv_gpu_addresses_[stage][cbv] !=
+      if (!current_bindless_table_valid_ ||
+          current_bindless_cbv_gpu_addresses_[stage][cbv] !=
               uniform_cbv.gpu_address ||
           current_bindless_cbv_sizes_[stage][cbv] != uniform_cbv.size) {
+        stage_cbvs_match = false;
         bindless_cbvs_match = false;
         bindless_cbv_mismatch = true;
-        if (stage < BackendTelemetryStats::kBindlessTelemetryStageCount &&
+        if (current_bindless_table_valid_ &&
+            stage < BackendTelemetryStats::kBindlessTelemetryStageCount &&
             cbv < BackendTelemetryStats::kBindlessTelemetryCbvSlotsPerStage) {
           ++backend_telemetry_.bindless_table_miss_cbv_slots[stage][cbv];
         }
+      }
+    }
+    if (stage < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+      if (stage_cbvs_match) {
+        ++backend_telemetry_.bindless_stage_cbv_match_hits[stage];
+      } else {
+        ++backend_telemetry_.bindless_stage_cbv_match_misses[stage];
       }
     }
   }
@@ -3380,6 +3416,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
         [&](size_t stage_index,
             const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>&
                 uniform_cbvs) {
+          if (stage_index < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+            ++backend_telemetry_
+                  .bindless_stage_top_level_allocations[stage_index];
+            backend_telemetry_.bindless_stage_top_level_bytes[stage_index] +=
+                kTopLevelABBytesPerTable;
+          }
           auto* top_level_ptrs = reinterpret_cast<uint64_t*>(
               reinterpret_cast<uint8_t*>(top_level_entries_all) +
               stage_index * kTopLevelABBytesPerTable);
@@ -3399,6 +3441,11 @@ bool MetalCommandProcessor::PopulateBindlessTables(
           auto write_root_cbv = [&](TopLevelABSlot slot,
                                     const UniformBufferInfo::Cbv& uniform_cbv) {
             ++backend_telemetry_.bindless_root_cbv_pointer_writes;
+            if (stage_index <
+                BackendTelemetryStats::kBindlessTelemetryStageCount) {
+              ++backend_telemetry_
+                    .bindless_stage_root_cbv_pointer_writes[stage_index];
+            }
             top_level_ptrs[slot] =
                 uniform_cbv.gpu_address ? uniform_cbv.gpu_address
                                         : null_buffer_->gpuAddress();
@@ -4723,6 +4770,55 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
     bindless_cbv_slot_misses = "none";
   }
 
+  auto format_stage_array =
+      [](const std::array<uint64_t,
+                          BackendTelemetryStats::
+                              kBindlessTelemetryStageCount>& values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted += fmt::format("{}={}", BindlessStageName(i), values[i]);
+        }
+        return formatted;
+      };
+  std::string bindless_stage_cbv_hits =
+      format_stage_array(backend_telemetry_.bindless_stage_cbv_match_hits);
+  std::string bindless_stage_cbv_misses =
+      format_stage_array(backend_telemetry_.bindless_stage_cbv_match_misses);
+  std::string bindless_stage_top_level_allocs =
+      format_stage_array(backend_telemetry_.bindless_stage_top_level_allocations);
+  std::string bindless_stage_top_level_bytes =
+      format_stage_array(backend_telemetry_.bindless_stage_top_level_bytes);
+  std::string bindless_stage_root_writes =
+      format_stage_array(backend_telemetry_.bindless_stage_root_cbv_pointer_writes);
+
+  auto format_buffer_stage_array =
+      [](const std::array<uint64_t,
+                          BackendTelemetryStats::
+                              kRenderEncoderBufferTelemetryStageCount>& values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}={}", RenderEncoderBufferStageName(i), values[i]);
+        }
+        return formatted;
+      };
+  std::string buffer_full_binds =
+      format_buffer_stage_array(backend_telemetry_.render_encoder_buffer_full_binds);
+  std::string buffer_offset_binds = format_buffer_stage_array(
+      backend_telemetry_.render_encoder_buffer_offset_binds);
+  std::string buffer_skipped_binds = format_buffer_stage_array(
+      backend_telemetry_.render_encoder_buffer_skipped_binds);
+  std::string buffer_null_binds =
+      format_buffer_stage_array(backend_telemetry_.render_encoder_buffer_null_binds);
+  std::string buffer_untracked_full_binds = format_buffer_stage_array(
+      backend_telemetry_.render_encoder_buffer_untracked_full_binds);
+
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
       "set/skip={}/{} texture_work_draws={} texture_work active/no_active="
@@ -4796,6 +4892,17 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_encoder_use_heap_calls,
       backend_telemetry_.render_encoder_use_heap_redundant,
       backend_telemetry_.render_encoder_use_heap_driver_calls);
+  XELOGI(
+      "MetalTelemetry[{}]: root_args stage_cbv hit={{ {} }} miss={{ {} }} "
+      "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }}",
+      reason, bindless_stage_cbv_hits, bindless_stage_cbv_misses,
+      bindless_stage_top_level_allocs, bindless_stage_top_level_bytes,
+      bindless_stage_root_writes);
+  XELOGI(
+      "MetalTelemetry[{}]: encoder_buffers full={{ {} }} offset={{ {} }} "
+      "skip={{ {} }} null={{ {} }} untracked_full={{ {} }}",
+      reason, buffer_full_binds, buffer_offset_binds, buffer_skipped_binds,
+      buffer_null_binds, buffer_untracked_full_binds);
   XELOGI(
       "MetalTelemetry[{}]: constants uploads system/vs_float/ps_float/"
       "bool_loop/fetch/vs_desc/ps_desc={}/{}/{}/{}/{}/{}/{} bytes={} "
@@ -5134,6 +5241,13 @@ void MetalCommandProcessor::SetRenderEncoderBuffer(
   if (!current_render_encoder_ || stage == RenderEncoderBufferStage::kCount) {
     return;
   }
+  size_t stage_index = static_cast<size_t>(stage);
+  auto increment_buffer_stat = [&](auto& counters) {
+    if (stage_index <
+        BackendTelemetryStats::kRenderEncoderBufferTelemetryStageCount) {
+      ++counters[stage_index];
+    }
+  };
   auto set_buffer = [&](MTL::Buffer* buffer_to_set, NS::UInteger offset_to_set) {
     switch (stage) {
       case RenderEncoderBufferStage::kVertex:
@@ -5175,22 +5289,31 @@ void MetalCommandProcessor::SetRenderEncoderBuffer(
     }
   };
   if (!buffer) {
+    increment_buffer_stat(backend_telemetry_.render_encoder_buffer_null_binds);
     set_buffer(nullptr, 0);
     InvalidateRenderEncoderBufferBinding(stage, index);
     return;
   }
   if (index >= kTrackedRenderEncoderBufferBindingCount) {
+    increment_buffer_stat(
+        backend_telemetry_.render_encoder_buffer_untracked_full_binds);
     set_buffer(buffer, offset);
     return;
   }
-  auto& binding = render_encoder_buffer_bindings_[size_t(stage)][index];
+  auto& binding = render_encoder_buffer_bindings_[stage_index][index];
   if (binding.valid && binding.buffer == buffer) {
     if (binding.offset != offset) {
+      increment_buffer_stat(
+          backend_telemetry_.render_encoder_buffer_offset_binds);
       set_buffer_offset();
       binding.offset = offset;
+    } else {
+      increment_buffer_stat(
+          backend_telemetry_.render_encoder_buffer_skipped_binds);
     }
     return;
   }
+  increment_buffer_stat(backend_telemetry_.render_encoder_buffer_full_binds);
   set_buffer(buffer, offset);
   binding = {buffer, offset, true};
 }
