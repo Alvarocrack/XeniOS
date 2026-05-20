@@ -209,6 +209,45 @@ class MetalCommandProcessor final : public CommandProcessor {
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
+                             uint32_t num_registers) override;
+  void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                  uint32_t num_registers) override;
+
+  void WriteALURangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                             uint32_t num_times);
+  void WriteFetchRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                               uint32_t num_times);
+  void WriteBoolRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                              uint32_t num_times);
+  void WriteLoopRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                              uint32_t num_times);
+  void WriteREGISTERSRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                   uint32_t num_times);
+
+  void WriteALURangeFromMem(uint32_t start_index, uint32_t* base,
+                            uint32_t num_registers);
+  void WriteFetchRangeFromMem(uint32_t start_index, uint32_t* base,
+                              uint32_t num_registers);
+  void WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base,
+                             uint32_t num_registers);
+  void WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base,
+                             uint32_t num_registers);
+  void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base,
+                                  uint32_t num_registers);
+
+  bool CanFastWriteRegisterRange(uint32_t start_index,
+                                 uint32_t num_registers) const;
+  bool TryWriteKnownRegisterRangeFromMem(uint32_t start_index, uint32_t* base,
+                                         uint32_t num_registers);
+  void WriteFastRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                      uint32_t num_registers);
+  void WriteShaderConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                   uint32_t num_registers);
+  void WriteBoolLoopConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                     uint32_t num_registers);
+  void WriteFetchConstantsFromMem(uint32_t start_index, uint32_t* base,
+                                  uint32_t num_registers);
 
   // Per-draw uniform buffer coordinates passed between IssueDraw sub-methods.
   struct UniformBufferInfo {
@@ -367,6 +406,14 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t register_write_fetch_unchanged = 0;
     uint64_t register_write_fetch_dirty = 0;
     uint64_t texture_fetch_constant_invalidations = 0;
+    uint64_t register_range_mem_calls = 0;
+    uint64_t register_range_ring_calls = 0;
+    uint64_t register_range_ring_wraparound = 0;
+    uint64_t register_range_fallback_calls = 0;
+    uint64_t register_range_fast_float_dwords = 0;
+    uint64_t register_range_fast_fetch_dwords = 0;
+    uint64_t register_range_fast_bool_loop_dwords = 0;
+    uint64_t register_range_fast_regular_dwords = 0;
 
     uint64_t begin_encoder_calls = 0;
     uint64_t begin_encoder_reused_compatible = 0;

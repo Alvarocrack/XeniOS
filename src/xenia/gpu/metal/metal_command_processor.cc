@@ -32,6 +32,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/draw_util.h"
@@ -4181,6 +4182,319 @@ void MetalCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+namespace {
+
+bool RegisterRangeContains(uint32_t start, uint32_t end, uint32_t range_start,
+                           uint32_t range_end) {
+  return start >= range_start && end <= range_end;
+}
+
+bool RegisterRangeOverlaps(uint32_t start, uint32_t end, uint32_t range_start,
+                           uint32_t range_end) {
+  return start < range_end && range_start < end;
+}
+
+}  // namespace
+
+void MetalCommandProcessor::WriteRegistersFromMem(uint32_t start_index,
+                                                  uint32_t* base,
+                                                  uint32_t num_registers) {
+  ++backend_telemetry_.register_range_mem_calls;
+  if (!num_registers) {
+    return;
+  }
+  if (TryWriteKnownRegisterRangeFromMem(start_index, base, num_registers)) {
+    return;
+  }
+  ++backend_telemetry_.register_range_fallback_calls;
+  CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteRegisterRangeFromRing(xe::RingBuffer* ring,
+                                                       uint32_t base,
+                                                       uint32_t num_registers) {
+  ++backend_telemetry_.register_range_ring_calls;
+  if (!num_registers) {
+    return;
+  }
+  if (CanFastWriteRegisterRange(base, num_registers)) {
+    WriteFastRegisterRangeFromRing(ring, base, num_registers);
+    return;
+  }
+  ++backend_telemetry_.register_range_fallback_calls;
+  CommandProcessor::WriteRegisterRangeFromRing(ring, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteALURangeFromRing(xe::RingBuffer* ring,
+                                                  uint32_t base,
+                                                  uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4000, num_times);
+}
+
+void MetalCommandProcessor::WriteFetchRangeFromRing(xe::RingBuffer* ring,
+                                                    uint32_t base,
+                                                    uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4800, num_times);
+}
+
+void MetalCommandProcessor::WriteBoolRangeFromRing(xe::RingBuffer* ring,
+                                                   uint32_t base,
+                                                   uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4900, num_times);
+}
+
+void MetalCommandProcessor::WriteLoopRangeFromRing(xe::RingBuffer* ring,
+                                                   uint32_t base,
+                                                   uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4908, num_times);
+}
+
+void MetalCommandProcessor::WriteREGISTERSRangeFromRing(xe::RingBuffer* ring,
+                                                        uint32_t base,
+                                                        uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x2000, num_times);
+}
+
+void MetalCommandProcessor::WriteALURangeFromMem(uint32_t start_index,
+                                                 uint32_t* base,
+                                                 uint32_t num_registers) {
+  WriteRegistersFromMem(start_index + 0x4000, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteFetchRangeFromMem(uint32_t start_index,
+                                                   uint32_t* base,
+                                                   uint32_t num_registers) {
+  WriteRegistersFromMem(start_index + 0x4800, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteBoolRangeFromMem(uint32_t start_index,
+                                                  uint32_t* base,
+                                                  uint32_t num_registers) {
+  WriteRegistersFromMem(start_index + 0x4900, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteLoopRangeFromMem(uint32_t start_index,
+                                                  uint32_t* base,
+                                                  uint32_t num_registers) {
+  WriteRegistersFromMem(start_index + 0x4908, base, num_registers);
+}
+
+void MetalCommandProcessor::WriteREGISTERSRangeFromMem(uint32_t start_index,
+                                                       uint32_t* base,
+                                                       uint32_t num_registers) {
+  WriteRegistersFromMem(start_index + 0x2000, base, num_registers);
+}
+
+bool MetalCommandProcessor::CanFastWriteRegisterRange(
+    uint32_t start_index, uint32_t num_registers) const {
+  if (!num_registers) {
+    return true;
+  }
+  const uint32_t end = start_index + num_registers;
+  if (end < start_index || end > RegisterFile::kRegisterCount) {
+    return false;
+  }
+  if (RegisterRangeContains(start_index, end, XE_GPU_REG_SHADER_CONSTANT_000_X,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) ||
+      RegisterRangeContains(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1) ||
+      RegisterRangeContains(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+                            XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1)) {
+    return true;
+  }
+
+  const bool overlaps_special =
+      RegisterRangeOverlaps(start_index, end, XE_GPU_REG_SCRATCH_REG0,
+                            XE_GPU_REG_SCRATCH_REG7 + 1) ||
+      RegisterRangeOverlaps(start_index, end, XE_GPU_REG_COHER_STATUS_HOST,
+                            XE_GPU_REG_COHER_STATUS_HOST + 1) ||
+      RegisterRangeOverlaps(start_index, end, XE_GPU_REG_DC_LUT_RW_INDEX,
+                            XE_GPU_REG_DC_LUT_30_COLOR + 1);
+  const bool overlaps_shader_constants =
+      RegisterRangeOverlaps(start_index, end, XE_GPU_REG_SHADER_CONSTANT_000_X,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) ||
+      RegisterRangeOverlaps(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1) ||
+      RegisterRangeOverlaps(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+                            XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1);
+  return !overlaps_special && !overlaps_shader_constants;
+}
+
+bool MetalCommandProcessor::TryWriteKnownRegisterRangeFromMem(
+    uint32_t start_index, uint32_t* base, uint32_t num_registers) {
+  if (!CanFastWriteRegisterRange(start_index, num_registers)) {
+    return false;
+  }
+  const uint32_t end = start_index + num_registers;
+  if (RegisterRangeContains(start_index, end, XE_GPU_REG_SHADER_CONSTANT_000_X,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0)) {
+    backend_telemetry_.register_range_fast_float_dwords += num_registers;
+    WriteShaderConstantsFromMem(start_index, base, num_registers);
+    return true;
+  }
+  if (RegisterRangeContains(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+                            XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1)) {
+    backend_telemetry_.register_range_fast_fetch_dwords += num_registers;
+    WriteFetchConstantsFromMem(start_index, base, num_registers);
+    return true;
+  }
+  if (RegisterRangeContains(start_index, end,
+                            XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+                            XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1)) {
+    backend_telemetry_.register_range_fast_bool_loop_dwords += num_registers;
+    WriteBoolLoopConstantsFromMem(start_index, base, num_registers);
+    return true;
+  }
+
+  xe::copy_and_swap_32_unaligned(&register_file_->values[start_index], base,
+                                 num_registers);
+  backend_telemetry_.register_range_fast_regular_dwords += num_registers;
+  return true;
+}
+
+void MetalCommandProcessor::WriteFastRegisterRangeFromRing(
+    xe::RingBuffer* ring, uint32_t base, uint32_t num_registers) {
+  RingBuffer::ReadRange range = ring->BeginRead(num_registers * sizeof(uint32_t));
+  if (!range.second) {
+    TryWriteKnownRegisterRangeFromMem(
+        base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
+        num_registers);
+    ring->EndRead(range);
+    return;
+  }
+
+  ++backend_telemetry_.register_range_ring_wraparound;
+  uint32_t first_registers =
+      static_cast<uint32_t>(range.first_length / sizeof(uint32_t));
+  TryWriteKnownRegisterRangeFromMem(
+      base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
+      first_registers);
+  TryWriteKnownRegisterRangeFromMem(
+      base + first_registers,
+      reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.second)),
+      num_registers - first_registers);
+  ring->EndRead(range);
+}
+
+void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
+                                                        uint32_t* base,
+                                                        uint32_t num_registers) {
+  uint64_t changed = 0;
+  uint64_t unchanged = 0;
+  uint64_t dirty = 0;
+  bool vertex_dirty = false;
+  bool pixel_dirty = false;
+  uint32_t* register_values = register_file_->values;
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    const uint32_t index = start_index + i;
+    const uint32_t value = xe::load_and_swap<uint32_t>(base + i);
+    const uint32_t old_value = register_values[index];
+    register_values[index] = value;
+    if (old_value == value) {
+      ++unchanged;
+      continue;
+    }
+    ++changed;
+
+    uint32_t float_constant_index =
+        (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+    if (float_constant_index >= 256) {
+      uint32_t rel = float_constant_index & 0xFF;
+      if (current_float_constant_map_pixel_[rel >> 6] &
+          (uint64_t(1) << (rel & 63))) {
+        pixel_dirty = true;
+        ++dirty;
+      }
+    } else if (current_float_constant_map_vertex_[float_constant_index >> 6] &
+               (uint64_t(1) << (float_constant_index & 63))) {
+      vertex_dirty = true;
+      ++dirty;
+    }
+  }
+  backend_telemetry_.register_write_float_total += num_registers;
+  backend_telemetry_.register_write_float_changed += changed;
+  backend_telemetry_.register_write_float_unchanged += unchanged;
+  backend_telemetry_.register_write_float_dirty += dirty;
+  if (vertex_dirty) {
+    cbuffer_binding_float_vertex_.up_to_date = false;
+  }
+  if (pixel_dirty) {
+    cbuffer_binding_float_pixel_.up_to_date = false;
+  }
+}
+
+void MetalCommandProcessor::WriteBoolLoopConstantsFromMem(
+    uint32_t start_index, uint32_t* base, uint32_t num_registers) {
+  uint64_t changed = 0;
+  uint64_t unchanged = 0;
+  uint32_t* register_values = register_file_->values;
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    const uint32_t index = start_index + i;
+    const uint32_t value = xe::load_and_swap<uint32_t>(base + i);
+    const uint32_t old_value = register_values[index];
+    register_values[index] = value;
+    if (old_value == value) {
+      ++unchanged;
+    } else {
+      ++changed;
+    }
+  }
+  backend_telemetry_.register_write_bool_loop_total += num_registers;
+  backend_telemetry_.register_write_bool_loop_changed += changed;
+  backend_telemetry_.register_write_bool_loop_unchanged += unchanged;
+  backend_telemetry_.register_write_bool_loop_dirty += changed;
+  if (changed) {
+    cbuffer_binding_bool_loop_.up_to_date = false;
+  }
+}
+
+void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
+                                                       uint32_t* base,
+                                                       uint32_t num_registers) {
+  uint64_t changed = 0;
+  uint64_t unchanged = 0;
+  uint32_t changed_fetch_mask = 0;
+  uint32_t* register_values = register_file_->values;
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    const uint32_t index = start_index + i;
+    const uint32_t value = xe::load_and_swap<uint32_t>(base + i);
+    const uint32_t old_value = register_values[index];
+    register_values[index] = value;
+    if (old_value == value) {
+      ++unchanged;
+      continue;
+    }
+    ++changed;
+    const uint32_t fetch_index =
+        (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6;
+    if (fetch_index < xenos::kTextureFetchConstantCount) {
+      changed_fetch_mask |= uint32_t(1) << fetch_index;
+    }
+  }
+  backend_telemetry_.register_write_fetch_total += num_registers;
+  backend_telemetry_.register_write_fetch_changed += changed;
+  backend_telemetry_.register_write_fetch_unchanged += unchanged;
+  backend_telemetry_.register_write_fetch_dirty += changed;
+  if (changed) {
+    cbuffer_binding_fetch_.up_to_date = false;
+  }
+  if (texture_cache_ && changed_fetch_mask) {
+    uint32_t mask = changed_fetch_mask;
+    uint32_t fetch_index = 0;
+    while (xe::bit_scan_forward(mask, &fetch_index)) {
+      mask = xe::clear_lowest_bit(mask);
+      texture_cache_->TextureFetchConstantWritten(fetch_index);
+    }
+    backend_telemetry_.texture_fetch_constant_invalidations +=
+        xe::bit_count(changed_fetch_mask);
+  }
+}
+
 void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   uint32_t old_value = 0;
   bool valid_register = index < RegisterFile::kRegisterCount;
@@ -4566,6 +4880,17 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.register_write_fetch_unchanged,
       backend_telemetry_.register_write_fetch_dirty,
       backend_telemetry_.texture_fetch_constant_invalidations);
+  XELOGI(
+      "MetalTelemetry[{}]: register_ranges mem/ring/wrap/fallback={}/{}/{}/{} "
+      "fast_dwords float/fetch/bool_loop/regular={}/{}/{}/{}",
+      reason, backend_telemetry_.register_range_mem_calls,
+      backend_telemetry_.register_range_ring_calls,
+      backend_telemetry_.register_range_ring_wraparound,
+      backend_telemetry_.register_range_fallback_calls,
+      backend_telemetry_.register_range_fast_float_dwords,
+      backend_telemetry_.register_range_fast_fetch_dwords,
+      backend_telemetry_.register_range_fast_bool_loop_dwords,
+      backend_telemetry_.register_range_fast_regular_dwords);
   XELOGI(
       "MetalTelemetry[{}]: draw_pass_transfers update_lists={} pending "
       "lists/transfers={}/{} accepted={} fallback={} full_overwrite={} "
