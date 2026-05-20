@@ -203,10 +203,24 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   void UseBindlessResources(MetalCommandProcessor& command_processor,
                             MTL::ResourceUsage usage) const;
 
+  struct ResolvePlan {
+    draw_util::ResolveInfo resolve_info = {};
+    bool valid = false;
+    bool noop = false;
+    bool needs_copy_export = false;
+    bool needs_resolve_clear = false;
+    bool can_defer_clear_to_next_pass = false;
+    bool needs_render_encoder_boundary = false;
+    uint32_t written_address = 0;
+    uint32_t written_length = 0;
+  };
+
   // Resolve (copy) render targets to shared memory
+  bool PrepareResolvePlan(Memory& memory, ResolvePlan& plan_out);
   bool Resolve(Memory& memory, uint32_t& written_address,
                uint32_t& written_length,
-               MTL::CommandBuffer* command_buffer = nullptr);
+               MTL::CommandBuffer* command_buffer = nullptr,
+               const ResolvePlan* prepared_resolve_plan = nullptr);
 
  protected:
   // Virtual methods from RenderTargetCache

@@ -5133,13 +5133,10 @@ MTL::RenderPipelineState* MetalRenderTargetCache::GetOrCreateEdramLoadPipeline(
   return pipeline;
 }
 
-bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
-                                     uint32_t& written_length,
-                                     MTL::CommandBuffer* command_buffer) {
-  written_address = 0;
-  written_length = 0;
+bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
+                                                ResolvePlan& plan_out) {
+  plan_out = ResolvePlan();
   const RegisterFile& regs = register_file();
-  draw_util::ResolveInfo resolve_info;
 
   // Fixed16 formats may be truncated to -1..1 when backed by SNORM.
   bool fixed_rg16_trunc = IsFixedRG16TruncatedToMinus1To1();
@@ -5153,13 +5150,52 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
   if (!draw_util::GetResolveInfo(regs, memory, *trace_writer_,
                                  draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_rg16_trunc,
-                                 fixed_rgba16_trunc, resolve_info)) {
+                                 fixed_rgba16_trunc,
+                                 plan_out.resolve_info)) {
     XELOGE("MetalRenderTargetCache::Resolve: GetResolveInfo failed");
     return false;
   }
+  plan_out.valid = true;
+
+  const draw_util::ResolveInfo& resolve_info = plan_out.resolve_info;
+  plan_out.noop = !resolve_info.coordinate_info.width_div_8 ||
+                  !resolve_info.height_div_8;
+  if (plan_out.noop) {
+    return true;
+  }
+  plan_out.needs_copy_export = resolve_info.copy_dest_extent_length != 0;
+  plan_out.needs_resolve_clear =
+      resolve_info.IsClearingDepth() || resolve_info.IsClearingColor();
+  plan_out.can_defer_clear_to_next_pass =
+      !plan_out.needs_copy_export && plan_out.needs_resolve_clear &&
+      GetPath() == Path::kHostRenderTargets;
+  plan_out.needs_render_encoder_boundary =
+      plan_out.needs_copy_export || plan_out.needs_resolve_clear;
+  if (plan_out.needs_copy_export) {
+    plan_out.written_address = resolve_info.copy_dest_extent_start;
+    plan_out.written_length = resolve_info.copy_dest_extent_length;
+  }
+  return true;
+}
+
+bool MetalRenderTargetCache::Resolve(
+    Memory& memory, uint32_t& written_address, uint32_t& written_length,
+    MTL::CommandBuffer* command_buffer,
+    const ResolvePlan* prepared_resolve_plan) {
+  written_address = 0;
+  written_length = 0;
+  ResolvePlan resolve_plan_storage;
+  if (!prepared_resolve_plan) {
+    if (!PrepareResolvePlan(memory, resolve_plan_storage)) {
+      return false;
+    }
+    prepared_resolve_plan = &resolve_plan_storage;
+  }
+  const ResolvePlan& resolve_plan = *prepared_resolve_plan;
+  const draw_util::ResolveInfo& resolve_info = resolve_plan.resolve_info;
 
   // Nothing to do.
-  if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+  if (resolve_plan.noop) {
     return true;
   }
 

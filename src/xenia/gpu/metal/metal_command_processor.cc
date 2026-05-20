@@ -3793,26 +3793,34 @@ bool MetalCommandProcessor::DispatchDraw(
 }
 
 bool MetalCommandProcessor::IssueCopy() {
-  // End any in-flight rendering so render target contents are visible to
-  // resolve logic.
-  EndRenderEncoder();
-
-  MTL::CommandBuffer* copy_command_buffer = EnsureCommandBuffer();
-  if (!copy_command_buffer) {
-    XELOGE("MetalCommandProcessor::IssueCopy: failed to get command buffer");
-    return false;
-  }
-
   if (!render_target_cache_) {
     XELOGW("MetalCommandProcessor::IssueCopy - No render target cache");
     return true;
+  }
+
+  MetalRenderTargetCache::ResolvePlan resolve_plan;
+  if (!render_target_cache_->PrepareResolvePlan(*memory_, resolve_plan)) {
+    XELOGE("MetalCommandProcessor::IssueCopy - Resolve planning failed");
+    return false;
+  }
+
+  MTL::CommandBuffer* copy_command_buffer = nullptr;
+  if (resolve_plan.needs_render_encoder_boundary) {
+    // End any in-flight rendering only when resolve work needs render target
+    // contents or a transfer pass.
+    EndRenderEncoder();
+    copy_command_buffer = EnsureCommandBuffer();
+    if (!copy_command_buffer) {
+      XELOGE("MetalCommandProcessor::IssueCopy: failed to get command buffer");
+      return false;
+    }
   }
 
   uint32_t written_address = 0;
   uint32_t written_length = 0;
 
   if (!render_target_cache_->Resolve(*memory_, written_address, written_length,
-                                     copy_command_buffer)) {
+                                     copy_command_buffer, &resolve_plan)) {
     XELOGE("MetalCommandProcessor::IssueCopy - Resolve failed");
     return false;
   }
