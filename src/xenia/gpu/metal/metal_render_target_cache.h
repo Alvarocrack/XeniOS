@@ -277,29 +277,16 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::ComputePipelineState* edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
   MTL::ComputePipelineState* edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
 
-  // Resolve compute shaders (Metal XeSL → MSL metallib)
-  MTL::ComputePipelineState* resolve_full_8bpp_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_16bpp_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_32bpp_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_64bpp_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_128bpp_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_fast_32bpp_1x2xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_fast_32bpp_4xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_fast_64bpp_1x2xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_fast_64bpp_4xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_8bpp_scaled_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_16bpp_scaled_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_32bpp_scaled_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_64bpp_scaled_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_full_128bpp_scaled_pipeline_ = nullptr;
-  MTL::ComputePipelineState* resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* resolve_fast_32bpp_4xmsaa_scaled_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* resolve_fast_64bpp_4xmsaa_scaled_pipeline_ =
-      nullptr;
+  // Resolve compute shaders (Metal XeSL -> MSL metallib).
+  static constexpr size_t kResolveScaledCount = 2;    // false, true
+  static constexpr size_t kResolveFullDestCount = 5;  // 8, 16, 32, 64, 128
+  static constexpr size_t kResolveFastBppCount = 2;   // 32, 64
+  static constexpr size_t kResolveFastMsaaCount = 2;  // 1/2x, 4x
+  MTL::ComputePipelineState*
+      resolve_full_pipelines_[kResolveScaledCount][kResolveFullDestCount] = {};
+  MTL::ComputePipelineState*
+      resolve_fast_pipelines_[kResolveScaledCount][kResolveFastBppCount]
+                             [kResolveFastMsaaCount] = {};
 
   // Direct host resolve compute shaders (host RT -> shared/scaled resolve
   // memory) for fast and full color copies plus depth copies.
@@ -702,6 +689,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   bool PrepareResolveDestinationBuffer(
       const draw_util::ResolveInfo& resolve_info, bool draw_resolution_scaled,
       ResolveDestinationBuffer& destination);
+  MTL::ComputePipelineState* GetResolvePipeline(
+      draw_util::ResolveCopyShaderIndex copy_shader, bool scaled) const;
   MTL::ComputePipelineState* GetDirectHostResolvePipeline(
       bool is_64bpp, xenos::MsaaSamples msaa_samples, bool scaled,
       bool source_is_uint) const;

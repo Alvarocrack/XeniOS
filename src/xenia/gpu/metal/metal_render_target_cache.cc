@@ -271,6 +271,36 @@ size_t DirectHostResolveFullDestIndex(
   }
 }
 
+size_t ResolveFastBppIndex(draw_util::ResolveCopyShaderIndex shader) {
+  switch (shader) {
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
+      return 0;
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
+      return 1;
+    default:
+      break;
+  }
+  assert_unhandled_case(shader);
+  return 0;
+}
+
+size_t ResolveFastMsaaIndex(draw_util::ResolveCopyShaderIndex shader) {
+  switch (shader) {
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
+      return 0;
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
+      return 1;
+    default:
+      break;
+  }
+  assert_unhandled_case(shader);
+  return 0;
+}
+
 bool IsResolveDirectHostRTFullColorCandidate(
     draw_util::ResolveCopyShaderIndex shader) {
   return DirectHostResolveFullDestIndex(shader) < 5;
@@ -929,24 +959,18 @@ bool MetalRenderTargetCache::InitializeEdramComputeShaders() {
   edram_dump_depth_32bpp_1xmsaa_pipeline_ = nullptr;
   edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
   edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
-  resolve_full_8bpp_pipeline_ = nullptr;
-  resolve_full_16bpp_pipeline_ = nullptr;
-  resolve_full_32bpp_pipeline_ = nullptr;
-  resolve_full_64bpp_pipeline_ = nullptr;
-  resolve_full_128bpp_pipeline_ = nullptr;
-  resolve_fast_32bpp_1x2xmsaa_pipeline_ = nullptr;
-  resolve_fast_32bpp_4xmsaa_pipeline_ = nullptr;
-  resolve_fast_64bpp_1x2xmsaa_pipeline_ = nullptr;
-  resolve_fast_64bpp_4xmsaa_pipeline_ = nullptr;
-  resolve_full_8bpp_scaled_pipeline_ = nullptr;
-  resolve_full_16bpp_scaled_pipeline_ = nullptr;
-  resolve_full_32bpp_scaled_pipeline_ = nullptr;
-  resolve_full_64bpp_scaled_pipeline_ = nullptr;
-  resolve_full_128bpp_scaled_pipeline_ = nullptr;
-  resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_ = nullptr;
-  resolve_fast_32bpp_4xmsaa_scaled_pipeline_ = nullptr;
-  resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_ = nullptr;
-  resolve_fast_64bpp_4xmsaa_scaled_pipeline_ = nullptr;
+  for (auto& by_scaled : resolve_full_pipelines_) {
+    for (auto*& pipeline : by_scaled) {
+      pipeline = nullptr;
+    }
+  }
+  for (auto& by_scaled : resolve_fast_pipelines_) {
+    for (auto& by_bpp : by_scaled) {
+      for (auto*& pipeline : by_bpp) {
+        pipeline = nullptr;
+      }
+    }
+  }
   for (auto& by_bpp : direct_host_resolve_pipelines_) {
     for (auto& by_msaa : by_bpp) {
       for (auto& by_scaled : by_msaa) {
@@ -976,110 +1000,88 @@ bool MetalRenderTargetCache::InitializeEdramComputeShaders() {
 
   NS::Error* error = nullptr;
 
-  // Resolve compute pipelines.
-  resolve_full_8bpp_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
-      device_, resolve_full_8bpp_cs_metallib,
-      sizeof(resolve_full_8bpp_cs_metallib), "resolve_full_8bpp");
-  resolve_full_16bpp_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
-      device_, resolve_full_16bpp_cs_metallib,
-      sizeof(resolve_full_16bpp_cs_metallib), "resolve_full_16bpp");
-  resolve_full_32bpp_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
-      device_, resolve_full_32bpp_cs_metallib,
-      sizeof(resolve_full_32bpp_cs_metallib), "resolve_full_32bpp");
-  resolve_full_64bpp_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
-      device_, resolve_full_64bpp_cs_metallib,
-      sizeof(resolve_full_64bpp_cs_metallib), "resolve_full_64bpp");
-  resolve_full_128bpp_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
-      device_, resolve_full_128bpp_cs_metallib,
-      sizeof(resolve_full_128bpp_cs_metallib), "resolve_full_128bpp");
-  resolve_fast_32bpp_1x2xmsaa_pipeline_ =
-      CreateComputePipelineFromEmbeddedLibrary(
-          device_, resolve_fast_32bpp_1x2xmsaa_cs_metallib,
-          sizeof(resolve_fast_32bpp_1x2xmsaa_cs_metallib),
-          "resolve_fast_32bpp_1x2xmsaa");
-  resolve_fast_32bpp_4xmsaa_pipeline_ =
-      CreateComputePipelineFromEmbeddedLibrary(
-          device_, resolve_fast_32bpp_4xmsaa_cs_metallib,
-          sizeof(resolve_fast_32bpp_4xmsaa_cs_metallib),
-          "resolve_fast_32bpp_4xmsaa");
-  resolve_fast_64bpp_1x2xmsaa_pipeline_ =
-      CreateComputePipelineFromEmbeddedLibrary(
-          device_, resolve_fast_64bpp_1x2xmsaa_cs_metallib,
-          sizeof(resolve_fast_64bpp_1x2xmsaa_cs_metallib),
-          "resolve_fast_64bpp_1x2xmsaa");
-  resolve_fast_64bpp_4xmsaa_pipeline_ =
-      CreateComputePipelineFromEmbeddedLibrary(
-          device_, resolve_fast_64bpp_4xmsaa_cs_metallib,
-          sizeof(resolve_fast_64bpp_4xmsaa_cs_metallib),
-          "resolve_fast_64bpp_4xmsaa");
-
-  if (!resolve_full_8bpp_pipeline_ || !resolve_full_16bpp_pipeline_ ||
-      !resolve_full_32bpp_pipeline_ || !resolve_full_64bpp_pipeline_ ||
-      !resolve_full_128bpp_pipeline_ ||
-      !resolve_fast_32bpp_1x2xmsaa_pipeline_ ||
-      !resolve_fast_32bpp_4xmsaa_pipeline_ ||
-      !resolve_fast_64bpp_1x2xmsaa_pipeline_ ||
-      !resolve_fast_64bpp_4xmsaa_pipeline_) {
-    XELOGE("Metal: failed to initialize resolve compute pipelines");
-    return false;
+  struct ResolveFullPipelineConfig {
+    const void* metallib_data;
+    size_t metallib_size;
+    bool scaled;
+    draw_util::ResolveCopyShaderIndex copy_shader;
+    const char* debug_name;
+  };
+  struct ResolveFastPipelineConfig {
+    const void* metallib_data;
+    size_t metallib_size;
+    bool scaled;
+    draw_util::ResolveCopyShaderIndex copy_shader;
+    const char* debug_name;
+  };
+#define XE_RESOLVE_FULL_CONFIG(id, scaled, copy_shader) \
+  {id##_metallib, sizeof(id##_metallib), scaled,        \
+   draw_util::ResolveCopyShaderIndex::copy_shader, #id}
+#define XE_RESOLVE_FAST_CONFIG(id, scaled, copy_shader)     \
+  {                                                         \
+    id##_metallib, sizeof(id##_metallib), scaled,           \
+        draw_util::ResolveCopyShaderIndex::copy_shader, #id \
   }
+  static constexpr ResolveFullPipelineConfig kResolveFullPipelineConfigs[] = {
+      XE_RESOLVE_FULL_CONFIG(resolve_full_8bpp_cs, false, kFull8bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_16bpp_cs, false, kFull16bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_32bpp_cs, false, kFull32bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_64bpp_cs, false, kFull64bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_128bpp_cs, false, kFull128bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_8bpp_scaled_cs, true, kFull8bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_16bpp_scaled_cs, true, kFull16bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_32bpp_scaled_cs, true, kFull32bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_64bpp_scaled_cs, true, kFull64bpp),
+      XE_RESOLVE_FULL_CONFIG(resolve_full_128bpp_scaled_cs, true, kFull128bpp),
+  };
+  static constexpr ResolveFastPipelineConfig kResolveFastPipelineConfigs[] = {
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_32bpp_1x2xmsaa_cs, false,
+                             kFast32bpp1x2xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_32bpp_4xmsaa_cs, false,
+                             kFast32bpp4xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_64bpp_1x2xmsaa_cs, false,
+                             kFast64bpp1x2xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_64bpp_4xmsaa_cs, false,
+                             kFast64bpp4xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_32bpp_1x2xmsaa_scaled_cs, true,
+                             kFast32bpp1x2xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_32bpp_4xmsaa_scaled_cs, true,
+                             kFast32bpp4xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_64bpp_1x2xmsaa_scaled_cs, true,
+                             kFast64bpp1x2xMSAA),
+      XE_RESOLVE_FAST_CONFIG(resolve_fast_64bpp_4xmsaa_scaled_cs, true,
+                             kFast64bpp4xMSAA),
+  };
+#undef XE_RESOLVE_FAST_CONFIG
+#undef XE_RESOLVE_FULL_CONFIG
 
-  if (draw_resolution_scaled) {
-    resolve_full_8bpp_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_full_8bpp_scaled_cs_metallib,
-            sizeof(resolve_full_8bpp_scaled_cs_metallib),
-            "resolve_full_8bpp_scaled");
-    resolve_full_16bpp_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_full_16bpp_scaled_cs_metallib,
-            sizeof(resolve_full_16bpp_scaled_cs_metallib),
-            "resolve_full_16bpp_scaled");
-    resolve_full_32bpp_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_full_32bpp_scaled_cs_metallib,
-            sizeof(resolve_full_32bpp_scaled_cs_metallib),
-            "resolve_full_32bpp_scaled");
-    resolve_full_64bpp_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_full_64bpp_scaled_cs_metallib,
-            sizeof(resolve_full_64bpp_scaled_cs_metallib),
-            "resolve_full_64bpp_scaled");
-    resolve_full_128bpp_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_full_128bpp_scaled_cs_metallib,
-            sizeof(resolve_full_128bpp_scaled_cs_metallib),
-            "resolve_full_128bpp_scaled");
-    resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_fast_32bpp_1x2xmsaa_scaled_cs_metallib,
-            sizeof(resolve_fast_32bpp_1x2xmsaa_scaled_cs_metallib),
-            "resolve_fast_32bpp_1x2xmsaa_scaled");
-    resolve_fast_32bpp_4xmsaa_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_fast_32bpp_4xmsaa_scaled_cs_metallib,
-            sizeof(resolve_fast_32bpp_4xmsaa_scaled_cs_metallib),
-            "resolve_fast_32bpp_4xmsaa_scaled");
-    resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_fast_64bpp_1x2xmsaa_scaled_cs_metallib,
-            sizeof(resolve_fast_64bpp_1x2xmsaa_scaled_cs_metallib),
-            "resolve_fast_64bpp_1x2xmsaa_scaled");
-    resolve_fast_64bpp_4xmsaa_scaled_pipeline_ =
-        CreateComputePipelineFromEmbeddedLibrary(
-            device_, resolve_fast_64bpp_4xmsaa_scaled_cs_metallib,
-            sizeof(resolve_fast_64bpp_4xmsaa_scaled_cs_metallib),
-            "resolve_fast_64bpp_4xmsaa_scaled");
-    if (!resolve_full_8bpp_scaled_pipeline_ ||
-        !resolve_full_16bpp_scaled_pipeline_ ||
-        !resolve_full_32bpp_scaled_pipeline_ ||
-        !resolve_full_64bpp_scaled_pipeline_ ||
-        !resolve_full_128bpp_scaled_pipeline_ ||
-        !resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_ ||
-        !resolve_fast_32bpp_4xmsaa_scaled_pipeline_ ||
-        !resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_ ||
-        !resolve_fast_64bpp_4xmsaa_scaled_pipeline_) {
-      XELOGE("Metal: failed to initialize scaled resolve compute pipelines");
+  for (const ResolveFullPipelineConfig& cfg : kResolveFullPipelineConfigs) {
+    if (cfg.scaled && !draw_resolution_scaled) {
+      continue;
+    }
+    size_t scaled_index = cfg.scaled ? 1u : 0u;
+    MTL::ComputePipelineState*& pipeline =
+        resolve_full_pipelines_[scaled_index][DirectHostResolveFullDestIndex(
+            cfg.copy_shader)];
+    pipeline = CreateComputePipelineFromEmbeddedLibrary(
+        device_, cfg.metallib_data, cfg.metallib_size, cfg.debug_name);
+    if (!pipeline) {
+      XELOGE("Metal: failed to initialize resolve compute pipelines");
+      return false;
+    }
+  }
+  for (const ResolveFastPipelineConfig& cfg : kResolveFastPipelineConfigs) {
+    if (cfg.scaled && !draw_resolution_scaled) {
+      continue;
+    }
+    size_t scaled_index = cfg.scaled ? 1u : 0u;
+    MTL::ComputePipelineState*& pipeline =
+        resolve_fast_pipelines_[scaled_index][ResolveFastBppIndex(
+            cfg.copy_shader)][ResolveFastMsaaIndex(cfg.copy_shader)];
+    pipeline = CreateComputePipelineFromEmbeddedLibrary(
+        device_, cfg.metallib_data, cfg.metallib_size, cfg.debug_name);
+    if (!pipeline) {
+      XELOGE("Metal: failed to initialize resolve compute pipelines");
       return false;
     }
   }
@@ -2188,78 +2190,23 @@ void MetalRenderTargetCache::ShutdownEdramComputeShaders() {
     edram_dump_depth_32bpp_4xmsaa_pipeline_->release();
     edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
   }
-  // Release resolve pipelines
-  if (resolve_full_8bpp_pipeline_) {
-    resolve_full_8bpp_pipeline_->release();
-    resolve_full_8bpp_pipeline_ = nullptr;
+  for (auto& by_scaled : resolve_full_pipelines_) {
+    for (auto*& pipeline : by_scaled) {
+      if (pipeline) {
+        pipeline->release();
+        pipeline = nullptr;
+      }
+    }
   }
-  if (resolve_full_16bpp_pipeline_) {
-    resolve_full_16bpp_pipeline_->release();
-    resolve_full_16bpp_pipeline_ = nullptr;
-  }
-  if (resolve_full_32bpp_pipeline_) {
-    resolve_full_32bpp_pipeline_->release();
-    resolve_full_32bpp_pipeline_ = nullptr;
-  }
-  if (resolve_full_64bpp_pipeline_) {
-    resolve_full_64bpp_pipeline_->release();
-    resolve_full_64bpp_pipeline_ = nullptr;
-  }
-  if (resolve_full_128bpp_pipeline_) {
-    resolve_full_128bpp_pipeline_->release();
-    resolve_full_128bpp_pipeline_ = nullptr;
-  }
-  if (resolve_fast_32bpp_1x2xmsaa_pipeline_) {
-    resolve_fast_32bpp_1x2xmsaa_pipeline_->release();
-    resolve_fast_32bpp_1x2xmsaa_pipeline_ = nullptr;
-  }
-  if (resolve_fast_32bpp_4xmsaa_pipeline_) {
-    resolve_fast_32bpp_4xmsaa_pipeline_->release();
-    resolve_fast_32bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  if (resolve_fast_64bpp_1x2xmsaa_pipeline_) {
-    resolve_fast_64bpp_1x2xmsaa_pipeline_->release();
-    resolve_fast_64bpp_1x2xmsaa_pipeline_ = nullptr;
-  }
-  if (resolve_fast_64bpp_4xmsaa_pipeline_) {
-    resolve_fast_64bpp_4xmsaa_pipeline_->release();
-    resolve_fast_64bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  if (resolve_full_8bpp_scaled_pipeline_) {
-    resolve_full_8bpp_scaled_pipeline_->release();
-    resolve_full_8bpp_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_full_16bpp_scaled_pipeline_) {
-    resolve_full_16bpp_scaled_pipeline_->release();
-    resolve_full_16bpp_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_full_32bpp_scaled_pipeline_) {
-    resolve_full_32bpp_scaled_pipeline_->release();
-    resolve_full_32bpp_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_full_64bpp_scaled_pipeline_) {
-    resolve_full_64bpp_scaled_pipeline_->release();
-    resolve_full_64bpp_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_full_128bpp_scaled_pipeline_) {
-    resolve_full_128bpp_scaled_pipeline_->release();
-    resolve_full_128bpp_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_) {
-    resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_->release();
-    resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_fast_32bpp_4xmsaa_scaled_pipeline_) {
-    resolve_fast_32bpp_4xmsaa_scaled_pipeline_->release();
-    resolve_fast_32bpp_4xmsaa_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_) {
-    resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_->release();
-    resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_ = nullptr;
-  }
-  if (resolve_fast_64bpp_4xmsaa_scaled_pipeline_) {
-    resolve_fast_64bpp_4xmsaa_scaled_pipeline_->release();
-    resolve_fast_64bpp_4xmsaa_scaled_pipeline_ = nullptr;
+  for (auto& by_scaled : resolve_fast_pipelines_) {
+    for (auto& by_bpp : by_scaled) {
+      for (auto*& pipeline : by_bpp) {
+        if (pipeline) {
+          pipeline->release();
+          pipeline = nullptr;
+        }
+      }
+    }
   }
   for (auto& by_bpp : direct_host_resolve_pipelines_) {
     for (auto& by_msaa : by_bpp) {
@@ -2365,6 +2312,20 @@ bool MetalRenderTargetCache::PrepareResolveDestinationBuffer(
   }
   return shared->RequestRange(resolve_info.copy_dest_extent_start,
                               resolve_info.copy_dest_extent_length);
+}
+
+MTL::ComputePipelineState* MetalRenderTargetCache::GetResolvePipeline(
+    draw_util::ResolveCopyShaderIndex copy_shader, bool scaled) const {
+  size_t scaled_index = scaled ? 1u : 0u;
+  if (IsResolveDirectHostRTFastCandidate(copy_shader)) {
+    return resolve_fast_pipelines_[scaled_index][ResolveFastBppIndex(
+        copy_shader)][ResolveFastMsaaIndex(copy_shader)];
+  }
+  size_t full_dest_index = DirectHostResolveFullDestIndex(copy_shader);
+  if (full_dest_index < kResolveFullDestCount) {
+    return resolve_full_pipelines_[scaled_index][full_dest_index];
+  }
+  return nullptr;
 }
 
 MTL::ComputePipelineState* MetalRenderTargetCache::GetDirectHostResolvePipeline(
@@ -5202,74 +5163,8 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
         uint32_t bytes_per_pixel = 4;
 
         // Select the appropriate Metal pipeline for this shader.
-        MTL::ComputePipelineState* pipeline = nullptr;
-        if (draw_resolution_scaled) {
-          switch (copy_shader) {
-            case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
-              pipeline = resolve_fast_32bpp_1x2xmsaa_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
-              pipeline = resolve_fast_32bpp_4xmsaa_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
-              pipeline = resolve_fast_64bpp_1x2xmsaa_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
-              pipeline = resolve_fast_64bpp_4xmsaa_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull8bpp:
-              pipeline = resolve_full_8bpp_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull16bpp:
-              pipeline = resolve_full_16bpp_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull32bpp:
-              pipeline = resolve_full_32bpp_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull64bpp:
-              pipeline = resolve_full_64bpp_scaled_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull128bpp:
-              pipeline = resolve_full_128bpp_scaled_pipeline_;
-              break;
-            default:
-              pipeline = nullptr;
-              break;
-          }
-        } else {
-          switch (copy_shader) {
-            case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
-              pipeline = resolve_fast_32bpp_1x2xmsaa_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
-              pipeline = resolve_fast_32bpp_4xmsaa_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
-              pipeline = resolve_fast_64bpp_1x2xmsaa_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
-              pipeline = resolve_fast_64bpp_4xmsaa_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull8bpp:
-              pipeline = resolve_full_8bpp_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull16bpp:
-              pipeline = resolve_full_16bpp_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull32bpp:
-              pipeline = resolve_full_32bpp_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull64bpp:
-              pipeline = resolve_full_64bpp_pipeline_;
-              break;
-            case draw_util::ResolveCopyShaderIndex::kFull128bpp:
-              pipeline = resolve_full_128bpp_pipeline_;
-              break;
-            default:
-              pipeline = nullptr;
-              break;
-          }
-        }
+        MTL::ComputePipelineState* pipeline =
+            GetResolvePipeline(copy_shader, draw_resolution_scaled);
         if (draw_resolution_scaled && !pipeline) {
           static uint32_t missing_scaled_pipeline_log_count = 0;
           if (missing_scaled_pipeline_log_count < 8) {
