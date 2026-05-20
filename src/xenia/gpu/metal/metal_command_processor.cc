@@ -3573,6 +3573,10 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       if (!uniform_buffer) {
         return;
       }
+      if (uniform_buffer == current_bindless_top_level_buffer_ ||
+          uniform_buffer == current_bindless_cbv_buffer_) {
+        return;
+      }
       for (uint32_t i = 0; i < uniform_buffer_count; ++i) {
         if (uniform_buffers_for_encoder[i] == uniform_buffer) {
           return;
