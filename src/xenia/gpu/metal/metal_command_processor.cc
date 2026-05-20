@@ -209,7 +209,6 @@ void ClampScissorToBounds(draw_util::Scissor& scissor, uint32_t width,
   scissor.extent[1] = std::min(scissor.extent[1], max_scissor_height);
 }
 
-constexpr size_t kResolvedMemoryRangesMax = 8192;
 PipelineAttachmentFormats ResolvePipelineAttachmentFormats(
     const MetalRenderTargetCache* render_target_cache,
     MTL::RenderPassDescriptor* pass_descriptor, bool pixel_shader_writes_depth,
@@ -355,47 +354,6 @@ PipelineAttachmentFormats ResolvePipelineAttachmentFormats(
   return result;
 }
 
-MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
-    MTL::Device* device, const void* metallib_data, size_t metallib_size,
-    const char* debug_name) {
-  if (!device || !metallib_data || !metallib_size) {
-    return nullptr;
-  }
-
-  NS::Error* error = nullptr;
-  dispatch_data_t data = dispatch_data_create(
-      metallib_data, metallib_size, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-  MTL::Library* lib = device->newLibrary(data, &error);
-  dispatch_release(data);
-  if (!lib) {
-    XELOGE("Metal: failed to create {} library: {}", debug_name,
-           error ? error->localizedDescription()->utf8String() : "unknown");
-    return nullptr;
-  }
-
-  // XeSL compute entrypoint name used in the embedded metallibs.
-  NS::String* fn_name = NS::String::string("entry_xe", NS::UTF8StringEncoding);
-  MTL::Function* fn = lib->newFunction(fn_name);
-  if (!fn) {
-    XELOGE("Metal: {} missing entry_xe", debug_name);
-    lib->release();
-    return nullptr;
-  }
-
-  MTL::ComputePipelineState* pipeline =
-      device->newComputePipelineState(fn, &error);
-  fn->release();
-  lib->release();
-
-  if (!pipeline) {
-    XELOGE("Metal: failed to create {} pipeline: {}", debug_name,
-           error ? error->localizedDescription()->utf8String() : "unknown");
-    return nullptr;
-  }
-
-  return pipeline;
-}
-
 bool ShaderUsesVertexFetch(const Shader& shader) {
   if (!shader.vertex_bindings().empty()) {
     return true;
@@ -527,9 +485,6 @@ void MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
         "cache initialization");
     return;
   }
-  // Trace playback frame boundary: drop resolve-write tracking from previous
-  // frame before restoring a new snapshot.
-  trace_resolve_guard_.Clear();
   render_target_cache_->RestoreEdramSnapshot(snapshot);
 }
 
@@ -561,111 +516,6 @@ uint64_t MetalCommandProcessor::GetCurrentSubmission() const {
 uint64_t MetalCommandProcessor::GetCompletedSubmission() const {
   return completed_command_buffers_.load(std::memory_order_relaxed);
 }
-
-// ---------------------------------------------------------------------------
-// TraceResolveGuard -- trace-only resolved-memory tracking.
-// ---------------------------------------------------------------------------
-
-void MetalCommandProcessor::TraceResolveGuard::Mark(uint32_t base_ptr,
-                                                    uint32_t length) {
-  if (length == 0) {
-    return;
-  }
-  constexpr uint64_t kAddressLimit =
-      uint64_t(std::numeric_limits<uint32_t>::max()) + 1ull;
-  uint64_t merged_base = base_ptr;
-  uint64_t merged_end =
-      std::min<uint64_t>(merged_base + uint64_t(length), kAddressLimit);
-  if (merged_end <= merged_base) {
-    return;
-  }
-
-  for (size_t i = 0; i < ranges_.size();) {
-    const auto& range = ranges_[i];
-    const uint64_t range_base = range.base;
-    const uint64_t range_end =
-        std::min<uint64_t>(range_base + uint64_t(range.length), kAddressLimit);
-    // Merge overlapping or adjacent ranges.
-    if (merged_end + 1 < range_base || range_end + 1 < merged_base) {
-      ++i;
-      continue;
-    }
-    merged_base = std::min(merged_base, range_base);
-    merged_end = std::max(merged_end, range_end);
-    ranges_.erase(ranges_.begin() + i);
-  }
-
-  const uint64_t merged_length_64 =
-      std::min<uint64_t>(merged_end - merged_base, kAddressLimit - merged_base);
-  if (!merged_length_64) {
-    return;
-  }
-  ResolvedRange merged_range = {uint32_t(merged_base),
-                                uint32_t(merged_length_64)};
-  auto insert_it =
-      std::lower_bound(ranges_.begin(), ranges_.end(), merged_range,
-                       [](const ResolvedRange& lhs, const ResolvedRange& rhs) {
-                         return lhs.base < rhs.base;
-                       });
-  ranges_.insert(insert_it, merged_range);
-
-  if (ranges_.size() <= kResolvedMemoryRangesMax) {
-    return;
-  }
-
-  std::sort(ranges_.begin(), ranges_.end(),
-            [](const ResolvedRange& lhs, const ResolvedRange& rhs) {
-              return lhs.base < rhs.base;
-            });
-  while (ranges_.size() > kResolvedMemoryRangesMax) {
-    size_t best_index = std::numeric_limits<size_t>::max();
-    uint64_t best_gap = std::numeric_limits<uint64_t>::max();
-    for (size_t i = 0; i + 1 < ranges_.size(); ++i) {
-      const auto& left = ranges_[i];
-      const auto& right = ranges_[i + 1];
-      const uint64_t left_end = uint64_t(left.base) + uint64_t(left.length);
-      const uint64_t right_base = uint64_t(right.base);
-      const uint64_t gap = right_base > left_end ? right_base - left_end : 0;
-      if (gap < best_gap) {
-        best_gap = gap;
-        best_index = i;
-        if (!gap) {
-          break;
-        }
-      }
-    }
-    if (best_index == std::numeric_limits<size_t>::max()) {
-      break;
-    }
-    auto& left = ranges_[best_index];
-    const auto& right = ranges_[best_index + 1];
-    const uint64_t merged_base_64 =
-        std::min<uint64_t>(left.base, uint64_t(right.base));
-    const uint64_t merged_end_64 =
-        std::max<uint64_t>(uint64_t(left.base) + uint64_t(left.length),
-                           uint64_t(right.base) + uint64_t(right.length));
-    const uint64_t merged_len_64 = std::min<uint64_t>(
-        merged_end_64 - merged_base_64, kAddressLimit - merged_base_64);
-    left.base = uint32_t(merged_base_64);
-    left.length = uint32_t(std::max<uint64_t>(1, merged_len_64));
-    ranges_.erase(ranges_.begin() + best_index + 1);
-  }
-}
-
-bool MetalCommandProcessor::TraceResolveGuard::IsResolved(
-    uint32_t base_ptr, uint32_t length) const {
-  const uint64_t end_ptr = uint64_t(base_ptr) + uint64_t(length);
-  for (const auto& range : ranges_) {
-    const uint64_t range_end = uint64_t(range.base) + uint64_t(range.length);
-    // Check if ranges overlap.
-    if (uint64_t(base_ptr) < range_end && end_ptr > uint64_t(range.base)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void MetalCommandProcessor::TraceResolveGuard::Clear() { ranges_.clear(); }
 
 void MetalCommandProcessor::ForceIssueSwap() {
   // Force a swap to push any pending render target to presenter
@@ -708,8 +558,6 @@ bool MetalCommandProcessor::SetupContext() {
   swap_dest_swaps_by_base_.clear();
   gamma_ramp_256_entry_table_up_to_date_ = false;
   gamma_ramp_pwl_up_to_date_ = false;
-  resolve_ordering_policy_ = ResolveOrderingPolicy::kEncoderBoundary;
-
   if (!CommandProcessor::SetupContext()) {
     XELOGE("Failed to initialize base command processor context");
     return false;
@@ -1349,9 +1197,6 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     }
   }
 
-  // Frame boundary reached - resolved memory tracking is only needed within a
-  // frame when trace playback writes memory.
-  trace_resolve_guard_.Clear();
   if (shared_memory_ && ::cvars::clear_memory_page_state) {
     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
   }
@@ -3951,53 +3796,12 @@ bool MetalCommandProcessor::DispatchDraw(
   return true;
 }
 
-MTL::CommandBuffer* MetalCommandProcessor::BeginResolveOrdering() {
+bool MetalCommandProcessor::IssueCopy() {
   // End any in-flight rendering so render target contents are visible to
   // resolve logic.
   EndRenderEncoder();
 
-  switch (resolve_ordering_policy_) {
-    case ResolveOrderingPolicy::kSubmissionBoundary: {
-      bool had_prior_draws = submission_has_draws_;
-      if (had_prior_draws) {
-        // Conservative/debug policy: force-submit prior draws before resolve.
-        // The default encoder-boundary path relies on explicit
-        // producer/consumer hazard tracking instead.
-        EndCommandBuffer();
-      }
-      break;
-    }
-    case ResolveOrderingPolicy::kEncoderBoundary:
-      break;
-  }
-
-  return EnsureCommandBuffer();
-}
-
-void MetalCommandProcessor::EndResolveOrdering() {
-  switch (resolve_ordering_policy_) {
-    case ResolveOrderingPolicy::kSubmissionBoundary:
-      // Conservative/debug policy: force the resolve command buffer out
-      // immediately. Encoder-boundary mode leaves synchronization to the
-      // explicit producer/consumer hazard paths.
-      EndCommandBuffer();
-      break;
-    case ResolveOrderingPolicy::kEncoderBoundary:
-      break;
-  }
-}
-
-bool MetalCommandProcessor::IssueCopy() {
-  // ===========================================================================
-  // Host render backend copy/resolve entry point.
-  //
-  // The virtual BeginResolveOrdering / EndResolveOrdering pair bracket the
-  // resolve work and enforce the active ResolveOrderingPolicy. The actual
-  // resolve is delegated to MetalRenderTargetCache::Resolve, and visibility
-  // of guest-visible writes is handled by the explicit memory hazard paths.
-  // ===========================================================================
-
-  MTL::CommandBuffer* copy_command_buffer = BeginResolveOrdering();
+  MTL::CommandBuffer* copy_command_buffer = EnsureCommandBuffer();
   if (!copy_command_buffer) {
     XELOGE("MetalCommandProcessor::IssueCopy: failed to get command buffer");
     return false;
@@ -4017,15 +3821,6 @@ bool MetalCommandProcessor::IssueCopy() {
     return false;
   }
 
-  if (!written_length) {
-    return true;
-  }
-
-  // Track this resolved region so the trace player can avoid overwriting it
-  // with stale MemoryRead commands from the trace file.
-  trace_resolve_guard_.Mark(written_address, written_length);
-
-  EndResolveOrdering();
   return true;
 }
 

@@ -79,44 +79,6 @@ class MetalCommandProcessor : public CommandProcessor {
   void InvalidateGpuMemory() override;
   void ClearReadbackBuffers() override;
 
-  // ---------------------------------------------------------------------------
-  // Trace replay resolve protection.
-  //
-  // During trace playback the trace player replays MemoryRead commands that
-  // blindly overwrite guest physical memory.  When the Metal backend has
-  // already resolved (IssueCopy) into a region, those writes would clobber
-  // live GPU-produced data with stale trace-file contents.
-  //
-  // TraceResolveGuard tracks resolved regions within a frame so the trace
-  // player (or any other caller) can query whether a write should be skipped.
-  // The guard is cleared at every frame boundary (IssueSwap /
-  // RestoreEdramSnapshot).  It carries no state that participates in live
-  // game rendering.
-  // ---------------------------------------------------------------------------
-  class TraceResolveGuard {
-   public:
-    // Record a resolved memory region (called from IssueCopy).
-    void Mark(uint32_t base_ptr, uint32_t length);
-
-    // Return true if the range overlaps any previously resolved region.
-    bool IsResolved(uint32_t base_ptr, uint32_t length) const;
-
-    // Drop all tracked ranges (frame boundary).
-    void Clear();
-
-   private:
-    struct ResolvedRange {
-      uint32_t base;
-      uint32_t length;
-    };
-    std::vector<ResolvedRange> ranges_;
-  };
-
-  TraceResolveGuard& trace_resolve_guard() { return trace_resolve_guard_; }
-  const TraceResolveGuard& trace_resolve_guard() const {
-    return trace_resolve_guard_;
-  }
-
   ui::metal::MetalProvider& GetMetalProvider() const;
 
   // Get the Metal device and command queue
@@ -213,17 +175,6 @@ class MetalCommandProcessor : public CommandProcessor {
   IRDescriptorTableEntry* GetViewBindlessHeapEntry(uint32_t index);
   IRDescriptorTableEntry* GetSamplerBindlessHeapEntry(uint32_t index);
 
-  // Resolve ordering policy - controls command-buffer boundary placement
-  // around resolve (IssueCopy) operations.
-  enum class ResolveOrderingPolicy {
-    kSubmissionBoundary,
-
-    // End the active render encoder before resolving, but keep the resolve in
-    // the same command buffer. Guest-visible resolve ordering is handled by
-    // explicit producer/consumer hazard paths.
-    kEncoderBoundary,
-  };
-
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
@@ -267,7 +218,7 @@ class MetalCommandProcessor : public CommandProcessor {
   // Draw path:   PrepareDrawConstants -> BeginRenderEncoderForDraw
   //              -> ApplyDrawDynamicState -> PopulateBindlessTables
   //              -> DispatchDraw
-  // Copy path:   BeginResolveOrdering -> Resolve -> EndResolveOrdering
+  // Copy path:   EndRenderEncoder -> Resolve
   // Transfer:    MetalRenderTargetCache::PerformTransfersAndResolveClears
   //              (sole transfer execution entry point; called from both the
   //              draw path via Update and the copy path via Resolve -- no
@@ -330,18 +281,18 @@ class MetalCommandProcessor : public CommandProcessor {
   // Host draw path — build the per-draw bindless descriptor tables (top-level
   // argument buffer, CBV table) and bind them plus the heap buffers to the
   // render encoder.
-  virtual bool PopulateBindlessTables(MetalShader* metal_vertex_shader,
-                                      MetalShader* metal_pixel_shader,
-                                      bool shared_memory_is_uav,
-                                      MTL::ResourceUsage shared_memory_usage,
-                                      bool use_geometry_emulation,
-                                      bool use_tessellation_emulation,
-                                      const UniformBufferInfo& uniforms);
+  bool PopulateBindlessTables(MetalShader* metal_vertex_shader,
+                              MetalShader* metal_pixel_shader,
+                              bool shared_memory_is_uav,
+                              MTL::ResourceUsage shared_memory_usage,
+                              bool use_geometry_emulation,
+                              bool use_tessellation_emulation,
+                              const UniformBufferInfo& uniforms);
 
   // Host draw path — bind vertex buffers and dispatch the actual draw call
   // (tessellation, geometry emulation, or standard path), then track
   // memexport writes.
-  virtual bool DispatchDraw(
+  bool DispatchDraw(
       const RegisterFile& regs,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool use_tessellation_emulation,
@@ -356,16 +307,6 @@ class MetalCommandProcessor : public CommandProcessor {
       const std::vector<Shader::VertexBinding>& vb_bindings,
       const VertexBindingRange* vertex_ranges, uint32_t vertex_range_count,
       IndexBufferInfo* index_buffer_info);
-
-  // Host copy/resolve path — enforce the active ResolveOrderingPolicy
-  // around resolve (IssueCopy) work.
-  // Called before resolve work begins.  Ends the render encoder, applies
-  // the pre-resolve boundary policy, ensures a command buffer, and returns
-  // it.  Returns nullptr on failure.
-  virtual MTL::CommandBuffer* BeginResolveOrdering();
-  // Called after resolve work completes.  Applies the post-resolve boundary
-  // policy.
-  virtual void EndResolveOrdering();
 
  private:
   // Command buffer management
@@ -685,17 +626,12 @@ class MetalCommandProcessor : public CommandProcessor {
   MTL::RenderStages active_render_encoder_shared_memory_write_stages_ =
       MTL::RenderStages(0);
 
-  ResolveOrderingPolicy resolve_ordering_policy_ =
-      ResolveOrderingPolicy::kEncoderBoundary;
-
   // Memexport tracking for shared memory invalidation.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
 
   bool gamma_ramp_256_entry_table_up_to_date_ = false;
   bool gamma_ramp_pwl_up_to_date_ = false;
 
-  // Trace-only resolve protection (see TraceResolveGuard above).
-  TraceResolveGuard trace_resolve_guard_;
 };
 
 }  // namespace metal
