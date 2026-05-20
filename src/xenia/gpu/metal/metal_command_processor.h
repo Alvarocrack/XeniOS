@@ -605,6 +605,9 @@ class MetalCommandProcessor : public CommandProcessor {
   void ResetRenderEncoderBufferBindings();
   void InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage stage,
                                             NS::UInteger index);
+  void SetRenderEncoderBuffer(RenderEncoderBufferStage stage,
+                              MTL::Buffer* buffer, NS::UInteger offset,
+                              NS::UInteger index);
   void SetRenderEncoderVertexBuffer(MTL::Buffer* buffer, NS::UInteger offset,
                                     NS::UInteger index);
   void SetRenderEncoderFragmentBuffer(MTL::Buffer* buffer, NS::UInteger offset,

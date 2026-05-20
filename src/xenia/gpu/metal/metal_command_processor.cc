@@ -4076,119 +4076,95 @@ void MetalCommandProcessor::InvalidateRenderEncoderBufferBinding(
   render_encoder_buffer_bindings_[stage_index][index] = {};
 }
 
-void MetalCommandProcessor::SetRenderEncoderVertexBuffer(
-    MTL::Buffer* buffer, NS::UInteger offset, NS::UInteger index) {
-  if (!current_render_encoder_) {
+void MetalCommandProcessor::SetRenderEncoderBuffer(
+    RenderEncoderBufferStage stage, MTL::Buffer* buffer, NS::UInteger offset,
+    NS::UInteger index) {
+  if (!current_render_encoder_ || stage == RenderEncoderBufferStage::kCount) {
     return;
   }
+  auto set_buffer = [&](MTL::Buffer* buffer_to_set, NS::UInteger offset_to_set) {
+    switch (stage) {
+      case RenderEncoderBufferStage::kVertex:
+        current_render_encoder_->setVertexBuffer(buffer_to_set, offset_to_set,
+                                                 index);
+        break;
+      case RenderEncoderBufferStage::kFragment:
+        current_render_encoder_->setFragmentBuffer(buffer_to_set, offset_to_set,
+                                                   index);
+        break;
+      case RenderEncoderBufferStage::kObject:
+        current_render_encoder_->setObjectBuffer(buffer_to_set, offset_to_set,
+                                                 index);
+        break;
+      case RenderEncoderBufferStage::kMesh:
+        current_render_encoder_->setMeshBuffer(buffer_to_set, offset_to_set,
+                                               index);
+        break;
+      case RenderEncoderBufferStage::kCount:
+        break;
+    }
+  };
+  auto set_buffer_offset = [&]() {
+    switch (stage) {
+      case RenderEncoderBufferStage::kVertex:
+        current_render_encoder_->setVertexBufferOffset(offset, index);
+        break;
+      case RenderEncoderBufferStage::kFragment:
+        current_render_encoder_->setFragmentBufferOffset(offset, index);
+        break;
+      case RenderEncoderBufferStage::kObject:
+        current_render_encoder_->setObjectBufferOffset(offset, index);
+        break;
+      case RenderEncoderBufferStage::kMesh:
+        current_render_encoder_->setMeshBufferOffset(offset, index);
+        break;
+      case RenderEncoderBufferStage::kCount:
+        break;
+    }
+  };
   if (!buffer) {
-    current_render_encoder_->setVertexBuffer(nullptr, 0, index);
-    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kVertex,
-                                         index);
+    set_buffer(nullptr, 0);
+    InvalidateRenderEncoderBufferBinding(stage, index);
     return;
   }
   if (index >= kTrackedRenderEncoderBufferBindingCount) {
-    current_render_encoder_->setVertexBuffer(buffer, offset, index);
+    set_buffer(buffer, offset);
     return;
   }
-  auto& binding =
-      render_encoder_buffer_bindings_[size_t(RenderEncoderBufferStage::kVertex)]
-                                     [index];
+  auto& binding = render_encoder_buffer_bindings_[size_t(stage)][index];
   if (binding.valid && binding.buffer == buffer) {
     if (binding.offset != offset) {
-      current_render_encoder_->setVertexBufferOffset(offset, index);
+      set_buffer_offset();
       binding.offset = offset;
     }
     return;
   }
-  current_render_encoder_->setVertexBuffer(buffer, offset, index);
+  set_buffer(buffer, offset);
   binding = {buffer, offset, true};
+}
+
+void MetalCommandProcessor::SetRenderEncoderVertexBuffer(
+    MTL::Buffer* buffer, NS::UInteger offset, NS::UInteger index) {
+  SetRenderEncoderBuffer(RenderEncoderBufferStage::kVertex, buffer, offset,
+                         index);
 }
 
 void MetalCommandProcessor::SetRenderEncoderFragmentBuffer(
     MTL::Buffer* buffer, NS::UInteger offset, NS::UInteger index) {
-  if (!current_render_encoder_) {
-    return;
-  }
-  if (!buffer) {
-    current_render_encoder_->setFragmentBuffer(nullptr, 0, index);
-    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kFragment,
-                                         index);
-    return;
-  }
-  if (index >= kTrackedRenderEncoderBufferBindingCount) {
-    current_render_encoder_->setFragmentBuffer(buffer, offset, index);
-    return;
-  }
-  auto& binding = render_encoder_buffer_bindings_[size_t(
-      RenderEncoderBufferStage::kFragment)][index];
-  if (binding.valid && binding.buffer == buffer) {
-    if (binding.offset != offset) {
-      current_render_encoder_->setFragmentBufferOffset(offset, index);
-      binding.offset = offset;
-    }
-    return;
-  }
-  current_render_encoder_->setFragmentBuffer(buffer, offset, index);
-  binding = {buffer, offset, true};
+  SetRenderEncoderBuffer(RenderEncoderBufferStage::kFragment, buffer, offset,
+                         index);
 }
 
 void MetalCommandProcessor::SetRenderEncoderObjectBuffer(
     MTL::Buffer* buffer, NS::UInteger offset, NS::UInteger index) {
-  if (!current_render_encoder_) {
-    return;
-  }
-  if (!buffer) {
-    current_render_encoder_->setObjectBuffer(nullptr, 0, index);
-    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kObject,
-                                         index);
-    return;
-  }
-  if (index >= kTrackedRenderEncoderBufferBindingCount) {
-    current_render_encoder_->setObjectBuffer(buffer, offset, index);
-    return;
-  }
-  auto& binding =
-      render_encoder_buffer_bindings_[size_t(RenderEncoderBufferStage::kObject)]
-                                     [index];
-  if (binding.valid && binding.buffer == buffer) {
-    if (binding.offset != offset) {
-      current_render_encoder_->setObjectBufferOffset(offset, index);
-      binding.offset = offset;
-    }
-    return;
-  }
-  current_render_encoder_->setObjectBuffer(buffer, offset, index);
-  binding = {buffer, offset, true};
+  SetRenderEncoderBuffer(RenderEncoderBufferStage::kObject, buffer, offset,
+                         index);
 }
 
 void MetalCommandProcessor::SetRenderEncoderMeshBuffer(
     MTL::Buffer* buffer, NS::UInteger offset, NS::UInteger index) {
-  if (!current_render_encoder_) {
-    return;
-  }
-  if (!buffer) {
-    current_render_encoder_->setMeshBuffer(nullptr, 0, index);
-    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kMesh,
-                                         index);
-    return;
-  }
-  if (index >= kTrackedRenderEncoderBufferBindingCount) {
-    current_render_encoder_->setMeshBuffer(buffer, offset, index);
-    return;
-  }
-  auto& binding =
-      render_encoder_buffer_bindings_[size_t(RenderEncoderBufferStage::kMesh)]
-                                     [index];
-  if (binding.valid && binding.buffer == buffer) {
-    if (binding.offset != offset) {
-      current_render_encoder_->setMeshBufferOffset(offset, index);
-      binding.offset = offset;
-    }
-    return;
-  }
-  current_render_encoder_->setMeshBuffer(buffer, offset, index);
-  binding = {buffer, offset, true};
+  SetRenderEncoderBuffer(RenderEncoderBufferStage::kMesh, buffer, offset,
+                         index);
 }
 
 void MetalCommandProcessor::UseRenderEncoderResource(MTL::Resource* resource,
