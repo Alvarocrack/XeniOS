@@ -181,6 +181,89 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       DrawPassTransferEncoderMutationMask* mutations_out = nullptr);
   bool FlushPendingDrawPassTransfers();
 
+  static constexpr size_t kDrawPassTransferRejectionReasonCount = 14;
+  enum class RenderPassDescriptorDirtyReason : uint32_t {
+    kClearCache,
+    kSampleCountOrFallbackChanged,
+    kPendingFullOverwriteTransfer,
+    kPendingInitialClearConsumed,
+    kTargetsChanged,
+    kLoadDontCareDescriptorConsumed,
+    kRestoreInitialClearConsumed,
+    kFallbackDepthCreateFailed,
+    kStandaloneTransferInitialClearConsumed,
+    kDescriptorDepthInitialClearConsumed,
+    kDescriptorColorInitialClearConsumed,
+    kCount,
+  };
+  static constexpr size_t kRenderPassDescriptorDirtyReasonCount =
+      static_cast<size_t>(RenderPassDescriptorDirtyReason::kCount);
+  enum class RenderPassCompatibilityReason : uint32_t {
+    kCompatible,
+    kNullDescriptor,
+    kDepthAttachmentMismatch,
+    kStencilAttachmentMismatch,
+    kUnexpectedStencilAttachment,
+    kFallbackDepthAttachmentMismatch,
+    kUnexpectedDepthStencilAttachment,
+    kColorAttachmentMismatch,
+    kUnexpectedColorAttachment,
+    kDummyColorAttachmentMismatch,
+    kCount,
+  };
+  static constexpr size_t kRenderPassCompatibilityReasonCount =
+      static_cast<size_t>(RenderPassCompatibilityReason::kCount);
+  struct TelemetryStats {
+    uint64_t render_pass_descriptor_requests = 0;
+    uint64_t render_pass_descriptor_cache_hits = 0;
+    uint64_t render_pass_descriptor_rebuilds = 0;
+    uint64_t render_pass_descriptor_dirty_marks = 0;
+    std::array<uint64_t, kRenderPassDescriptorDirtyReasonCount>
+        render_pass_descriptor_dirty_reasons = {};
+    uint64_t render_pass_compatibility_checks = 0;
+    std::array<uint64_t, kRenderPassCompatibilityReasonCount>
+        render_pass_compatibility_reasons = {};
+
+    uint64_t update_transfer_lists = 0;
+    uint64_t pending_draw_pass_transfer_lists = 0;
+    uint64_t pending_draw_pass_transfer_count = 0;
+    uint64_t pending_draw_pass_accepted_lists = 0;
+    uint64_t pending_draw_pass_fallback_lists = 0;
+    uint64_t pending_draw_pass_full_overwrite_lists = 0;
+    uint64_t pending_draw_pass_preflight_attempts = 0;
+    uint64_t pending_draw_pass_preflight_successes = 0;
+    uint64_t pending_draw_pass_preflight_failures = 0;
+    uint64_t pending_draw_pass_encode_attempts = 0;
+    uint64_t pending_draw_pass_encode_successes = 0;
+    uint64_t pending_draw_pass_encode_failures = 0;
+    uint64_t pending_draw_pass_flush_attempts = 0;
+    uint64_t pending_draw_pass_flush_successes = 0;
+    uint64_t pending_draw_pass_flush_failures = 0;
+    std::array<uint64_t, kDrawPassTransferRejectionReasonCount>
+        pending_draw_pass_rejections = {};
+
+    uint64_t resolve_plan_calls = 0;
+    uint64_t resolve_plan_noops = 0;
+    uint64_t resolve_plan_copy_export = 0;
+    uint64_t resolve_plan_clear = 0;
+    uint64_t resolve_plan_copy_only = 0;
+    uint64_t resolve_plan_clear_only = 0;
+    uint64_t resolve_plan_clear_color = 0;
+    uint64_t resolve_plan_clear_depth = 0;
+    uint64_t resolve_plan_copy_and_clear = 0;
+    uint64_t resolve_plan_needs_encoder_end = 0;
+    uint64_t resolve_plan_no_encoder_end = 0;
+    uint64_t resolve_execute_calls = 0;
+
+    uint64_t perform_transfer_calls = 0;
+    uint64_t perform_transfer_active_encoder_calls = 0;
+    uint64_t perform_transfer_standalone_calls = 0;
+    uint64_t perform_transfer_resolve_clear_calls = 0;
+    uint64_t perform_transfer_no_work_calls = 0;
+    uint64_t perform_transfer_work_calls = 0;
+  };
+  TelemetryStats GetAndResetTelemetryStats();
+
   bool IsRenderPassDescriptorDirty() const {
     return render_pass_descriptor_dirty_;
   }
@@ -555,6 +638,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   uint32_t pending_draw_pass_full_overwrite_mask_ = 0;
   uint32_t pending_draw_pass_preflighted_transfer_mask_ = 0;
   uint32_t pending_draw_pass_load_dontcare_mask_ = 0;
+  mutable TelemetryStats telemetry_;
   MTL::DepthStencilState* transfer_depth_state_ = nullptr;
   MTL::DepthStencilState* transfer_depth_state_none_ = nullptr;
   MTL::DepthStencilState* transfer_depth_clear_state_ = nullptr;
@@ -640,6 +724,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       const TransferAttachmentFormats& attachment_formats);
   bool PreflightPendingDrawPassTransfers(
       MTL::RenderPassDescriptor* pass_descriptor);
+  void MarkRenderPassDescriptorDirty(RenderPassDescriptorDirtyReason reason);
+  RenderPassCompatibilityReason GetRenderPassDescriptorCompatibilityReason(
+      MTL::RenderPassDescriptor* pass_descriptor,
+      uint32_t expected_sample_count,
+      bool fallback_depth_attachment_required) const;
   void ClearPendingDrawPassTransfers();
 
   // EDRAM compute shader setup

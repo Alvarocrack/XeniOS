@@ -623,6 +623,13 @@ MetalRenderTargetCache::MetalRenderTargetCache(
 
 MetalRenderTargetCache::~MetalRenderTargetCache() { Shutdown(true); }
 
+MetalRenderTargetCache::TelemetryStats
+MetalRenderTargetCache::GetAndResetTelemetryStats() {
+  TelemetryStats stats = telemetry_;
+  telemetry_ = TelemetryStats();
+  return stats;
+}
+
 RenderTargetCache::Path MetalRenderTargetCache::GetPath() const {
   return Path::kHostRenderTargets;
 }
@@ -2221,6 +2228,16 @@ void MetalRenderTargetCache::ShutdownEdramComputeShaders() {
   }
 }
 
+void MetalRenderTargetCache::MarkRenderPassDescriptorDirty(
+    RenderPassDescriptorDirtyReason reason) {
+  render_pass_descriptor_dirty_ = true;
+  ++telemetry_.render_pass_descriptor_dirty_marks;
+  size_t reason_index = static_cast<size_t>(reason);
+  if (reason_index < telemetry_.render_pass_descriptor_dirty_reasons.size()) {
+    ++telemetry_.render_pass_descriptor_dirty_reasons[reason_index];
+  }
+}
+
 void MetalRenderTargetCache::ClearCache() {
   ClearPendingDrawPassTransfers();
 
@@ -2229,7 +2246,7 @@ void MetalRenderTargetCache::ClearCache() {
     current_color_targets_[i] = nullptr;
   }
   current_depth_target_ = nullptr;
-  render_pass_descriptor_dirty_ = true;
+  MarkRenderPassDescriptorDirty(RenderPassDescriptorDirtyReason::kClearCache);
 
   dummy_color_targets_.clear();
   dummy_color_target_ = nullptr;
@@ -2406,14 +2423,22 @@ bool MetalRenderTargetCache::Update(
       if (transfers.empty()) {
         continue;
       }
+      ++telemetry_.update_transfer_lists;
+      ++telemetry_.pending_draw_pass_transfer_lists;
+      telemetry_.pending_draw_pass_transfer_count += transfers.size();
       DrawPassTransferRejectionReason draw_pass_rejection =
           GetDrawPassTransferRejectionReason(i, accumulated_targets, transfers);
+      size_t rejection_index = static_cast<size_t>(draw_pass_rejection);
+      if (rejection_index < telemetry_.pending_draw_pass_rejections.size()) {
+        ++telemetry_.pending_draw_pass_rejections[rejection_index];
+      }
       PendingDrawPassTransferPlan& pending_plan =
           pending_draw_pass_transfer_plans_[i];
       pending_plan = PendingDrawPassTransferPlan();
       pending_plan.render_target = accumulated_targets[i];
       pending_plan.rejection_reason = draw_pass_rejection;
       if (draw_pass_rejection == DrawPassTransferRejectionReason::kNone) {
+        ++telemetry_.pending_draw_pass_accepted_lists;
         pending_draw_pass_render_targets_[i] = accumulated_targets[i];
         pending_draw_pass_transfers_[i] = transfers;
         pending_draw_pass_transfer_mask_ |= uint32_t(1) << i;
@@ -2423,16 +2448,20 @@ bool MetalRenderTargetCache::Update(
             PendingDrawPassTransfersFullyOverwriteTarget(
                 i, accumulated_targets[i], transfers);
         if (pending_plan.full_overwrite) {
+          ++telemetry_.pending_draw_pass_full_overwrite_lists;
           pending_draw_pass_full_overwrite_mask_ |= uint32_t(1) << i;
-          render_pass_descriptor_dirty_ = true;
+          MarkRenderPassDescriptorDirty(
+              RenderPassDescriptorDirtyReason::kPendingFullOverwriteTransfer);
         }
         auto* dest_metal_rt =
             static_cast<MetalRenderTarget*>(accumulated_targets[i]);
         if (dest_metal_rt->needs_initial_clear()) {
           dest_metal_rt->SetNeedsInitialClear(false);
-          render_pass_descriptor_dirty_ = true;
+          MarkRenderPassDescriptorDirty(
+              RenderPassDescriptorDirtyReason::kPendingInitialClearConsumed);
         }
       } else {
+        ++telemetry_.pending_draw_pass_fallback_lists;
         fallback_transfers[i] = transfers;
         fallback_transfer_work = true;
       }
@@ -2449,6 +2478,11 @@ bool MetalRenderTargetCache::Update(
       }
     }
   } else {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!update_transfers[i].empty()) {
+        ++telemetry_.update_transfer_lists;
+      }
+    }
     PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                      accumulated_targets, update_transfers,
                                      nullptr, nullptr, nullptr);
@@ -2456,7 +2490,8 @@ bool MetalRenderTargetCache::Update(
 
   // Only mark render pass descriptor as dirty if targets actually changed
   if (targets_changed) {
-    render_pass_descriptor_dirty_ = true;
+    MarkRenderPassDescriptorDirty(
+        RenderPassDescriptorDirtyReason::kTargetsChanged);
   }
 
   return true;
@@ -2475,7 +2510,8 @@ void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
   pending_draw_pass_preflighted_transfer_mask_ = 0;
   pending_draw_pass_load_dontcare_mask_ = 0;
   if (load_dontcare_descriptor_used) {
-    render_pass_descriptor_dirty_ = true;
+    MarkRenderPassDescriptorDirty(
+        RenderPassDescriptorDirtyReason::kLoadDontCareDescriptorConsumed);
   }
 }
 
@@ -2915,9 +2951,11 @@ bool MetalRenderTargetCache::EnsurePendingDrawPassTransfersPreflighted() {
     return true;
   }
 
+  ++telemetry_.pending_draw_pass_preflight_attempts;
   TransferAttachmentFormats attachment_formats;
   if (!GetCurrentTransferAttachmentFormats(attachment_formats) ||
       !PreflightPendingDrawPassTransfers(attachment_formats)) {
+    ++telemetry_.pending_draw_pass_preflight_failures;
     pending_draw_pass_preflighted_transfer_mask_ = 0;
     for (PendingDrawPassTransferPlan& plan : pending_draw_pass_transfer_plans_) {
       plan.preflighted = false;
@@ -2926,6 +2964,7 @@ bool MetalRenderTargetCache::EnsurePendingDrawPassTransfersPreflighted() {
     return false;
   }
 
+  ++telemetry_.pending_draw_pass_preflight_successes;
   pending_draw_pass_preflighted_transfer_mask_ =
       pending_draw_pass_transfer_mask_;
   for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
@@ -2960,10 +2999,13 @@ bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
   if (!HasPendingDrawPassTransfers()) {
     return true;
   }
+  ++telemetry_.pending_draw_pass_encode_attempts;
   if (!encoder) {
+    ++telemetry_.pending_draw_pass_encode_failures;
     return false;
   }
   if (!PreflightPendingDrawPassTransfers(pass_descriptor)) {
+    ++telemetry_.pending_draw_pass_encode_failures;
     return false;
   }
 
@@ -2973,7 +3015,10 @@ bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
       pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr, encoder,
       pass_descriptor, mutations_out);
   if (success) {
+    ++telemetry_.pending_draw_pass_encode_successes;
     ClearPendingDrawPassTransfers();
+  } else {
+    ++telemetry_.pending_draw_pass_encode_failures;
   }
   return success;
 }
@@ -2982,13 +3027,16 @@ bool MetalRenderTargetCache::FlushPendingDrawPassTransfers() {
   if (!HasPendingDrawPassTransfers()) {
     return true;
   }
+  ++telemetry_.pending_draw_pass_flush_attempts;
   bool success = PerformTransfersAndResolveClears(
       1 + xenos::kMaxColorRenderTargets,
       pending_draw_pass_render_targets_.data(),
       pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr);
   if (!success) {
+    ++telemetry_.pending_draw_pass_flush_failures;
     return false;
   }
+  ++telemetry_.pending_draw_pass_flush_successes;
   ClearPendingDrawPassTransfers();
   return true;
 }
@@ -3295,7 +3343,8 @@ void MetalRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   staging->release();
   if (metal_rt->needs_initial_clear()) {
     metal_rt->SetNeedsInitialClear(false);
-    render_pass_descriptor_dirty_ = true;
+    MarkRenderPassDescriptorDirty(
+        RenderPassDescriptorDirtyReason::kRestoreInitialClearConsumed);
   }
 
   // Seed edram_buffer_ with the restored full-EDRAM render target contents
@@ -3547,17 +3596,21 @@ MTL::Texture* MetalRenderTargetCache::GetStencilTextureView(
 MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     uint32_t expected_sample_count,
     bool fallback_depth_attachment_required) {
+  ++telemetry_.render_pass_descriptor_requests;
   if (!render_pass_descriptor_dirty_ && cached_render_pass_descriptor_ &&
       cached_render_pass_descriptor_sample_count_ == expected_sample_count &&
       cached_render_pass_descriptor_fallback_depth_required_ ==
           fallback_depth_attachment_required) {
+    ++telemetry_.render_pass_descriptor_cache_hits;
     return cached_render_pass_descriptor_;
   }
   if (cached_render_pass_descriptor_sample_count_ != expected_sample_count ||
       cached_render_pass_descriptor_fallback_depth_required_ !=
           fallback_depth_attachment_required) {
-    render_pass_descriptor_dirty_ = true;
+    MarkRenderPassDescriptorDirty(
+        RenderPassDescriptorDirtyReason::kSampleCountOrFallbackChanged);
   }
+  ++telemetry_.render_pass_descriptor_rebuilds;
 
   // Release old descriptor
   if (cached_render_pass_descriptor_) {
@@ -3576,10 +3629,10 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
   cached_render_pass_descriptor_sample_count_ = expected_sample_count;
   cached_render_pass_descriptor_fallback_depth_required_ =
       fallback_depth_attachment_required;
+  render_pass_descriptor_dirty_ = false;
 
   bool has_any_render_target = false;
   bool has_any_color_target = false;
-  bool needs_descriptor_refresh = false;
   uint32_t coverage_width = 0;
   uint32_t coverage_height = 0;
   uint32_t coverage_samples = std::max(1u, expected_sample_count);
@@ -3613,7 +3666,9 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     if (depth_needs_clear) {
       depth_attachment->setClearDepth(GetDepthTargetClearDepth());
       current_depth_target_->SetNeedsInitialClear(false);
-      needs_descriptor_refresh = true;
+      MarkRenderPassDescriptorDirty(
+          RenderPassDescriptorDirtyReason::
+              kDescriptorDepthInitialClearConsumed);
     }
 
     // If the depth texture includes stencil, bind the same texture to the
@@ -3676,7 +3731,9 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
         color_attachment->setClearColor(
             MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.0));
         current_color_targets_[i]->SetNeedsInitialClear(false);
-        needs_descriptor_refresh = true;
+        MarkRenderPassDescriptorDirty(
+            RenderPassDescriptorDirtyReason::
+                kDescriptorColorInitialClearConsumed);
       }
 
       has_any_render_target = true;
@@ -3870,7 +3927,8 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
           "attachment");
       cached_render_pass_descriptor_->release();
       cached_render_pass_descriptor_ = nullptr;
-      render_pass_descriptor_dirty_ = true;
+      MarkRenderPassDescriptorDirty(
+          RenderPassDescriptorDirtyReason::kFallbackDepthCreateFailed);
       return nullptr;
     }
 
@@ -3883,7 +3941,6 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     has_any_render_target = true;
   }
 
-  render_pass_descriptor_dirty_ = needs_descriptor_refresh;
   return cached_render_pass_descriptor_;
 }
 
@@ -3891,9 +3948,26 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
     MTL::RenderPassDescriptor* pass_descriptor,
     uint32_t expected_sample_count,
     bool fallback_depth_attachment_required) const {
+  RenderPassCompatibilityReason reason =
+      GetRenderPassDescriptorCompatibilityReason(
+          pass_descriptor, expected_sample_count,
+          fallback_depth_attachment_required);
+  ++telemetry_.render_pass_compatibility_checks;
+  size_t reason_index = static_cast<size_t>(reason);
+  if (reason_index < telemetry_.render_pass_compatibility_reasons.size()) {
+    ++telemetry_.render_pass_compatibility_reasons[reason_index];
+  }
+  return reason == RenderPassCompatibilityReason::kCompatible;
+}
+
+MetalRenderTargetCache::RenderPassCompatibilityReason
+MetalRenderTargetCache::GetRenderPassDescriptorCompatibilityReason(
+    MTL::RenderPassDescriptor* pass_descriptor,
+    uint32_t expected_sample_count,
+    bool fallback_depth_attachment_required) const {
   (void)expected_sample_count;
   if (!pass_descriptor) {
-    return false;
+    return RenderPassCompatibilityReason::kNullDescriptor;
   }
 
   MTL::Texture* expected_depth =
@@ -3902,7 +3976,7 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
   auto* stencil_attachment = pass_descriptor->stencilAttachment();
   if (expected_depth) {
     if (!depth_attachment || depth_attachment->texture() != expected_depth) {
-      return false;
+      return RenderPassCompatibilityReason::kDepthAttachmentMismatch;
     }
     MTL::PixelFormat depth_pixel_format = expected_depth->pixelFormat();
     bool expects_stencil =
@@ -3912,10 +3986,10 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
     if (expects_stencil) {
       if (!stencil_attachment ||
           stencil_attachment->texture() != expected_depth) {
-        return false;
+        return RenderPassCompatibilityReason::kStencilAttachmentMismatch;
       }
     } else if (stencil_attachment && stencil_attachment->texture()) {
-      return false;
+      return RenderPassCompatibilityReason::kUnexpectedStencilAttachment;
     }
   } else {
     MTL::Texture* depth_texture =
@@ -3926,10 +4000,12 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
       if (!depth_texture ||
           depth_texture->pixelFormat() != MTL::PixelFormatDepth32Float ||
           stencil_texture) {
-        return false;
+        return RenderPassCompatibilityReason::
+            kFallbackDepthAttachmentMismatch;
       }
     } else if (depth_texture || stencil_texture) {
-      return false;
+      return RenderPassCompatibilityReason::
+          kUnexpectedDepthStencilAttachment;
     }
   }
 
@@ -3949,7 +4025,7 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
                                   : nullptr;
     if (expected_color) {
       if (!color_attachment || color_attachment->texture() != expected_color) {
-        return false;
+        return RenderPassCompatibilityReason::kColorAttachmentMismatch;
       }
       continue;
     }
@@ -3957,19 +4033,22 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
       if (!has_current_color_target && i == 0) {
         continue;
       }
-      return false;
+      return RenderPassCompatibilityReason::kUnexpectedColorAttachment;
     }
   }
 
   if (has_current_color_target) {
-    return true;
+    return RenderPassCompatibilityReason::kCompatible;
   }
 
   MTL::Texture* expected_dummy =
       dummy_color_target_ ? dummy_color_target_->draw_texture() : nullptr;
   auto* color_attachment_0 = color_attachments->object(0);
-  return expected_dummy && color_attachment_0 &&
-         color_attachment_0->texture() == expected_dummy;
+  if (expected_dummy && color_attachment_0 &&
+      color_attachment_0->texture() == expected_dummy) {
+    return RenderPassCompatibilityReason::kCompatible;
+  }
+  return RenderPassCompatibilityReason::kDummyColorAttachmentMismatch;
 }
 
 MTL::Texture* MetalRenderTargetCache::GetColorTarget(uint32_t index) const {
@@ -5143,6 +5222,7 @@ MTL::RenderPipelineState* MetalRenderTargetCache::GetOrCreateEdramLoadPipeline(
 
 bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
                                                 ResolvePlan& plan_out) {
+  ++telemetry_.resolve_plan_calls;
   plan_out = ResolvePlan();
   const RegisterFile& regs = register_file();
 
@@ -5169,11 +5249,32 @@ bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
   plan_out.noop = !resolve_info.coordinate_info.width_div_8 ||
                   !resolve_info.height_div_8;
   if (plan_out.noop) {
+    ++telemetry_.resolve_plan_noops;
+    ++telemetry_.resolve_plan_no_encoder_end;
     return true;
   }
   plan_out.needs_copy_export = resolve_info.copy_dest_extent_length != 0;
   plan_out.needs_resolve_clear =
       resolve_info.IsClearingDepth() || resolve_info.IsClearingColor();
+  if (plan_out.needs_copy_export) {
+    ++telemetry_.resolve_plan_copy_export;
+  }
+  if (plan_out.needs_resolve_clear) {
+    ++telemetry_.resolve_plan_clear;
+    if (resolve_info.IsClearingColor()) {
+      ++telemetry_.resolve_plan_clear_color;
+    }
+    if (resolve_info.IsClearingDepth()) {
+      ++telemetry_.resolve_plan_clear_depth;
+    }
+  }
+  if (plan_out.needs_copy_export && plan_out.needs_resolve_clear) {
+    ++telemetry_.resolve_plan_copy_and_clear;
+  } else if (plan_out.needs_copy_export) {
+    ++telemetry_.resolve_plan_copy_only;
+  } else if (plan_out.needs_resolve_clear) {
+    ++telemetry_.resolve_plan_clear_only;
+  }
   // TODO (xenios-jp): Add a queued resolve-clear system for clear-only resolves
   // that can be materialized before the next observer. Full clears could become
   // descriptor-time loadActionClear in the next render pass, avoiding an
@@ -5183,6 +5284,11 @@ bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
   // ownership query must observe the cleared contents.
   plan_out.needs_render_encoder_end =
       plan_out.needs_copy_export || plan_out.needs_resolve_clear;
+  if (plan_out.needs_render_encoder_end) {
+    ++telemetry_.resolve_plan_needs_encoder_end;
+  } else {
+    ++telemetry_.resolve_plan_no_encoder_end;
+  }
   if (plan_out.needs_copy_export) {
     plan_out.written_address = resolve_info.copy_dest_extent_start;
     plan_out.written_length = resolve_info.copy_dest_extent_length;
@@ -5194,6 +5300,7 @@ bool MetalRenderTargetCache::Resolve(
     Memory& memory, uint32_t& written_address, uint32_t& written_length,
     MTL::CommandBuffer* command_buffer,
     const ResolvePlan* prepared_resolve_plan) {
+  ++telemetry_.resolve_execute_calls;
   written_address = 0;
   written_length = 0;
   ResolvePlan resolve_plan_storage;
@@ -5434,6 +5541,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::RenderCommandEncoder* active_render_encoder,
     MTL::RenderPassDescriptor* active_render_pass_descriptor,
     DrawPassTransferEncoderMutationMask* mutations_out) {
+  ++telemetry_.perform_transfer_calls;
   if (mutations_out) {
     *mutations_out = kDrawPassTransferEncoderMutationNone;
   }
@@ -5444,6 +5552,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
   bool resolve_clear_needed =
       render_target_resolve_clear_values && resolve_clear_rectangle;
   bool use_active_render_encoder = active_render_encoder != nullptr;
+  if (use_active_render_encoder) {
+    ++telemetry_.perform_transfer_active_encoder_calls;
+  } else {
+    ++telemetry_.perform_transfer_standalone_calls;
+  }
+  if (resolve_clear_needed) {
+    ++telemetry_.perform_transfer_resolve_clear_calls;
+  }
   if (use_active_render_encoder &&
       (resolve_clear_needed || !active_render_pass_descriptor)) {
     return false;
@@ -5494,8 +5610,10 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     any_work = true;
   }
   if (!any_work) {
+    ++telemetry_.perform_transfer_no_work_calls;
     return true;
   }
+  ++telemetry_.perform_transfer_work_calls;
   if (use_active_render_encoder && host_depth_store_needed) {
     return false;
   }
@@ -5637,7 +5755,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     auto* dest_metal_rt = static_cast<MetalRenderTarget*>(dest_rt);
     if (dest_metal_rt->needs_initial_clear()) {
       dest_metal_rt->SetNeedsInitialClear(false);
-      render_pass_descriptor_dirty_ = true;
+      MarkRenderPassDescriptorDirty(
+          RenderPassDescriptorDirtyReason::
+              kStandaloneTransferInitialClearConsumed);
     }
     RenderTargetKey dest_key = dest_metal_rt->key();
     bool dest_is_depth = dest_key.is_depth;

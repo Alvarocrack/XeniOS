@@ -295,15 +295,141 @@ class MetalCommandProcessor final : public CommandProcessor {
 
  private:
   // Command buffer management
+  enum class RenderEncoderEndReason : uint32_t {
+    kUnknown,
+    kPrepareForWait,
+    kSwap,
+    kCommandBufferEnd,
+    kRequestTransferCommandBuffer,
+    kSharedMemoryReadDependency,
+    kRenderTargetUpdateDescriptorDirty,
+    kPipelineDescriptorIncompatible,
+    kTextureUploadBeforeDrawPass,
+    kResolveNeedsBoundary,
+    kBeginRenderEncoderDescriptorChanged,
+    kCount,
+  };
+
+  static constexpr size_t kRenderEncoderEndReasonCount =
+      static_cast<size_t>(RenderEncoderEndReason::kCount);
+
+  struct BackendTelemetryStats {
+    static constexpr size_t kBindlessTelemetryStageCount = 2;
+    static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 7;
+
+    uint64_t swaps = 0;
+    uint64_t draw_calls = 0;
+    uint64_t prepare_draw_constants = 0;
+    uint64_t pipeline_sets = 0;
+    uint64_t pipeline_set_skips = 0;
+    uint64_t texture_request_work_draws = 0;
+    uint64_t texture_request_work_active_encoder = 0;
+    uint64_t texture_request_work_no_active_encoder = 0;
+    uint64_t texture_request_work_pass_compatible = 0;
+    uint64_t texture_request_work_pass_changing = 0;
+    uint64_t texture_request_work_no_descriptor = 0;
+    uint64_t texture_request_work_mask_or = 0;
+    uint64_t texture_requests_before_encoder = 0;
+    uint64_t texture_requests_after_encoder_begin = 0;
+
+    uint64_t constant_upload_system = 0;
+    uint64_t constant_upload_float_vertex = 0;
+    uint64_t constant_upload_float_pixel = 0;
+    uint64_t constant_upload_bool_loop = 0;
+    uint64_t constant_upload_fetch = 0;
+    uint64_t constant_upload_descriptor_indices_vertex = 0;
+    uint64_t constant_upload_descriptor_indices_pixel = 0;
+    uint64_t constant_upload_bytes = 0;
+    uint64_t constant_dirty_float_layout_vertex = 0;
+    uint64_t constant_dirty_float_layout_pixel = 0;
+    uint64_t descriptor_dirty_vertex_sampler_layout = 0;
+    uint64_t descriptor_dirty_vertex_sampler_params = 0;
+    uint64_t descriptor_dirty_vertex_texture_layout = 0;
+    uint64_t descriptor_dirty_vertex_texture_srv = 0;
+    uint64_t descriptor_dirty_pixel_sampler_layout = 0;
+    uint64_t descriptor_dirty_pixel_sampler_params = 0;
+    uint64_t descriptor_dirty_pixel_texture_layout = 0;
+    uint64_t descriptor_dirty_pixel_texture_srv = 0;
+    uint64_t descriptor_index_texture_lookups_vertex = 0;
+    uint64_t descriptor_index_sampler_lookups_vertex = 0;
+    uint64_t descriptor_index_texture_lookups_pixel = 0;
+    uint64_t descriptor_index_sampler_lookups_pixel = 0;
+    uint64_t register_write_float_total = 0;
+    uint64_t register_write_float_changed = 0;
+    uint64_t register_write_float_unchanged = 0;
+    uint64_t register_write_float_dirty = 0;
+    uint64_t register_write_bool_loop_total = 0;
+    uint64_t register_write_bool_loop_changed = 0;
+    uint64_t register_write_bool_loop_unchanged = 0;
+    uint64_t register_write_bool_loop_dirty = 0;
+    uint64_t register_write_fetch_total = 0;
+    uint64_t register_write_fetch_changed = 0;
+    uint64_t register_write_fetch_unchanged = 0;
+    uint64_t register_write_fetch_dirty = 0;
+    uint64_t texture_fetch_constant_invalidations = 0;
+
+    uint64_t begin_encoder_calls = 0;
+    uint64_t begin_encoder_reused_compatible = 0;
+    uint64_t begin_encoder_created = 0;
+    uint64_t begin_encoder_descriptor_restarts = 0;
+    uint64_t begin_encoder_resource_usage_resets = 0;
+    uint64_t begin_encoder_descriptor_failures = 0;
+    uint64_t begin_encoder_creation_failures = 0;
+
+    uint64_t end_encoder_calls = 0;
+    uint64_t end_encoder_active = 0;
+    uint64_t end_encoder_no_active = 0;
+    std::array<uint64_t, kRenderEncoderEndReasonCount> end_reasons = {};
+
+    uint64_t pending_transfer_encode_attempts = 0;
+    uint64_t pending_transfer_encode_successes = 0;
+    uint64_t pending_transfer_encode_failures = 0;
+    uint64_t pending_transfer_fallback_flush_successes = 0;
+    uint64_t pending_transfer_fallback_flush_failures = 0;
+    uint64_t pending_transfer_state_invalidations = 0;
+    uint64_t pending_transfer_mutation_mask_or = 0;
+
+    uint64_t bindless_populate_calls = 0;
+    uint64_t bindless_table_reuse_hits = 0;
+    uint64_t bindless_table_reuse_misses = 0;
+    uint64_t bindless_table_miss_invalid = 0;
+    uint64_t bindless_table_miss_cbv = 0;
+    uint64_t bindless_table_miss_shared_memory_uav = 0;
+    uint64_t bindless_table_miss_mesh_stages = 0;
+    uint64_t bindless_table_allocations = 0;
+    uint64_t bindless_table_bytes = 0;
+    uint64_t bindless_cbv_entry_writes = 0;
+    std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
+               kBindlessTelemetryStageCount>
+        bindless_table_miss_cbv_slots = {};
+    uint64_t bindless_resource_serial_hits = 0;
+    uint64_t bindless_resource_serial_misses = 0;
+    uint64_t bindless_resource_miss_invalid = 0;
+    uint64_t bindless_resource_miss_shared_memory_uav = 0;
+    uint64_t bindless_resource_miss_usage = 0;
+    uint64_t bindless_resource_textures_tracked = 0;
+    uint64_t bindless_resource_uniform_buffers_tracked = 0;
+
+    uint64_t render_encoder_use_resource_calls = 0;
+    uint64_t render_encoder_use_resource_redundant = 0;
+    uint64_t render_encoder_use_resource_driver_calls = 0;
+    uint64_t render_encoder_use_heap_calls = 0;
+    uint64_t render_encoder_use_heap_redundant = 0;
+    uint64_t render_encoder_use_heap_driver_calls = 0;
+  };
+
   void FlushCommandBufferAndWait(uint64_t timeout_ns, const char* context);
   MTL::RenderPassDescriptor* GetDrawRenderPassDescriptor(
       bool fallback_depth_attachment_required = false);
   bool BeginRenderEncoderForDraw(
       bool fallback_depth_attachment_required = false);
+  void EndRenderEncoder(RenderEncoderEndReason reason);
   void EndCommandBuffer();
   bool CanEndSubmissionImmediately();
   void WaitForPendingCompletionHandlers();
   void ProcessCompletedSubmissions();
+  void MaybeDumpBackendTelemetry(const char* reason, bool force = false);
+  void ResetBackendTelemetry();
 
   void UseRenderEncoderAttachmentHeaps(MTL::RenderPassDescriptor* descriptor);
   void UseRenderEncoderHeap(MTL::Heap* heap);
@@ -393,6 +519,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       render_encoder_resource_usage_map_;
   std::vector<MTL::Heap*> render_encoder_heap_usage_;
   std::unordered_set<MTL::Heap*> render_encoder_heap_usage_set_;
+  BackendTelemetryStats backend_telemetry_;
+  uint64_t backend_telemetry_last_dump_swap_ = 0;
 
   // Shared memory for Xbox 360 memory access
   std::unique_ptr<MetalSharedMemory> shared_memory_;

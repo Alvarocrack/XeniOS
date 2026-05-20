@@ -169,6 +169,46 @@ class MetalTextureCache : public TextureCache {
   // encoder.
   bool CanUseCurrentCommandBufferForTextureUploads() const;
 
+  struct TelemetryStats {
+    uint64_t request_textures_calls = 0;
+    uint64_t request_textures_nonzero_mask = 0;
+    uint64_t request_textures_work_mask_bits = 0;
+    uint64_t request_textures_with_loads = 0;
+    uint64_t request_textures_without_loads = 0;
+    uint64_t request_textures_loaded_textures = 0;
+    uint64_t load_texture_calls = 0;
+    uint64_t load_texture_base = 0;
+    uint64_t load_texture_mips = 0;
+    uint64_t gpu_load_attempts = 0;
+    uint64_t gpu_load_successes = 0;
+    uint64_t gpu_load_failures = 0;
+    uint64_t gpu_load_scaled = 0;
+    uint64_t gpu_load_decompressed = 0;
+    uint64_t gpu_load_blit_path = 0;
+    uint64_t gpu_load_compute_copy_path = 0;
+    uint64_t gpu_load_standalone_command_buffers = 0;
+    uint64_t gpu_load_upload_batch_command_buffers = 0;
+    uint64_t gpu_load_current_submission_command_buffers = 0;
+    uint64_t gpu_load_direct_uploads = 0;
+    uint64_t gpu_load_repack_uploads = 0;
+    uint64_t gpu_load_dispatches = 0;
+    uint64_t gpu_load_repack_dispatches = 0;
+    uint64_t gpu_load_deferred_encoder_uses = 0;
+    uint64_t gpu_load_local_encoder_uses = 0;
+    uint64_t deferred_upload_compute_encoder_creates = 0;
+    uint64_t deferred_upload_compute_encoder_reuses = 0;
+    uint64_t deferred_upload_empty_flushes = 0;
+    uint64_t deferred_upload_flushes = 0;
+    uint64_t deferred_upload_flushes_with_compute = 0;
+    uint64_t deferred_upload_flushes_with_blits = 0;
+    uint64_t deferred_upload_copy_count = 0;
+    uint64_t immediate_upload_blit_encoder_creates = 0;
+    uint64_t ensure_bindless_headroom_calls = 0;
+    uint64_t ensure_bindless_headroom_trims = 0;
+    uint64_t ensure_bindless_headroom_failures = 0;
+  };
+  TelemetryStats GetAndResetTelemetryStats();
+
  private:
   bool EnsureViewBindlessHeadroom(uint32_t target_free_slots) const;
   // GPU-based texture loading entry point. Returns true on success.
@@ -213,6 +253,7 @@ class MetalTextureCache : public TextureCache {
   MTL::ComputePipelineState* load_pipelines_[kLoadShaderCount] = {};
   MTL::ComputePipelineState* load_pipelines_scaled_[kLoadShaderCount] = {};
   MTL::ComputePipelineState* texture_upload_repack_pipeline_ = nullptr;
+  TelemetryStats telemetry_;
 
   // Metal-specific Texture implementation
 

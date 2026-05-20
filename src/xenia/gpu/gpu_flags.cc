@@ -232,6 +232,22 @@ DEFINE_bool(metal_pipeline_disk_cache, true,
             "archive can be prewarmed on the next run.",
             "Metal");
 
+DEFINE_int32(
+    metal_draw_ring_count, 128,
+    "Metal per-command-buffer draw ring size (descriptor-table pages). "
+    "Higher reduces ring churn but uses more memory.",
+    "Metal");
+
+DEFINE_bool(metal_backend_telemetry, true,
+            "Log concise Metal backend decision counters for render encoder "
+            "lifetime, resolve/transfer planning, bindless binding, and "
+            "texture upload/load behavior.",
+            "Metal");
+DEFINE_int32(metal_backend_telemetry_interval, 120,
+             "Number of guest swaps between Metal backend telemetry summaries. "
+             "Set to 0 to log only on shutdown.",
+             "Metal");
+
 DEFINE_bool(
     ac6_ground_fix, false,
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "

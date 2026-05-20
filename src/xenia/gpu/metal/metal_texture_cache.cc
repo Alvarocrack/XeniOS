@@ -492,6 +492,12 @@ MetalTextureCache::MetalTextureCache(MetalCommandProcessor* command_processor,
 
 MetalTextureCache::~MetalTextureCache() { Shutdown(); }
 
+MetalTextureCache::TelemetryStats MetalTextureCache::GetAndResetTelemetryStats() {
+  TelemetryStats stats = telemetry_;
+  telemetry_ = TelemetryStats();
+  return stats;
+}
+
 MTL::StorageMode MetalTextureCache::GetCacheTextureStorageMode() const {
   if (!::cvars::metal_texture_upload_via_blit ||
       !::cvars::metal_texture_cache_use_private) {
@@ -595,18 +601,22 @@ bool MetalTextureCache::EndDeferredUploadEncoderBatch() {
   }
   if (!deferred_upload_compute_encoder_ && deferred_upload_copies_.empty()) {
     deferred_upload_command_buffer_ = nullptr;
+    ++telemetry_.deferred_upload_empty_flushes;
     return true;
   }
   return FlushDeferredUploadEncoderBatch();
 }
 
 bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
+  MTL::CommandBuffer* cmd = deferred_upload_command_buffer_;
   if (!deferred_upload_compute_encoder_ && deferred_upload_copies_.empty()) {
     deferred_upload_command_buffer_ = nullptr;
+    ++telemetry_.deferred_upload_empty_flushes;
     return true;
   }
-  MTL::CommandBuffer* cmd = deferred_upload_command_buffer_;
+  ++telemetry_.deferred_upload_flushes;
   if (deferred_upload_compute_encoder_) {
+    ++telemetry_.deferred_upload_flushes_with_compute;
     MTL::ComputeCommandEncoder* compute_encoder =
         deferred_upload_compute_encoder_;
     deferred_upload_compute_encoder_ = nullptr;
@@ -615,6 +625,7 @@ bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
   }
   bool success = true;
   if (cmd && !deferred_upload_copies_.empty()) {
+    ++telemetry_.deferred_upload_flushes_with_blits;
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       XELOGE("Metal texture upload: failed to create deferred blit encoder");
@@ -650,10 +661,13 @@ MTL::ComputeCommandEncoder* MetalTextureCache::GetDeferredUploadComputeEncoder(
   if (!deferred_upload_compute_encoder_) {
     deferred_upload_compute_encoder_ = command_buffer->computeCommandEncoder();
     if (deferred_upload_compute_encoder_) {
+      ++telemetry_.deferred_upload_compute_encoder_creates;
       SetEncoderLabel(deferred_upload_compute_encoder_,
                       "XeniaTextureUploadDeferredComputeEncoder");
       deferred_upload_compute_encoder_->retain();
     }
+  } else {
+    ++telemetry_.deferred_upload_compute_encoder_reuses;
   }
   return deferred_upload_compute_encoder_;
 }
@@ -683,6 +697,7 @@ void MetalTextureCache::QueueDeferredUploadCopy(
   copy.height = height;
   copy.depth = depth;
   deferred_upload_copies_.push_back(copy);
+  ++telemetry_.deferred_upload_copy_count;
 }
 
 class MetalTextureCache::UploadBatchScope {
@@ -970,10 +985,25 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   if (!metal_texture || !metal_texture->metal_texture()) {
     return false;
   }
+  ++telemetry_.gpu_load_attempts;
+  struct GpuLoadTelemetryScope {
+    TelemetryStats& stats;
+    bool success = false;
+    ~GpuLoadTelemetryScope() {
+      if (success) {
+        ++stats.gpu_load_successes;
+      } else {
+        ++stats.gpu_load_failures;
+      }
+    }
+  } gpu_load_telemetry_scope{telemetry_};
 
   const TextureKey& key = texture.key();
   bool texture_resolution_scaled =
       key.scaled_resolve && IsDrawResolutionScaled();
+  if (texture_resolution_scaled) {
+    ++telemetry_.gpu_load_scaled;
+  }
   uint32_t texture_resolution_scale_x =
       texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y =
@@ -1007,6 +1037,9 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
 
   bool decompress = IsDecompressionNeededForKey(key);
+  if (decompress) {
+    ++telemetry_.gpu_load_decompressed;
+  }
   TextureCache::LoadShaderIndex load_shader = GetLoadShaderIndexForKey(key);
   if (load_shader == TextureCache::kLoadShaderIndexUnknown) {
     return false;
@@ -1203,6 +1236,11 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
 
   const bool use_blit_upload = ShouldUploadViaBlit();
+  if (use_blit_upload) {
+    ++telemetry_.gpu_load_blit_path;
+  } else {
+    ++telemetry_.gpu_load_compute_copy_path;
+  }
   MetalCommandProcessor::SharedMemoryReadDependency shared_memory_dependency;
   MetalCommandProcessor::SharedMemoryRange shared_memory_ranges[2] = {};
   uint32_t shared_memory_range_count = 0;
@@ -1284,12 +1322,15 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   if (use_upload_batch) {
     cmd = upload_batch_command_buffer_;
     upload_command_buffer_mode = UploadCommandBufferMode::kUploadBatch;
+    ++telemetry_.gpu_load_upload_batch_command_buffers;
   } else if (use_current_command_buffer) {
     cmd = command_processor_->GetCurrentCommandBuffer();
     upload_command_buffer_mode = UploadCommandBufferMode::kCurrentSubmission;
+    ++telemetry_.gpu_load_current_submission_command_buffers;
   } else {
     cmd = command_processor_->CreateStandaloneTransferCommandBuffer(
         "XeniaCB reason=texture-upload");
+    ++telemetry_.gpu_load_standalone_command_buffers;
   }
   if (!cmd) {
     release_buffer_immediate(constants_buffer, constants_buffer_size);
@@ -1543,9 +1584,12 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     return false;
   }
   if (!using_deferred_upload_encoder) {
+    ++telemetry_.gpu_load_local_encoder_uses;
     SetEncoderLabel(encoder, repack_uploads.empty()
                                  ? "XeniaTextureLoadEncoder"
                                  : "XeniaTextureLoadRepackEncoder");
+  } else {
+    ++telemetry_.gpu_load_deferred_encoder_uses;
   }
   bool compute_encoder_open = true;
   auto end_local_compute_encoder = [&]() {
@@ -1681,6 +1725,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                          1);
       encoder->dispatchThreadgroups(threadgroups, threads_per_group);
       command_buffer_has_work = true;
+      ++telemetry_.gpu_load_dispatches;
       ++dispatch_index;
     }
   }
@@ -1702,6 +1747,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                           upload.constants.depth),
           repack_threads_per_group);
       command_buffer_has_work = true;
+      ++telemetry_.gpu_load_repack_dispatches;
     }
     encoder->popDebugGroup();
   }
@@ -1735,6 +1781,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
           handle_upload_failure(true);
           return false;
         }
+        ++telemetry_.immediate_upload_blit_encoder_creates;
 
         for (const PendingDirectUpload& upload : direct_uploads) {
           blit->copyFromBuffer(
@@ -1882,6 +1929,9 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
   }
 
+  telemetry_.gpu_load_direct_uploads += direct_uploads.size();
+  telemetry_.gpu_load_repack_uploads += repack_uploads.size();
+  gpu_load_telemetry_scope.success = true;
   return true;
 }
 
@@ -2677,10 +2727,24 @@ MTL::Texture* MetalTextureCache::CreateNullTextureCube() {
 // RequestTextures override - integrates with standard texture binding pipeline
 void MetalTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
+  ++telemetry_.request_textures_calls;
+  if (used_texture_mask) {
+    ++telemetry_.request_textures_nonzero_mask;
+  }
+  uint32_t work_mask = GetUsedTextureRequestWorkMask(used_texture_mask);
+  telemetry_.request_textures_work_mask_bits += xe::bit_count(work_mask);
+  uint64_t load_calls_before = telemetry_.load_texture_calls;
 
   UploadBatchScope upload_batch(*this);
   TextureCache::RequestTextures(used_texture_mask);
   upload_batch.End();
+  uint64_t load_calls_delta = telemetry_.load_texture_calls - load_calls_before;
+  if (load_calls_delta) {
+    ++telemetry_.request_textures_with_loads;
+    telemetry_.request_textures_loaded_textures += load_calls_delta;
+  } else {
+    ++telemetry_.request_textures_without_loads;
+  }
 
   // Intentionally no Metal-specific per-fetch logging here - invalid fetch
   // constants are already reported by the shared TextureCache logic.
@@ -3768,6 +3832,13 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_base,
                                                               bool load_mips) {
   SCOPE_profile_cpu_f("gpu");
+  ++telemetry_.load_texture_calls;
+  if (load_base) {
+    ++telemetry_.load_texture_base;
+  }
+  if (load_mips) {
+    ++telemetry_.load_texture_mips;
+  }
 
   MetalTexture* metal_texture = static_cast<MetalTexture*>(&texture);
   if (!metal_texture || !metal_texture->metal_texture()) {
@@ -3786,17 +3857,28 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
 bool MetalTextureCache::EnsureViewBindlessHeadroom(
     uint32_t target_free_slots) const {
+  ++const_cast<MetalTextureCache*>(this)->telemetry_
+        .ensure_bindless_headroom_calls;
   if (!command_processor_) {
+    ++const_cast<MetalTextureCache*>(this)->telemetry_
+          .ensure_bindless_headroom_failures;
     return false;
   }
   if (command_processor_->GetViewBindlessHeapAvailableCount() >=
       target_free_slots) {
     return true;
   }
+  ++const_cast<MetalTextureCache*>(this)->telemetry_
+        .ensure_bindless_headroom_trims;
   const_cast<MetalTextureCache*>(this)->TrimViewBindlessPressure(
       target_free_slots);
-  return command_processor_->GetViewBindlessHeapAvailableCount() >=
-         target_free_slots;
+  bool success = command_processor_->GetViewBindlessHeapAvailableCount() >=
+                 target_free_slots;
+  if (!success) {
+    ++const_cast<MetalTextureCache*>(this)->telemetry_
+          .ensure_bindless_headroom_failures;
+  }
+  return success;
 }
 
 // MetalTexture implementation
