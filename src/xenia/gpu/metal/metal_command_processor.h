@@ -410,6 +410,14 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t register_write_float_changed = 0;
     uint64_t register_write_float_unchanged = 0;
     uint64_t register_write_float_dirty = 0;
+    uint64_t register_write_float_dwords_copied = 0;
+    uint64_t register_write_float_dwords_compared = 0;
+    uint64_t register_write_float_dirty_vertex = 0;
+    uint64_t register_write_float_dirty_pixel = 0;
+    uint64_t register_write_float_stage_already_dirty_vertex = 0;
+    uint64_t register_write_float_stage_already_dirty_pixel = 0;
+    uint64_t register_write_float_range_unused_vertex = 0;
+    uint64_t register_write_float_range_unused_pixel = 0;
     uint64_t register_write_bool_loop_total = 0;
     uint64_t register_write_bool_loop_changed = 0;
     uint64_t register_write_bool_loop_unchanged = 0;
@@ -418,6 +426,10 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t register_write_fetch_changed = 0;
     uint64_t register_write_fetch_unchanged = 0;
     uint64_t register_write_fetch_dirty = 0;
+    uint64_t register_write_fetch_dwords_copied = 0;
+    uint64_t register_write_fetch_slots_tested = 0;
+    uint64_t register_write_fetch_dwords_compared = 0;
+    uint64_t register_write_fetch_changed_slots = 0;
     uint64_t texture_fetch_constant_invalidations = 0;
     uint64_t register_range_mem_calls = 0;
     uint64_t register_range_ring_calls = 0;

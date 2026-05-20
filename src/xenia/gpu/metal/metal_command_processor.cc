@@ -4517,11 +4517,15 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
   backend_telemetry_.register_write_float_changed += changed;
   backend_telemetry_.register_write_float_unchanged += unchanged;
   backend_telemetry_.register_write_float_dirty += dirty;
+  backend_telemetry_.register_write_float_dwords_copied += num_registers;
+  backend_telemetry_.register_write_float_dwords_compared += num_registers;
   if (vertex_dirty) {
     cbuffer_binding_float_vertex_.up_to_date = false;
+    ++backend_telemetry_.register_write_float_dirty_vertex;
   }
   if (pixel_dirty) {
     cbuffer_binding_float_pixel_.up_to_date = false;
+    ++backend_telemetry_.register_write_float_dirty_pixel;
   }
 }
 
@@ -4577,6 +4581,18 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   backend_telemetry_.register_write_fetch_changed += changed;
   backend_telemetry_.register_write_fetch_unchanged += unchanged;
   backend_telemetry_.register_write_fetch_dirty += changed;
+  backend_telemetry_.register_write_fetch_dwords_copied += num_registers;
+  backend_telemetry_.register_write_fetch_dwords_compared += num_registers;
+  if (num_registers) {
+    const uint32_t fetch_relative_start =
+        start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    const uint32_t fetch_relative_end =
+        fetch_relative_start + num_registers;
+    backend_telemetry_.register_write_fetch_slots_tested +=
+        (fetch_relative_end - 1) / 6 - fetch_relative_start / 6 + 1;
+  }
+  backend_telemetry_.register_write_fetch_changed_slots +=
+      xe::bit_count(changed_fetch_mask);
   if (changed) {
     cbuffer_binding_fetch_.up_to_date = false;
   }
@@ -5039,6 +5055,23 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.register_write_fetch_unchanged,
       backend_telemetry_.register_write_fetch_dirty,
       backend_telemetry_.texture_fetch_constant_invalidations);
+  XELOGI(
+      "MetalTelemetry[{}]: register_write_detail float "
+      "copied/compared/dirty_vs/dirty_ps/already_dirty_vs/"
+      "already_dirty_ps/unused_vs/unused_ps={}/{}/{}/{}/{}/{}/{}/{} "
+      "fetch copied/slots/compared/changed_slots={}/{}/{}/{}",
+      reason, backend_telemetry_.register_write_float_dwords_copied,
+      backend_telemetry_.register_write_float_dwords_compared,
+      backend_telemetry_.register_write_float_dirty_vertex,
+      backend_telemetry_.register_write_float_dirty_pixel,
+      backend_telemetry_.register_write_float_stage_already_dirty_vertex,
+      backend_telemetry_.register_write_float_stage_already_dirty_pixel,
+      backend_telemetry_.register_write_float_range_unused_vertex,
+      backend_telemetry_.register_write_float_range_unused_pixel,
+      backend_telemetry_.register_write_fetch_dwords_copied,
+      backend_telemetry_.register_write_fetch_slots_tested,
+      backend_telemetry_.register_write_fetch_dwords_compared,
+      backend_telemetry_.register_write_fetch_changed_slots);
   XELOGI(
       "MetalTelemetry[{}]: register_ranges mem/ring/wrap/fallback={}/{}/{}/{} "
       "fast_dwords float/fetch/bool_loop/regular={}/{}/{}/{}",
