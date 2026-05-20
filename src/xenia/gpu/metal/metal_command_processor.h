@@ -808,7 +808,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   // Fetch constants are one physical register file, but MSC root arguments are
   // bound per stage.  Keep one full-buffer snapshot per stage so a write only
-  // churns the stage whose translated shader reads the changed dwords.
+  // churns stages whose current shader uses the changed fetch dwords.
   std::array<ConstantBufferBinding, kStageCount> cbuffer_binding_fetch_stage_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;

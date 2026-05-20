@@ -620,11 +620,61 @@ void MarkFetchConstantDword(DxbcShader::FetchConstantDwordMask& mask,
   mask[dword_index >> 5] |= uint32_t(1) << (dword_index & 31);
 }
 
+void MarkVertexFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
+                             uint32_t fetch_constant_index) {
+  if (fetch_constant_index >= xenos::kVertexFetchConstantCount) {
+    assert_always();
+    return;
+  }
+  const uint32_t dword_index = fetch_constant_index * 2;
+  MarkFetchConstantDword(mask, dword_index);
+  MarkFetchConstantDword(mask, dword_index + 1);
+}
+
+void MarkTextureFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
+                              uint32_t fetch_constant_index) {
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    assert_always();
+    return;
+  }
+  const uint32_t dword_index = fetch_constant_index * 6;
+  for (uint32_t i = 0; i < 6; ++i) {
+    MarkFetchConstantDword(mask, dword_index + i);
+  }
+}
+
 void MergeFetchConstantDwordMask(DxbcShader::FetchConstantDwordMask& dest,
                                  const DxbcShader::FetchConstantDwordMask& src) {
   for (size_t i = 0; i < dest.size(); ++i) {
     dest[i] |= src[i];
   }
+}
+
+DxbcShader::FetchConstantDwordMask GetShaderFetchConstantDwordMask(
+    const Shader* shader) {
+  DxbcShader::FetchConstantDwordMask mask = {};
+  if (!shader) {
+    return mask;
+  }
+
+  const Shader::ConstantRegisterMap& constant_map =
+      shader->constant_register_map();
+  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+    uint32_t bit_index;
+    while (xe::bit_scan_forward(vfetch_bits_remaining, &bit_index)) {
+      vfetch_bits_remaining = xe::clear_lowest_bit(vfetch_bits_remaining);
+      MarkVertexFetchConstant(mask, i * 32 + bit_index);
+    }
+  }
+
+  for (const Shader::VertexBinding& binding : shader->vertex_bindings()) {
+    MarkVertexFetchConstant(mask, binding.fetch_constant);
+  }
+  for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+    MarkTextureFetchConstant(mask, binding.fetch_constant);
+  }
+  return mask;
 }
 
 }  // namespace
@@ -2832,6 +2882,10 @@ bool MetalCommandProcessor::PrepareDrawConstants(
           metal_pixel_shader
               ? metal_pixel_shader->GetFetchConstantDwordMaskAfterTranslation()
               : DxbcShader::FetchConstantDwordMask()};
+  MergeFetchConstantDwordMask(fetch_constant_dword_masks[kStageVertex],
+                              GetShaderFetchConstantDwordMask(vertex_shader));
+  MergeFetchConstantDwordMask(fetch_constant_dword_masks[kStagePixel],
+                              GetShaderFetchConstantDwordMask(pixel_shader));
   for (size_t stage = 0; stage < kStageCount; ++stage) {
     if ((active_cbv_masks[stage] & (uint32_t(1) << kCbvSlotFetch)) &&
         FetchConstantDwordMaskEmpty(fetch_constant_dword_masks[stage])) {
