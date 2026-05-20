@@ -571,6 +571,34 @@ const char* RenderEncoderBufferStageName(size_t stage) {
   }
 }
 
+const char* ConstantPayloadSlotName(size_t slot) {
+  switch (slot) {
+    case 0:
+      return "system";
+    case 1:
+      return "vs_float";
+    case 2:
+      return "ps_float";
+    case 3:
+      return "bool_loop";
+    case 4:
+      return "fetch";
+    case 5:
+      return "vs_desc";
+    case 6:
+      return "ps_desc";
+    default:
+      return "invalid";
+  }
+}
+
+uint64_t ConstantPayloadCacheKey(XXH128_hash_t hash, size_t size,
+                                 size_t slot) {
+  return hash.low64 ^ xe::rotate_left(hash.high64, 1) ^
+         xe::rotate_left(static_cast<uint64_t>(size), 17) ^
+         xe::rotate_left(static_cast<uint64_t>(slot), 33);
+}
+
 }  // namespace
 
 MetalCommandProcessor::MetalCommandProcessor(
@@ -2970,29 +2998,14 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   bool descriptor_indices_vertex_written = false;
   bool descriptor_indices_pixel_written = false;
 
-  constexpr size_t kConstantBufferAlignment = 256;
-  const uint64_t submission = submission_current_ ? submission_current_ : 1;
-
-  auto upload_binding = [&](ConstantBufferBinding& binding, size_t size,
+  auto upload_binding = [&](ConstantPayloadSlot slot,
+                            ConstantBufferBinding& binding, size_t size,
                             const char* name, auto&& writer) -> bool {
     size = std::max(size, size_t(16));
-    MTL::Buffer* buffer = nullptr;
-    size_t offset = 0;
-    uint64_t gpu_address = 0;
-    uint8_t* data = constant_buffer_pool_->Request(
-        submission, size, kConstantBufferAlignment, &buffer, offset,
-        gpu_address);
-    if (!data) {
-      XELOGE("IssueDraw: {} constant buffer pool allocation failed", name);
-      return false;
-    }
-    writer(data, size);
-    binding.buffer = buffer;
-    binding.offset = static_cast<NS::UInteger>(offset);
-    binding.gpu_address = gpu_address;
-    binding.size = size;
-    binding.up_to_date = true;
-    return true;
+    constant_upload_scratch_.resize(size);
+    writer(constant_upload_scratch_.data(), size);
+    return UploadOrReuseConstantBinding(slot, binding, size, name,
+                                        constant_upload_scratch_.data());
   };
   auto count_constant_upload = [&](uint64_t& counter, size_t size) {
     ++counter;
@@ -3000,7 +3013,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   };
 
   if (!cbuffer_binding_system_.up_to_date) {
-    if (!upload_binding(cbuffer_binding_system_,
+    if (!upload_binding(ConstantPayloadSlot::kSystem, cbuffer_binding_system_,
                         sizeof(DxbcShaderTranslator::SystemConstants), "system",
                         [&](uint8_t* data, size_t) {
                           std::memcpy(
@@ -3044,7 +3057,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_float_vertex_.up_to_date) {
     const size_t float_size =
         sizeof(float) * 4 * std::max(float_map_vertex.float_count, uint32_t(1));
-    if (!upload_binding(cbuffer_binding_float_vertex_, float_size,
+    if (!upload_binding(ConstantPayloadSlot::kVertexFloat,
+                        cbuffer_binding_float_vertex_, float_size,
                         "vertex float", [&](uint8_t* data, size_t size) {
                           write_packed_float_constants(
                               data, size, &float_map_vertex,
@@ -3063,8 +3077,9 @@ bool MetalCommandProcessor::PrepareDrawConstants(
         sizeof(float) * 4 *
         std::max(float_map_pixel ? float_map_pixel->float_count : uint32_t(0),
                  uint32_t(1));
-    if (!upload_binding(cbuffer_binding_float_pixel_, float_size, "pixel float",
-                        [&](uint8_t* data, size_t size) {
+    if (!upload_binding(ConstantPayloadSlot::kPixelFloat,
+                        cbuffer_binding_float_pixel_, float_size,
+                        "pixel float", [&](uint8_t* data, size_t size) {
                           write_packed_float_constants(
                               data, size, float_map_pixel,
                               XE_GPU_REG_SHADER_CONSTANT_256_X);
@@ -3077,7 +3092,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
 
   if (!cbuffer_binding_bool_loop_.up_to_date) {
     if (!upload_binding(
-            cbuffer_binding_bool_loop_, kBoolLoopConstantsSize, "bool loop",
+            ConstantPayloadSlot::kBoolLoop, cbuffer_binding_bool_loop_,
+            kBoolLoopConstantsSize, "bool loop",
             [&](uint8_t* data, size_t) {
               std::memcpy(data,
                           &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
@@ -3092,7 +3108,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_fetch_.up_to_date) {
     const size_t fetch_size = kFetchConstantCount * sizeof(uint32_t);
     if (!upload_binding(
-            cbuffer_binding_fetch_, fetch_size, "fetch",
+            ConstantPayloadSlot::kFetch, cbuffer_binding_fetch_, fetch_size,
+            "fetch",
             [&](uint8_t* data, size_t) {
               std::memcpy(data,
                           &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
@@ -3166,6 +3183,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     size_t descriptor_indices_bytes =
         descriptor_indices_size(metal_vertex_shader);
     if (!upload_binding(
+            ConstantPayloadSlot::kVertexDescriptorIndices,
             cbuffer_binding_descriptor_indices_vertex_,
             descriptor_indices_bytes, "vertex descriptor indices",
             [&](uint8_t* data, size_t size) {
@@ -3184,7 +3202,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
     size_t descriptor_indices_bytes =
         descriptor_indices_size(metal_pixel_shader);
-    if (!upload_binding(cbuffer_binding_descriptor_indices_pixel_,
+    if (!upload_binding(ConstantPayloadSlot::kPixelDescriptorIndices,
+                        cbuffer_binding_descriptor_indices_pixel_,
                         descriptor_indices_bytes,
                         "pixel descriptor indices", [&](uint8_t* data,
                                                         size_t size) {
@@ -3308,6 +3327,110 @@ void MetalCommandProcessor::ApplyDrawDynamicState(
         dynamic_state.blend_constants[0], dynamic_state.blend_constants[1],
         dynamic_state.blend_constants[2], dynamic_state.blend_constants[3]);
   }
+}
+
+void MetalCommandProcessor::ResetConstantPayloadCacheForSubmission(
+    uint64_t submission) {
+  if (constant_payload_cache_submission_ == submission) {
+    return;
+  }
+  for (ConstantPayloadCacheSlot& slot : constant_payload_cache_) {
+    slot.entries.clear();
+    slot.index.clear();
+  }
+  constant_payload_cache_bytes_ = 0;
+  constant_payload_cache_submission_ = submission;
+}
+
+bool MetalCommandProcessor::UploadOrReuseConstantBinding(
+    ConstantPayloadSlot slot, ConstantBufferBinding& binding, size_t size,
+    const char* name, const uint8_t* payload) {
+  constexpr size_t kConstantBufferAlignment = 256;
+  const uint64_t submission = submission_current_ ? submission_current_ : 1;
+  ResetConstantPayloadCacheForSubmission(submission);
+  size = std::max(size, size_t(16));
+
+  size_t slot_index = static_cast<size_t>(slot);
+  assert_true(slot_index < constant_payload_cache_.size());
+  const bool slot_tracked = slot_index < constant_payload_cache_.size();
+  auto increment_slot_stat = [&](auto& counters) {
+    if (slot_index <
+        BackendTelemetryStats::kConstantPayloadTelemetrySlotCount) {
+      ++counters[slot_index];
+    }
+  };
+
+  ++backend_telemetry_.constant_payload_cache_lookups;
+  XXH128_hash_t hash = XXH3_128bits(payload, size);
+  uint64_t key = ConstantPayloadCacheKey(hash, size, slot_index);
+  if (slot_tracked) {
+    ConstantPayloadCacheSlot& cache_slot = constant_payload_cache_[slot_index];
+    auto range = cache_slot.index.equal_range(key);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second >= cache_slot.entries.size()) {
+        continue;
+      }
+      const ConstantPayloadCacheEntry& entry = cache_slot.entries[it->second];
+      if (entry.size != size || entry.hash.low64 != hash.low64 ||
+          entry.hash.high64 != hash.high64) {
+        continue;
+      }
+      if (std::memcmp(entry.payload.data(), payload, size) != 0) {
+        continue;
+      }
+      binding = entry.binding;
+      binding.up_to_date = true;
+      ++backend_telemetry_.constant_payload_cache_hits;
+      backend_telemetry_.constant_payload_cache_bytes_reused += size;
+      increment_slot_stat(
+          backend_telemetry_.constant_payload_cache_slot_hits);
+      return true;
+    }
+  }
+
+  ++backend_telemetry_.constant_payload_cache_misses;
+  increment_slot_stat(backend_telemetry_.constant_payload_cache_slot_misses);
+
+  MTL::Buffer* buffer = nullptr;
+  size_t offset = 0;
+  uint64_t gpu_address = 0;
+  uint8_t* data = constant_buffer_pool_->Request(
+      submission, size, kConstantBufferAlignment, &buffer, offset, gpu_address);
+  if (!data) {
+    XELOGE("IssueDraw: {} constant buffer pool allocation failed", name);
+    return false;
+  }
+  std::memcpy(data, payload, size);
+  backend_telemetry_.constant_payload_cache_bytes_uploaded += size;
+
+  binding.buffer = buffer;
+  binding.offset = static_cast<NS::UInteger>(offset);
+  binding.gpu_address = gpu_address;
+  binding.size = size;
+  binding.up_to_date = true;
+
+  if (!slot_tracked ||
+      constant_payload_cache_bytes_ + size > kConstantPayloadCacheByteLimit) {
+    ++backend_telemetry_.constant_payload_cache_bypasses;
+    backend_telemetry_.constant_payload_cache_bytes_bypassed += size;
+    increment_slot_stat(
+        backend_telemetry_.constant_payload_cache_slot_bypasses);
+    return true;
+  }
+
+  ConstantPayloadCacheSlot& cache_slot = constant_payload_cache_[slot_index];
+  ConstantPayloadCacheEntry entry;
+  entry.hash = hash;
+  entry.size = size;
+  entry.payload.assign(payload, payload + size);
+  entry.binding = binding;
+  const size_t entry_index = cache_slot.entries.size();
+  cache_slot.entries.push_back(std::move(entry));
+  cache_slot.index.emplace(key, entry_index);
+  constant_payload_cache_bytes_ += size;
+  ++backend_telemetry_.constant_payload_cache_stores;
+  backend_telemetry_.constant_payload_cache_bytes_stored += size;
+  return true;
 }
 
 MetalCommandProcessor::StageRootArgumentKey
@@ -4858,6 +4981,29 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   std::string buffer_untracked_full_binds = format_buffer_stage_array(
       backend_telemetry_.render_encoder_buffer_untracked_full_binds);
 
+  auto format_constant_payload_slot_array =
+      [](const std::array<uint64_t,
+                          BackendTelemetryStats::
+                              kConstantPayloadTelemetrySlotCount>& values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}={}", ConstantPayloadSlotName(i), values[i]);
+        }
+        return formatted;
+      };
+  std::string constant_payload_slot_hits = format_constant_payload_slot_array(
+      backend_telemetry_.constant_payload_cache_slot_hits);
+  std::string constant_payload_slot_misses =
+      format_constant_payload_slot_array(
+          backend_telemetry_.constant_payload_cache_slot_misses);
+  std::string constant_payload_slot_bypasses =
+      format_constant_payload_slot_array(
+          backend_telemetry_.constant_payload_cache_slot_bypasses);
+
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
       "set/skip={}/{} texture_work_draws={} texture_work active/no_active="
@@ -4971,6 +5117,22 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.descriptor_index_texture_lookups_pixel,
       backend_telemetry_.descriptor_index_sampler_lookups_vertex,
       backend_telemetry_.descriptor_index_sampler_lookups_pixel);
+  XELOGI(
+      "MetalTelemetry[{}]: constant_payload_cache "
+      "lookups/hits/misses/bypasses/stores={}/{}/{}/{}/{} "
+      "bytes reused/uploaded/stored/bypassed={}/{}/{}/{} "
+      "slot_hits={{ {} }} slot_misses={{ {} }} slot_bypasses={{ {} }}",
+      reason, backend_telemetry_.constant_payload_cache_lookups,
+      backend_telemetry_.constant_payload_cache_hits,
+      backend_telemetry_.constant_payload_cache_misses,
+      backend_telemetry_.constant_payload_cache_bypasses,
+      backend_telemetry_.constant_payload_cache_stores,
+      backend_telemetry_.constant_payload_cache_bytes_reused,
+      backend_telemetry_.constant_payload_cache_bytes_uploaded,
+      backend_telemetry_.constant_payload_cache_bytes_stored,
+      backend_telemetry_.constant_payload_cache_bytes_bypassed,
+      constant_payload_slot_hits, constant_payload_slot_misses,
+      constant_payload_slot_bypasses);
   XELOGI(
       "MetalTelemetry[{}]: register_writes float total/changed/unchanged/"
       "dirty={}/{}/{}/{} bool_loop total/changed/unchanged/dirty={}/{}/{}/{} "
@@ -5603,6 +5765,7 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_bindless_stable_resources_valid_ = false;
     current_bindless_stable_shared_memory_is_uav_ = false;
     current_bindless_stable_shared_memory_usage_bits_ = 0;
+    ResetConstantPayloadCacheForSubmission(0);
   }
   DrainCommandBufferAutoreleasePool();
 }
