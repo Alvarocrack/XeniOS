@@ -3312,36 +3312,60 @@ bool MetalCommandProcessor::PrepareDrawConstants(
 
   uniforms_out = {};
   auto set_uniform_cbv = [](UniformBufferInfo::Cbv& cbv,
-                            const ConstantBufferBinding& binding) {
+                            const ConstantBufferBinding& binding, bool active) {
+    cbv.active = active;
+    if (!active) {
+      return;
+    }
     cbv.buffer = binding.buffer;
     cbv.offset = binding.offset;
     cbv.gpu_address = binding.gpu_address;
     cbv.size = binding.size;
   };
-  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotSystem],
-                  cbuffer_binding_system_);
-  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFloat],
-                  cbuffer_binding_float_vertex_);
-  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotBoolLoop],
-                  cbuffer_binding_bool_loop_);
-  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFetch],
-                  cbuffer_binding_fetch_);
-  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotDescriptorIndices],
-                  cbuffer_binding_descriptor_indices_vertex_);
-  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotSystem],
-                  cbuffer_binding_system_);
-  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotFloat],
-                  cbuffer_binding_float_pixel_);
-  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotBoolLoop],
-                  cbuffer_binding_bool_loop_);
-  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotFetch],
-                  cbuffer_binding_fetch_);
-  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotDescriptorIndices],
-                  cbuffer_binding_descriptor_indices_pixel_);
   uniforms_out.active_cbv_masks[kStageVertex] =
       ActiveCbvMaskForShader(metal_vertex_shader);
   uniforms_out.active_cbv_masks[kStagePixel] =
       ActiveCbvMaskForShader(metal_pixel_shader);
+  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotSystem],
+                  cbuffer_binding_system_,
+                  uniforms_out.active_cbv_masks[kStageVertex] &
+                      (uint32_t(1) << kCbvSlotSystem));
+  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFloat],
+                  cbuffer_binding_float_vertex_,
+                  uniforms_out.active_cbv_masks[kStageVertex] &
+                      (uint32_t(1) << kCbvSlotFloat));
+  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotBoolLoop],
+                  cbuffer_binding_bool_loop_,
+                  uniforms_out.active_cbv_masks[kStageVertex] &
+                      (uint32_t(1) << kCbvSlotBoolLoop));
+  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFetch],
+                  cbuffer_binding_fetch_,
+                  uniforms_out.active_cbv_masks[kStageVertex] &
+                      (uint32_t(1) << kCbvSlotFetch));
+  set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotDescriptorIndices],
+                  cbuffer_binding_descriptor_indices_vertex_,
+                  uniforms_out.active_cbv_masks[kStageVertex] &
+                      (uint32_t(1) << kCbvSlotDescriptorIndices));
+  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotSystem],
+                  cbuffer_binding_system_,
+                  uniforms_out.active_cbv_masks[kStagePixel] &
+                      (uint32_t(1) << kCbvSlotSystem));
+  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotFloat],
+                  cbuffer_binding_float_pixel_,
+                  uniforms_out.active_cbv_masks[kStagePixel] &
+                      (uint32_t(1) << kCbvSlotFloat));
+  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotBoolLoop],
+                  cbuffer_binding_bool_loop_,
+                  uniforms_out.active_cbv_masks[kStagePixel] &
+                      (uint32_t(1) << kCbvSlotBoolLoop));
+  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotFetch],
+                  cbuffer_binding_fetch_,
+                  uniforms_out.active_cbv_masks[kStagePixel] &
+                      (uint32_t(1) << kCbvSlotFetch));
+  set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotDescriptorIndices],
+                  cbuffer_binding_descriptor_indices_pixel_,
+                  uniforms_out.active_cbv_masks[kStagePixel] &
+                      (uint32_t(1) << kCbvSlotDescriptorIndices));
   uniforms_out.fetch_constant_dword_masks[kStageVertex] =
       metal_vertex_shader
           ? metal_vertex_shader->GetFetchConstantDwordMaskAfterTranslation()
@@ -3429,10 +3453,15 @@ MetalCommandProcessor::BuildStageRootArgumentKey(
 
   for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
     const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
-    key.pointers[kTopLevelABSlotCBVSystem + cbv] =
-        uniform_cbv.gpu_address ? uniform_cbv.gpu_address
-                                : null_buffer_->gpuAddress();
-    key.cbv_sizes[cbv] = uniform_cbv.size;
+    if (uniform_cbv.active) {
+      key.pointers[kTopLevelABSlotCBVSystem + cbv] =
+          uniform_cbv.gpu_address ? uniform_cbv.gpu_address
+                                  : null_buffer_->gpuAddress();
+      key.cbv_sizes[cbv] = uniform_cbv.size;
+    } else {
+      key.pointers[kTopLevelABSlotCBVSystem + cbv] = null_buffer_->gpuAddress();
+      key.cbv_sizes[cbv] = 0;
+    }
   }
   return key;
 }
@@ -3730,7 +3759,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
         continue;
       }
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
-        track_uniform_buffer_usage(uniforms.cbvs[stage][cbv].buffer);
+        if (uniforms.cbvs[stage][cbv].active) {
+          track_uniform_buffer_usage(uniforms.cbvs[stage][cbv].buffer);
+        }
       }
     }
     for (uint32_t i = 0; i < uniform_buffer_count; ++i) {

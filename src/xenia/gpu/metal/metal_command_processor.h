@@ -268,6 +268,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       NS::UInteger offset = 0;
       uint64_t gpu_address = 0;
       size_t size = 0;
+      bool active = false;
     };
 
     std::array<std::array<Cbv, kCbvSlotCount>, kStageCount> cbvs = {};
