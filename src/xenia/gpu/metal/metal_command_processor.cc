@@ -34,7 +34,6 @@
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
-#include "xenia/base/xxhash.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
@@ -3354,32 +3353,9 @@ MetalCommandProcessor::BuildStageRootArgumentKey(
   return key;
 }
 
-uint64_t MetalCommandProcessor::HashStageRootArgumentKey(
-    const StageRootArgumentKey& key, size_t stage_index) const {
-  uint64_t pointers_hash = XXH3_64bits(
-      key.pointers.data(), key.pointers.size() * sizeof(key.pointers[0]));
-  uint64_t sizes_hash = XXH3_64bits(key.cbv_sizes.data(),
-                                    key.cbv_sizes.size() *
-                                        sizeof(key.cbv_sizes[0]));
-  return pointers_hash ^ xe::rotate_left(sizes_hash, 1) ^
-         xe::rotate_left(static_cast<uint64_t>(stage_index), 33);
-}
-
 void MetalCommandProcessor::WriteStageRootArgumentTable(
     uint64_t* top_level_ptrs, const StageRootArgumentKey& key) const {
   std::memcpy(top_level_ptrs, key.pointers.data(), kTopLevelABBytesPerTable);
-}
-
-void MetalCommandProcessor::ResetStageRootArgumentCacheForSubmission(
-    uint64_t submission) {
-  if (stage_root_argument_cache_submission_ == submission) {
-    return;
-  }
-  for (StageRootArgumentCacheSlot& slot : stage_root_argument_cache_) {
-    slot.entries.clear();
-    slot.index.clear();
-  }
-  stage_root_argument_cache_submission_ = submission;
 }
 
 bool MetalCommandProcessor::AllocateStageRootArgument(
@@ -3414,62 +3390,7 @@ bool MetalCommandProcessor::AllocateStageRootArgument(
   allocation_out = {top_level_buffer,
                     static_cast<NS::UInteger>(top_level_offset),
                     top_level_gpu_address,
-                    key,
                     true};
-  return true;
-}
-
-bool MetalCommandProcessor::GetOrCreateStageRootArgument(
-    size_t stage_index, const StageRootArgumentKey& key,
-    StageRootArgumentAllocation& allocation_out) {
-  const uint64_t submission = submission_current_ ? submission_current_ : 1;
-  ResetStageRootArgumentCacheForSubmission(submission);
-
-  assert_true(stage_index < stage_root_argument_cache_.size());
-  if (stage_index >= stage_root_argument_cache_.size()) {
-    return AllocateStageRootArgument(stage_index, key, allocation_out);
-  }
-
-  auto increment_stage_stat = [&](auto& counters) {
-    if (stage_index < BackendTelemetryStats::kBindlessTelemetryStageCount) {
-      ++counters[stage_index];
-    }
-  };
-  StageRootArgumentCacheSlot& cache_slot =
-      stage_root_argument_cache_[stage_index];
-  const uint64_t hash = HashStageRootArgumentKey(key, stage_index);
-  auto range = cache_slot.index.equal_range(hash);
-  for (auto it = range.first; it != range.second; ++it) {
-    if (it->second >= cache_slot.entries.size()) {
-      continue;
-    }
-    const StageRootArgumentCacheEntry& entry = cache_slot.entries[it->second];
-    if (entry.key != key) {
-      continue;
-    }
-    allocation_out = entry.allocation;
-    increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_hits);
-    return true;
-  }
-
-  increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_misses);
-  if (!AllocateStageRootArgument(stage_index, key, allocation_out)) {
-    return false;
-  }
-
-  if (cache_slot.entries.size() >=
-      kStageRootArgumentCacheEntryLimitPerStage) {
-    increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_bypasses);
-    return true;
-  }
-
-  StageRootArgumentCacheEntry entry;
-  entry.key = key;
-  entry.allocation = allocation_out;
-  const size_t entry_index = cache_slot.entries.size();
-  cache_slot.entries.push_back(entry);
-  cache_slot.index.emplace(hash, entry_index);
-  increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_stores);
   return true;
 }
 
@@ -3542,7 +3463,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       StageRootArgumentKey key =
           BuildStageRootArgumentKey(uniforms.cbvs[stage],
                                     shared_memory_is_uav);
-      if (!GetOrCreateStageRootArgument(
+      if (!AllocateStageRootArgument(
               stage, key, current_bindless_stage_root_arguments_[stage])) {
         return false;
       }
@@ -4924,15 +4845,6 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       format_stage_array(backend_telemetry_.bindless_stage_top_level_bytes);
   std::string bindless_stage_root_writes =
       format_stage_array(backend_telemetry_.bindless_stage_root_cbv_pointer_writes);
-  std::string bindless_stage_root_cache_hits =
-      format_stage_array(backend_telemetry_.bindless_stage_root_cache_hits);
-  std::string bindless_stage_root_cache_misses =
-      format_stage_array(backend_telemetry_.bindless_stage_root_cache_misses);
-  std::string bindless_stage_root_cache_stores =
-      format_stage_array(backend_telemetry_.bindless_stage_root_cache_stores);
-  std::string bindless_stage_root_cache_bypasses =
-      format_stage_array(backend_telemetry_.bindless_stage_root_cache_bypasses);
-
   auto format_buffer_stage_array =
       [](const std::array<uint64_t,
                           BackendTelemetryStats::
@@ -5034,13 +4946,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   XELOGI(
       "MetalTelemetry[{}]: root_args stage_cbv hit={{ {} }} miss={{ {} }} "
       "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }} "
-      "cache hit={{ {} }} miss={{ {} }} store={{ {} }} bypass={{ {} }} "
       "bind update/skip={}/{}",
       reason, bindless_stage_cbv_hits, bindless_stage_cbv_misses,
       bindless_stage_top_level_allocs, bindless_stage_top_level_bytes,
-      bindless_stage_root_writes, bindless_stage_root_cache_hits,
-      bindless_stage_root_cache_misses, bindless_stage_root_cache_stores,
-      bindless_stage_root_cache_bypasses,
+      bindless_stage_root_writes,
       backend_telemetry_.bindless_root_argument_bind_updates,
       backend_telemetry_.bindless_root_argument_bind_skips);
   XELOGI(
@@ -5721,7 +5630,6 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_bindless_stable_resources_valid_ = false;
     current_bindless_stable_shared_memory_is_uav_ = false;
     current_bindless_stable_shared_memory_usage_bits_ = 0;
-    ResetStageRootArgumentCacheForSubmission(0);
   }
   DrainCommandBufferAutoreleasePool();
 }

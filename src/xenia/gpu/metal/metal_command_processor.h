@@ -28,7 +28,6 @@
 
 #include "xenia/base/platform.h"
 #include "xenia/base/string_buffer.h"
-#include "xenia/base/xxhash.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
@@ -469,14 +468,6 @@ class MetalCommandProcessor final : public CommandProcessor {
         bindless_stage_top_level_bytes = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
         bindless_stage_root_cbv_pointer_writes = {};
-    std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_root_cache_hits = {};
-    std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_root_cache_misses = {};
-    std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_root_cache_stores = {};
-    std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_root_cache_bypasses = {};
     std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
                kBindlessTelemetryStageCount>
         bindless_table_miss_cbv_slots = {};
@@ -761,44 +752,21 @@ class MetalCommandProcessor final : public CommandProcessor {
   struct StageRootArgumentKey {
     std::array<uint64_t, kTopLevelABSlotsPerTable> pointers = {};
     std::array<size_t, kCbvSlotCount> cbv_sizes = {};
-
-    bool operator==(const StageRootArgumentKey& other) const {
-      return pointers == other.pointers && cbv_sizes == other.cbv_sizes;
-    }
-    bool operator!=(const StageRootArgumentKey& other) const {
-      return !(*this == other);
-    }
   };
   struct StageRootArgumentAllocation {
     MTL::Buffer* buffer = nullptr;
     NS::UInteger offset = 0;
     uint64_t gpu_address = 0;
-    StageRootArgumentKey key = {};
     bool valid = false;
-  };
-  static constexpr size_t kStageRootArgumentCacheEntryLimitPerStage = 8192;
-  struct StageRootArgumentCacheEntry {
-    StageRootArgumentKey key = {};
-    StageRootArgumentAllocation allocation = {};
-  };
-  struct StageRootArgumentCacheSlot {
-    std::vector<StageRootArgumentCacheEntry> entries;
-    std::unordered_multimap<uint64_t, size_t> index;
   };
   StageRootArgumentKey BuildStageRootArgumentKey(
       const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
       bool shared_memory_is_uav) const;
-  uint64_t HashStageRootArgumentKey(const StageRootArgumentKey& key,
-                                    size_t stage_index) const;
   void WriteStageRootArgumentTable(uint64_t* top_level_ptrs,
                                    const StageRootArgumentKey& key) const;
-  void ResetStageRootArgumentCacheForSubmission(uint64_t submission);
   bool AllocateStageRootArgument(size_t stage_index,
                                  const StageRootArgumentKey& key,
                                  StageRootArgumentAllocation& allocation_out);
-  bool GetOrCreateStageRootArgument(
-      size_t stage_index, const StageRootArgumentKey& key,
-      StageRootArgumentAllocation& allocation_out);
   ConstantBufferBinding cbuffer_binding_system_;
   ConstantBufferBinding cbuffer_binding_float_vertex_;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
@@ -839,9 +807,6 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool render_encoder_bindless_table_bind_tessellation_ = false;
   std::array<StageRootArgumentAllocation, kStageCount>
       current_bindless_stage_root_arguments_ = {};
-  std::array<StageRootArgumentCacheSlot, kStageCount>
-      stage_root_argument_cache_ = {};
-  uint64_t stage_root_argument_cache_submission_ = 0;
   std::array<std::array<uint64_t, kCbvSlotCount>, kStageCount>
       current_bindless_cbv_gpu_addresses_ = {};
   std::array<std::array<size_t, kCbvSlotCount>, kStageCount>
