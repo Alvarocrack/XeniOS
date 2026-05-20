@@ -4212,22 +4212,6 @@ void MetalRenderTargetCache::DumpRenderTargets(
     if (!dispatch_count) {
       continue;
     }
-    if (key.is_depth) {
-    } else {
-    }
-    if (is_64bpp) {
-    } else {
-    }
-    switch (key.msaa_samples) {
-      case xenos::MsaaSamples::k1X:
-        break;
-      case xenos::MsaaSamples::k2X:
-        break;
-      case xenos::MsaaSamples::k4X:
-        break;
-      default:
-        break;
-    }
 
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
@@ -4278,9 +4262,6 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
       MTL::Size threads_per_group = MTL::Size::Make(40, 16, 1);
       MTL::Size threadgroups = MTL::Size::Make(groups_x, groups_y, 1);
-      uint64_t dispatch_pixels = uint64_t(dispatch.width_tiles) *
-                                 uint64_t(dispatch.height_tiles) *
-                                 uint64_t(tile_size_x) * uint64_t(tile_size_y);
       encoder->dispatchThreadgroups(threadgroups, threads_per_group);
     }
   }
