@@ -249,6 +249,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   void WriteFetchConstantsFromMem(uint32_t start_index, uint32_t* base,
                                   uint32_t num_registers);
 
+  static constexpr size_t kStageVertex = 0;
+  static constexpr size_t kStagePixel = 1;
   static constexpr size_t kStageCount = 2;  // Vertex + pixel.
   static constexpr size_t kCbvSlotCount = 5;
   enum CbvSlot : size_t {
@@ -453,7 +455,6 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t bindless_table_miss_invalid = 0;
     uint64_t bindless_table_miss_cbv = 0;
     uint64_t bindless_table_miss_shared_memory_uav = 0;
-    uint64_t bindless_table_miss_mesh_stages = 0;
     uint64_t bindless_table_allocations = 0;
     uint64_t bindless_table_bytes = 0;
     uint64_t bindless_root_cbv_pointer_writes = 0;
@@ -802,12 +803,14 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
   std::vector<MTL::Texture*> current_texture_bindless_resources_vertex_;
   std::vector<MTL::Texture*> current_texture_bindless_resources_pixel_;
-  bool current_bindless_table_valid_ = false;
-  uint64_t current_bindless_table_serial_ = 0;
+  std::array<bool, kStageCount> current_bindless_stage_root_valid_ = {};
+  std::array<uint64_t, kStageCount> current_bindless_stage_root_serials_ = {};
   uint64_t current_bindless_stable_resources_serial_ = 0;
-  uint64_t render_encoder_bindless_table_resources_serial_ = 0;
+  std::array<uint64_t, kStageCount>
+      render_encoder_bindless_stage_root_resource_serials_ = {};
   uint64_t render_encoder_bindless_stable_resources_serial_ = 0;
-  uint64_t render_encoder_bindless_table_bind_serial_ = 0;
+  std::array<uint64_t, kStageCount>
+      render_encoder_bindless_stage_root_bind_serials_ = {};
   bool render_encoder_bindless_table_bind_mesh_path_ = false;
   bool render_encoder_bindless_table_bind_tessellation_ = false;
   std::array<StageRootArgumentAllocation, kStageCount>
@@ -817,7 +820,6 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::array<std::array<size_t, kCbvSlotCount>, kStageCount>
       current_bindless_cbv_sizes_ = {};
   bool current_bindless_shared_memory_is_uav_ = false;
-  bool current_bindless_uses_mesh_stages_ = false;
   bool current_bindless_stable_resources_valid_ = false;
   bool current_bindless_stable_shared_memory_is_uav_ = false;
   uint32_t current_bindless_stable_shared_memory_usage_bits_ = 0;

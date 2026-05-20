@@ -622,12 +622,12 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     null_sampler_->release();
     null_sampler_ = nullptr;
   }
-  current_bindless_table_valid_ = false;
-  current_bindless_table_serial_ = 0;
+  current_bindless_stage_root_valid_.fill(false);
+  current_bindless_stage_root_serials_.fill(0);
   current_bindless_stable_resources_serial_ = 0;
-  render_encoder_bindless_table_resources_serial_ = 0;
+  render_encoder_bindless_stage_root_resource_serials_.fill(0);
   render_encoder_bindless_stable_resources_serial_ = 0;
-  render_encoder_bindless_table_bind_serial_ = 0;
+  render_encoder_bindless_stage_root_bind_serials_.fill(0);
   render_encoder_bindless_table_bind_mesh_path_ = false;
   render_encoder_bindless_table_bind_tessellation_ = false;
   current_bindless_stage_root_arguments_ = {};
@@ -3403,29 +3403,34 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   constexpr size_t kStageVertex = 0;
   constexpr size_t kStagePixel = 1;
 
-  bool bindless_cbvs_match = current_bindless_table_valid_;
-  bool bindless_table_invalid = !current_bindless_table_valid_;
+  std::array<bool, kStageCount> stage_cbvs_match = {};
+  std::array<bool, kStageCount> stage_roots_need_update = {};
+  bool bindless_table_invalid = false;
   bool bindless_cbv_mismatch = false;
   for (size_t stage = 0; stage < kStageCount; ++stage) {
-    bool stage_cbvs_match = current_bindless_table_valid_;
+    const bool stage_root_valid = current_bindless_stage_root_valid_[stage];
+    bool stage_cbvs_match_local = stage_root_valid;
+    if (!stage_root_valid) {
+      bindless_table_invalid = true;
+    }
     for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
       const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
-      if (!current_bindless_table_valid_ ||
+      if (!stage_root_valid ||
           current_bindless_cbv_gpu_addresses_[stage][cbv] !=
               uniform_cbv.gpu_address ||
           current_bindless_cbv_sizes_[stage][cbv] != uniform_cbv.size) {
-        stage_cbvs_match = false;
-        bindless_cbvs_match = false;
+        stage_cbvs_match_local = false;
         bindless_cbv_mismatch = true;
-        if (current_bindless_table_valid_ &&
+        if (stage_root_valid &&
             stage < BackendTelemetryStats::kBindlessTelemetryStageCount &&
             cbv < BackendTelemetryStats::kBindlessTelemetryCbvSlotsPerStage) {
           ++backend_telemetry_.bindless_table_miss_cbv_slots[stage][cbv];
         }
       }
     }
+    stage_cbvs_match[stage] = stage_cbvs_match_local;
     if (stage < BackendTelemetryStats::kBindlessTelemetryStageCount) {
-      if (stage_cbvs_match) {
+      if (stage_cbvs_match_local) {
         ++backend_telemetry_.bindless_stage_cbv_same[stage];
       } else {
         ++backend_telemetry_.bindless_stage_cbv_changed[stage];
@@ -3434,12 +3439,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   }
   bool bindless_shared_memory_uav_mismatch =
       current_bindless_shared_memory_is_uav_ != shared_memory_is_uav;
-  bool bindless_mesh_stages_mismatch =
-      current_bindless_uses_mesh_stages_ !=
-      (use_geometry_emulation || use_tessellation_emulation);
-  bool reuse_bindless_table =
-      bindless_cbvs_match &&
-      !bindless_shared_memory_uav_mismatch && !bindless_mesh_stages_mismatch;
+  bool reuse_bindless_table = true;
+  for (size_t stage = 0; stage < kStageCount; ++stage) {
+    stage_roots_need_update[stage] =
+        !stage_cbvs_match[stage] || bindless_shared_memory_uav_mismatch;
+    reuse_bindless_table &= !stage_roots_need_update[stage];
+  }
   if (reuse_bindless_table) {
     ++backend_telemetry_.bindless_table_reuse_hits;
   } else {
@@ -3453,13 +3458,13 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     if (bindless_shared_memory_uav_mismatch) {
       ++backend_telemetry_.bindless_table_miss_shared_memory_uav;
     }
-    if (bindless_mesh_stages_mismatch) {
-      ++backend_telemetry_.bindless_table_miss_mesh_stages;
-    }
   }
 
   if (!reuse_bindless_table) {
     for (size_t stage = 0; stage < kStageCount; ++stage) {
+      if (!stage_roots_need_update[stage]) {
+        continue;
+      }
       StageRootArgumentKey key =
           BuildStageRootArgumentKey(uniforms.cbvs[stage],
                                     shared_memory_is_uav);
@@ -3467,24 +3472,19 @@ bool MetalCommandProcessor::PopulateBindlessTables(
               stage, key, current_bindless_stage_root_arguments_[stage])) {
         return false;
       }
-    }
-
-    current_bindless_table_valid_ = true;
-    for (size_t stage = 0; stage < kStageCount; ++stage) {
+      current_bindless_stage_root_valid_[stage] = true;
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         current_bindless_cbv_gpu_addresses_[stage][cbv] =
             uniforms.cbvs[stage][cbv].gpu_address;
         current_bindless_cbv_sizes_[stage][cbv] =
             uniforms.cbvs[stage][cbv].size;
       }
+      ++current_bindless_stage_root_serials_[stage];
+      if (!current_bindless_stage_root_serials_[stage]) {
+        current_bindless_stage_root_serials_[stage] = 1;
+      }
     }
     current_bindless_shared_memory_is_uav_ = shared_memory_is_uav;
-    current_bindless_uses_mesh_stages_ =
-        use_geometry_emulation || use_tessellation_emulation;
-    ++current_bindless_table_serial_;
-    if (!current_bindless_table_serial_) {
-      current_bindless_table_serial_ = 1;
-    }
   }
 
   const uint32_t shared_memory_usage_bits =
@@ -3572,27 +3572,43 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     ++backend_telemetry_.bindless_resource_serial_hits;
   }
 
-  if (render_encoder_bindless_table_resources_serial_ !=
-      current_bindless_table_serial_) {
-    for (const StageRootArgumentAllocation& allocation :
-         current_bindless_stage_root_arguments_) {
+  std::array<bool, kStageCount> stage_root_resources_need_update = {};
+  bool root_resources_need_update = false;
+  for (size_t stage = 0; stage < kStageCount; ++stage) {
+    stage_root_resources_need_update[stage] =
+        render_encoder_bindless_stage_root_resource_serials_[stage] !=
+        current_bindless_stage_root_serials_[stage];
+    root_resources_need_update |= stage_root_resources_need_update[stage];
+  }
+  if (root_resources_need_update) {
+    std::array<MTL::Buffer*, kStageCount> root_buffers_for_encoder;
+    uint32_t root_buffer_count = 0;
+    auto track_root_buffer_usage = [&](MTL::Buffer* root_buffer) {
+      if (!root_buffer) {
+        return;
+      }
+      for (uint32_t i = 0; i < root_buffer_count; ++i) {
+        if (root_buffers_for_encoder[i] == root_buffer) {
+          return;
+        }
+      }
+      assert_true(root_buffer_count < root_buffers_for_encoder.size());
+      root_buffers_for_encoder[root_buffer_count++] = root_buffer;
+    };
+    for (size_t stage = 0; stage < kStageCount; ++stage) {
+      if (!stage_root_resources_need_update[stage]) {
+        continue;
+      }
+      const StageRootArgumentAllocation& allocation =
+          current_bindless_stage_root_arguments_[stage];
       if (!allocation.valid || !allocation.buffer) {
         continue;
       }
-      bool already_used = false;
-      for (const StageRootArgumentAllocation& previous :
-           current_bindless_stage_root_arguments_) {
-        if (&previous == &allocation) {
-          break;
-        }
-        if (previous.valid && previous.buffer == allocation.buffer) {
-          already_used = true;
-          break;
-        }
-      }
-      if (!already_used) {
-        UseRenderEncoderResource(allocation.buffer, MTL::ResourceUsageRead);
-      }
+      track_root_buffer_usage(allocation.buffer);
+    }
+    for (uint32_t i = 0; i < root_buffer_count; ++i) {
+      UseRenderEncoderResource(root_buffers_for_encoder[i],
+                               MTL::ResourceUsageRead);
     }
     std::array<MTL::Buffer*, kStageCount * kCbvSlotCount>
         uniform_buffers_for_encoder;
@@ -3601,16 +3617,10 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       if (!uniform_buffer) {
         return;
       }
-      bool is_stage_root_argument_buffer = false;
-      for (const StageRootArgumentAllocation& allocation :
-           current_bindless_stage_root_arguments_) {
-        if (allocation.valid && allocation.buffer == uniform_buffer) {
-          is_stage_root_argument_buffer = true;
-          break;
+      for (uint32_t i = 0; i < root_buffer_count; ++i) {
+        if (root_buffers_for_encoder[i] == uniform_buffer) {
+          return;
         }
-      }
-      if (is_stage_root_argument_buffer) {
-        return;
       }
       for (uint32_t i = 0; i < uniform_buffer_count; ++i) {
         if (uniform_buffers_for_encoder[i] == uniform_buffer) {
@@ -3621,6 +3631,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       uniform_buffers_for_encoder[uniform_buffer_count++] = uniform_buffer;
     };
     for (size_t stage = 0; stage < kStageCount; ++stage) {
+      if (!stage_root_resources_need_update[stage]) {
+        continue;
+      }
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         track_uniform_buffer_usage(uniforms.cbvs[stage][cbv].buffer);
       }
@@ -3631,8 +3644,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     }
     backend_telemetry_.bindless_resource_uniform_buffers_tracked +=
         uniform_buffer_count;
-    render_encoder_bindless_table_resources_serial_ =
-        current_bindless_table_serial_;
+    for (size_t stage = 0; stage < kStageCount; ++stage) {
+      if (stage_root_resources_need_update[stage]) {
+        render_encoder_bindless_stage_root_resource_serials_[stage] =
+            current_bindless_stage_root_serials_[stage];
+      }
+    }
   }
 
   const StageRootArgumentAllocation& vertex_root_arguments =
@@ -3642,28 +3659,33 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   assert_true(vertex_root_arguments.valid);
   assert_true(pixel_root_arguments.valid);
   const bool use_mesh_path = use_geometry_emulation || use_tessellation_emulation;
-  const bool root_argument_bindings_need_update =
-      render_encoder_bindless_table_bind_serial_ !=
-          current_bindless_table_serial_ ||
+  const bool root_argument_path_needs_update =
       render_encoder_bindless_table_bind_mesh_path_ != use_mesh_path ||
       render_encoder_bindless_table_bind_tessellation_ !=
           use_tessellation_emulation;
+  const bool vertex_root_argument_binding_needs_update =
+      render_encoder_bindless_stage_root_bind_serials_[kStageVertex] !=
+          current_bindless_stage_root_serials_[kStageVertex] ||
+      root_argument_path_needs_update;
+  const bool pixel_root_argument_binding_needs_update =
+      render_encoder_bindless_stage_root_bind_serials_[kStagePixel] !=
+      current_bindless_stage_root_serials_[kStagePixel];
+  const bool root_argument_bindings_need_update =
+      vertex_root_argument_binding_needs_update ||
+      pixel_root_argument_binding_needs_update;
   if (root_argument_bindings_need_update) {
     ++backend_telemetry_.bindless_root_argument_bind_updates;
   } else {
     ++backend_telemetry_.bindless_root_argument_bind_skips;
   }
   if (use_mesh_path) {
-    if (root_argument_bindings_need_update) {
+    if (vertex_root_argument_binding_needs_update) {
       SetRenderEncoderObjectBuffer(vertex_root_arguments.buffer,
                                    vertex_root_arguments.offset,
                                    kIRArgumentBufferBindPoint);
       SetRenderEncoderMeshBuffer(vertex_root_arguments.buffer,
                                  vertex_root_arguments.offset,
                                  kIRArgumentBufferBindPoint);
-      SetRenderEncoderFragmentBuffer(pixel_root_arguments.buffer,
-                                     pixel_root_arguments.offset,
-                                     kIRArgumentBufferBindPoint);
 
       if (use_tessellation_emulation) {
         SetRenderEncoderObjectBuffer(vertex_root_arguments.buffer,
@@ -3673,6 +3695,11 @@ bool MetalCommandProcessor::PopulateBindlessTables(
                                    vertex_root_arguments.offset,
                                    kIRArgumentBufferHullDomainBindPoint);
       }
+    }
+    if (pixel_root_argument_binding_needs_update) {
+      SetRenderEncoderFragmentBuffer(pixel_root_arguments.buffer,
+                                     pixel_root_arguments.offset,
+                                     kIRArgumentBufferBindPoint);
     }
 
     if (!heap_binds_set_on_encoder_) {
@@ -3691,10 +3718,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       heap_binds_set_on_encoder_ = true;
     }
   } else {
-    if (root_argument_bindings_need_update) {
+    if (vertex_root_argument_binding_needs_update) {
       SetRenderEncoderVertexBuffer(vertex_root_arguments.buffer,
                                    vertex_root_arguments.offset,
                                    kIRArgumentBufferBindPoint);
+    }
+    if (pixel_root_argument_binding_needs_update) {
       SetRenderEncoderFragmentBuffer(pixel_root_arguments.buffer,
                                      pixel_root_arguments.offset,
                                      kIRArgumentBufferBindPoint);
@@ -3712,8 +3741,15 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       heap_binds_set_on_encoder_ = true;
     }
   }
+  if (vertex_root_argument_binding_needs_update) {
+    render_encoder_bindless_stage_root_bind_serials_[kStageVertex] =
+        current_bindless_stage_root_serials_[kStageVertex];
+  }
+  if (pixel_root_argument_binding_needs_update) {
+    render_encoder_bindless_stage_root_bind_serials_[kStagePixel] =
+        current_bindless_stage_root_serials_[kStagePixel];
+  }
   if (root_argument_bindings_need_update) {
-    render_encoder_bindless_table_bind_serial_ = current_bindless_table_serial_;
     render_encoder_bindless_table_bind_mesh_path_ = use_mesh_path;
     render_encoder_bindless_table_bind_tessellation_ =
         use_tessellation_emulation;
@@ -4912,7 +4948,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       descriptor_compatibility_reasons);
   XELOGI(
       "MetalTelemetry[{}]: bindless calls={} reuse hit/miss={}/{} "
-      "miss invalid/cbv/smem_uav/mesh={}/{}/{}/{} resource "
+      "miss invalid/cbv/smem_uav={}/{}/{} resource "
       "serial hit/miss={}/{} stable_miss invalid/smem_uav/usage={}/{}/{} "
       "allocations/bytes={}/{} root_cbv_ptr_writes={} "
       "cbv_miss_slots={{ {} }} "
@@ -4925,7 +4961,6 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.bindless_table_miss_invalid,
       backend_telemetry_.bindless_table_miss_cbv,
       backend_telemetry_.bindless_table_miss_shared_memory_uav,
-      backend_telemetry_.bindless_table_miss_mesh_stages,
       backend_telemetry_.bindless_resource_serial_hits,
       backend_telemetry_.bindless_resource_serial_misses,
       backend_telemetry_.bindless_resource_miss_invalid,
@@ -5260,7 +5295,7 @@ void MetalCommandProcessor::ResetRenderEncoderResourceUsage() {
   render_encoder_resource_usage_map_.clear();
   render_encoder_heap_usage_.clear();
   render_encoder_heap_usage_set_.clear();
-  render_encoder_bindless_table_resources_serial_ = 0;
+  render_encoder_bindless_stage_root_resource_serials_.fill(0);
   render_encoder_bindless_stable_resources_serial_ = 0;
 }
 
@@ -5277,7 +5312,7 @@ void MetalCommandProcessor::ResetRenderEncoderBufferBindings() {
       binding = {};
     }
   }
-  render_encoder_bindless_table_bind_serial_ = 0;
+  render_encoder_bindless_stage_root_bind_serials_.fill(0);
   render_encoder_bindless_table_bind_mesh_path_ = false;
   render_encoder_bindless_table_bind_tessellation_ = false;
 }
@@ -5292,9 +5327,13 @@ void MetalCommandProcessor::InvalidateRenderEncoderBufferBinding(
   render_encoder_buffer_bindings_[stage_index][index] = {};
   if (index == kIRArgumentBufferBindPoint ||
       index == kIRArgumentBufferHullDomainBindPoint) {
-    render_encoder_bindless_table_bind_serial_ = 0;
-    render_encoder_bindless_table_bind_mesh_path_ = false;
-    render_encoder_bindless_table_bind_tessellation_ = false;
+    if (stage == RenderEncoderBufferStage::kFragment) {
+      render_encoder_bindless_stage_root_bind_serials_[kStagePixel] = 0;
+    } else {
+      render_encoder_bindless_stage_root_bind_serials_[kStageVertex] = 0;
+      render_encoder_bindless_table_bind_mesh_path_ = false;
+      render_encoder_bindless_table_bind_tessellation_ = false;
+    }
   }
 }
 
@@ -5618,12 +5657,12 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_command_buffer_->release();
     current_command_buffer_ = nullptr;
     submission_has_draws_ = false;
-    current_bindless_table_valid_ = false;
-    current_bindless_table_serial_ = 0;
+    current_bindless_stage_root_valid_.fill(false);
+    current_bindless_stage_root_serials_.fill(0);
     current_bindless_stable_resources_serial_ = 0;
-    render_encoder_bindless_table_resources_serial_ = 0;
+    render_encoder_bindless_stage_root_resource_serials_.fill(0);
     render_encoder_bindless_stable_resources_serial_ = 0;
-    render_encoder_bindless_table_bind_serial_ = 0;
+    render_encoder_bindless_stage_root_bind_serials_.fill(0);
     render_encoder_bindless_table_bind_mesh_path_ = false;
     render_encoder_bindless_table_bind_tessellation_ = false;
     current_bindless_stage_root_arguments_ = {};
