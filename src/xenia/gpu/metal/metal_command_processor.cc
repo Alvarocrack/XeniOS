@@ -3410,16 +3410,16 @@ bool MetalCommandProcessor::PopulateBindlessTables(
               stage_index * kTopLevelABBytesPerTable);
           std::memset(top_level_ptrs, 0, kTopLevelABBytesPerTable);
 
-          top_level_ptrs[0] = srv_space0_gpu;
-          top_level_ptrs[5] = uav_space0_gpu;
-          top_level_ptrs[1] = view_heap_gpu;
-          top_level_ptrs[2] = view_heap_gpu;
-          top_level_ptrs[3] = view_heap_gpu;
-          top_level_ptrs[4] = view_heap_gpu;
-          top_level_ptrs[6] = null_uav_gpu;
-          top_level_ptrs[7] = null_uav_gpu;
-          top_level_ptrs[8] = null_uav_gpu;
-          top_level_ptrs[9] = sampler_heap_gpu;
+          top_level_ptrs[kTopLevelABSlotSRVSpace0] = srv_space0_gpu;
+          top_level_ptrs[kTopLevelABSlotSRVSpace1] = view_heap_gpu;
+          top_level_ptrs[kTopLevelABSlotSRVSpace2] = view_heap_gpu;
+          top_level_ptrs[kTopLevelABSlotSRVSpace3] = view_heap_gpu;
+          top_level_ptrs[kTopLevelABSlotSRVSpace10] = view_heap_gpu;
+          top_level_ptrs[kTopLevelABSlotUAVSpace0] = uav_space0_gpu;
+          top_level_ptrs[kTopLevelABSlotUAVSpace1] = null_uav_gpu;
+          top_level_ptrs[kTopLevelABSlotUAVSpace2] = null_uav_gpu;
+          top_level_ptrs[kTopLevelABSlotUAVSpace3] = null_uav_gpu;
+          top_level_ptrs[kTopLevelABSlotSamplerSpace0] = sampler_heap_gpu;
 
           for (size_t cbv = 0; cbv < kCbvHeapSlotsPerTable; ++cbv) {
             const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
@@ -3437,10 +3437,10 @@ bool MetalCommandProcessor::PopulateBindlessTables(
           uint64_t cbv_table_gpu_base =
               cbv_table_gpu_address +
               stage_index * kCbvHeapSlotsPerTable * kDescriptorEntrySize;
-          top_level_ptrs[10] = cbv_table_gpu_base;
-          top_level_ptrs[11] = cbv_table_gpu_base;
-          top_level_ptrs[12] = cbv_table_gpu_base;
-          top_level_ptrs[13] = cbv_table_gpu_base;
+          top_level_ptrs[kTopLevelABSlotCBVSpace0] = cbv_table_gpu_base;
+          top_level_ptrs[kTopLevelABSlotCBVSpace1] = cbv_table_gpu_base;
+          top_level_ptrs[kTopLevelABSlotCBVSpace2] = cbv_table_gpu_base;
+          top_level_ptrs[kTopLevelABSlotCBVSpace3] = cbv_table_gpu_base;
         };
 
     write_top_level_and_cbvs_bindless(

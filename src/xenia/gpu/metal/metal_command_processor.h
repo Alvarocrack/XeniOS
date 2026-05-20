@@ -531,6 +531,25 @@ class MetalCommandProcessor final : public CommandProcessor {
   static constexpr size_t kTopLevelABSlotsPerTable = 32;
   static constexpr size_t kTopLevelABBytesPerTable =
       kTopLevelABSlotsPerTable * sizeof(uint64_t);
+  // MSC explicit root signatures encode descriptor-table pointers and root
+  // resource pointers as 64-bit entries in the top-level argument buffer.
+  // Keep these in the same order as MetalShaderConverter's root signature.
+  enum TopLevelABSlot : uint32_t {
+    kTopLevelABSlotSRVSpace0,
+    kTopLevelABSlotSRVSpace1,
+    kTopLevelABSlotSRVSpace2,
+    kTopLevelABSlotSRVSpace3,
+    kTopLevelABSlotSRVSpace10,
+    kTopLevelABSlotUAVSpace0,
+    kTopLevelABSlotUAVSpace1,
+    kTopLevelABSlotUAVSpace2,
+    kTopLevelABSlotUAVSpace3,
+    kTopLevelABSlotSamplerSpace0,
+    kTopLevelABSlotCBVSpace0,
+    kTopLevelABSlotCBVSpace1,
+    kTopLevelABSlotCBVSpace2,
+    kTopLevelABSlotCBVSpace3,
+  };
 
   // System constants population (mirrors D3D12 implementation)
   void UpdateSystemConstantValues(bool shared_memory_is_uav,
