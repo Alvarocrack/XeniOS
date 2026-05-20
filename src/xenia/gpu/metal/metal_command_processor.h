@@ -803,9 +803,11 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_float_vertex_;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
-  ConstantBufferBinding cbuffer_binding_fetch_;
+  std::array<ConstantBufferBinding, kStageCount> cbuffer_binding_fetch_stage_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
+  std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
+      fetch_constant_dirty_masks_ = {};
 
   // Float constant usage bitmaps for the current shader pair.
   // Used to gate WriteRegister invalidation: only dirty the float CBV
