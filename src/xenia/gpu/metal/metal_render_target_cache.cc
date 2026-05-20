@@ -348,8 +348,12 @@ struct AttachmentLoadStoreActions {
 };
 
 AttachmentLoadStoreActions GetRealAttachmentLoadStoreActions(
-    bool needs_initial_clear) {
-  return {needs_initial_clear ? MTL::LoadActionClear : MTL::LoadActionLoad,
+    bool needs_initial_clear, bool previous_contents_needed = true) {
+  if (needs_initial_clear) {
+    return {MTL::LoadActionClear, MTL::StoreActionStore};
+  }
+  return {previous_contents_needed ? MTL::LoadActionLoad
+                                   : MTL::LoadActionDontCare,
           MTL::StoreActionStore};
 }
 
@@ -2413,11 +2417,13 @@ bool MetalRenderTargetCache::Update(
         pending_draw_pass_transfers_[i] = transfers;
         pending_draw_pass_transfer_mask_ |= uint32_t(1) << i;
         pending_draw_pass_preflighted_transfer_mask_ = 0;
+        pending_draw_pass_load_dontcare_mask_ = 0;
         pending_plan.full_overwrite =
             PendingDrawPassTransfersFullyOverwriteTarget(
                 i, accumulated_targets[i], transfers);
         if (pending_plan.full_overwrite) {
           pending_draw_pass_full_overwrite_mask_ |= uint32_t(1) << i;
+          render_pass_descriptor_dirty_ = true;
         }
         auto* dest_metal_rt =
             static_cast<MetalRenderTarget*>(accumulated_targets[i]);
@@ -2453,6 +2459,8 @@ bool MetalRenderTargetCache::Update(
 }
 
 void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
+  bool load_dontcare_descriptor_used =
+      pending_draw_pass_load_dontcare_mask_ != 0;
   for (auto& transfers : pending_draw_pass_transfers_) {
     transfers.clear();
   }
@@ -2461,6 +2469,10 @@ void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
   pending_draw_pass_transfer_mask_ = 0;
   pending_draw_pass_full_overwrite_mask_ = 0;
   pending_draw_pass_preflighted_transfer_mask_ = 0;
+  pending_draw_pass_load_dontcare_mask_ = 0;
+  if (load_dontcare_descriptor_used) {
+    render_pass_descriptor_dirty_ = true;
+  }
 }
 
 MetalRenderTargetCache::DrawPassTransferRejectionReason
@@ -3564,6 +3576,17 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
   uint32_t coverage_height = 0;
   uint32_t coverage_samples = std::max(1u, expected_sample_count);
 
+  pending_draw_pass_load_dontcare_mask_ = 0;
+  if (HasPendingDrawPassTransfers() &&
+      EnsurePendingDrawPassTransfersPreflighted()) {
+    for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
+      if ((pending_draw_pass_transfer_mask_ & (uint32_t(1) << i)) &&
+          pending_draw_pass_transfer_plans_[i].load_action_safe) {
+        pending_draw_pass_load_dontcare_mask_ |= uint32_t(1) << i;
+      }
+    }
+  }
+
   // Bind the actual render targets retrieved from base class in Update()
 
   // Bind depth target if present
@@ -3573,8 +3596,11 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
 
     // Clear on first bind to avoid synchronous clears at creation.
     bool depth_needs_clear = current_depth_target_->needs_initial_clear();
+    bool depth_load_dontcare =
+        (pending_draw_pass_load_dontcare_mask_ & uint32_t(1)) != 0;
     AttachmentLoadStoreActions depth_load_store =
-        GetRealAttachmentLoadStoreActions(depth_needs_clear);
+        GetRealAttachmentLoadStoreActions(depth_needs_clear,
+                                          !depth_load_dontcare);
     SetAttachmentLoadStoreActions(depth_attachment, depth_load_store);
     if (depth_needs_clear) {
       depth_attachment->setClearDepth(GetDepthTargetClearDepth());
@@ -3593,8 +3619,12 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       auto* stencil_attachment =
           cached_render_pass_descriptor_->stencilAttachment();
       stencil_attachment->setTexture(current_depth_target_->draw_texture());
-      SetAttachmentLoadStoreActions(stencil_attachment, depth_load_store);
-      if (depth_needs_clear) {
+      AttachmentLoadStoreActions stencil_load_store = depth_load_store;
+      if (!depth_needs_clear && depth_load_dontcare) {
+        stencil_load_store = {MTL::LoadActionClear, MTL::StoreActionStore};
+      }
+      SetAttachmentLoadStoreActions(stencil_attachment, stencil_load_store);
+      if (depth_needs_clear || (!depth_needs_clear && depth_load_dontcare)) {
         stencil_attachment->setClearStencil(0);
       }
     }
@@ -3627,8 +3657,12 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
 
       // Clear on first bind to avoid synchronous clears at creation.
       bool color_needs_clear = current_color_targets_[i]->needs_initial_clear();
+      bool color_load_dontcare =
+          (pending_draw_pass_load_dontcare_mask_ & (uint32_t(1) << (i + 1))) !=
+          0;
       AttachmentLoadStoreActions color_load_store =
-          GetRealAttachmentLoadStoreActions(color_needs_clear);
+          GetRealAttachmentLoadStoreActions(color_needs_clear,
+                                            !color_load_dontcare);
       SetAttachmentLoadStoreActions(color_attachment, color_load_store);
       if (color_needs_clear) {
         color_attachment->setClearColor(

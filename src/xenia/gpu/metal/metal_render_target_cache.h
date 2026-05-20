@@ -528,6 +528,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   uint32_t pending_draw_pass_transfer_mask_ = 0;
   uint32_t pending_draw_pass_full_overwrite_mask_ = 0;
   uint32_t pending_draw_pass_preflighted_transfer_mask_ = 0;
+  uint32_t pending_draw_pass_load_dontcare_mask_ = 0;
   MTL::DepthStencilState* transfer_depth_state_ = nullptr;
   MTL::DepthStencilState* transfer_depth_state_none_ = nullptr;
   MTL::DepthStencilState* transfer_depth_clear_state_ = nullptr;
