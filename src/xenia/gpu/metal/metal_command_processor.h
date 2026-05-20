@@ -365,7 +365,6 @@ class MetalCommandProcessor final : public CommandProcessor {
   struct BackendTelemetryStats {
     static constexpr size_t kBindlessTelemetryStageCount = 2;
     static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 5;
-    static constexpr size_t kConstantPayloadTelemetrySlotCount = 7;
     static constexpr size_t kRenderEncoderBufferTelemetryStageCount = 4;
 
     uint64_t swaps = 0;
@@ -391,21 +390,6 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t constant_upload_descriptor_indices_vertex = 0;
     uint64_t constant_upload_descriptor_indices_pixel = 0;
     uint64_t constant_upload_bytes = 0;
-    uint64_t constant_payload_cache_lookups = 0;
-    uint64_t constant_payload_cache_hits = 0;
-    uint64_t constant_payload_cache_misses = 0;
-    uint64_t constant_payload_cache_bypasses = 0;
-    uint64_t constant_payload_cache_stores = 0;
-    uint64_t constant_payload_cache_bytes_reused = 0;
-    uint64_t constant_payload_cache_bytes_uploaded = 0;
-    uint64_t constant_payload_cache_bytes_stored = 0;
-    uint64_t constant_payload_cache_bytes_bypassed = 0;
-    std::array<uint64_t, kConstantPayloadTelemetrySlotCount>
-        constant_payload_cache_slot_hits = {};
-    std::array<uint64_t, kConstantPayloadTelemetrySlotCount>
-        constant_payload_cache_slot_misses = {};
-    std::array<uint64_t, kConstantPayloadTelemetrySlotCount>
-        constant_payload_cache_slot_bypasses = {};
     uint64_t constant_dirty_float_layout_vertex = 0;
     uint64_t constant_dirty_float_layout_pixel = 0;
     uint64_t descriptor_dirty_vertex_sampler_layout = 0;
@@ -774,32 +758,6 @@ class MetalCommandProcessor final : public CommandProcessor {
     size_t size = 0;
     bool up_to_date = false;
   };
-  static constexpr size_t kConstantPayloadSlotCount = 7;
-  static constexpr size_t kConstantPayloadCacheByteLimit = 32 * 1024 * 1024;
-  enum class ConstantPayloadSlot : size_t {
-    kSystem,
-    kVertexFloat,
-    kPixelFloat,
-    kBoolLoop,
-    kFetch,
-    kVertexDescriptorIndices,
-    kPixelDescriptorIndices,
-  };
-  struct ConstantPayloadCacheEntry {
-    XXH128_hash_t hash = {};
-    size_t size = 0;
-    std::vector<uint8_t> payload;
-    ConstantBufferBinding binding = {};
-  };
-  struct ConstantPayloadCacheSlot {
-    std::vector<ConstantPayloadCacheEntry> entries;
-    std::unordered_multimap<uint64_t, size_t> index;
-  };
-  void ResetConstantPayloadCacheForSubmission(uint64_t submission);
-  bool UploadOrReuseConstantBinding(ConstantPayloadSlot slot,
-                                    ConstantBufferBinding& binding,
-                                    size_t size, const char* name,
-                                    const uint8_t* payload);
   struct StageRootArgumentKey {
     std::array<uint64_t, kTopLevelABSlotsPerTable> pointers = {};
     std::array<size_t, kCbvSlotCount> cbv_sizes = {};
@@ -848,11 +806,6 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
-  std::array<ConstantPayloadCacheSlot, kConstantPayloadSlotCount>
-      constant_payload_cache_ = {};
-  size_t constant_payload_cache_bytes_ = 0;
-  uint64_t constant_payload_cache_submission_ = 0;
-  std::vector<uint8_t> constant_upload_scratch_;
 
   // Float constant usage bitmaps for the current shader pair.
   // Used to gate WriteRegister invalidation: only dirty the float CBV
