@@ -4275,16 +4275,15 @@ bool MetalCommandProcessor::BeginRenderEncoderForDraw(
   // descriptor while the attachment textures still match the current binding.
   // The cache may be dirty only because a clear load action was consumed and
   // the next new pass needs a refreshed descriptor.
-  MTL::RenderPassDescriptor* pass_descriptor = nullptr;
   if (current_render_encoder_ && render_target_cache_ &&
       render_target_cache_->IsRenderPassDescriptorCompatible(
           current_render_pass_descriptor_, 1,
           fallback_depth_attachment_required)) {
-    pass_descriptor = current_render_pass_descriptor_;
-  } else {
-    pass_descriptor =
-        GetDrawRenderPassDescriptor(fallback_depth_attachment_required);
+    return true;
   }
+
+  MTL::RenderPassDescriptor* pass_descriptor =
+      GetDrawRenderPassDescriptor(fallback_depth_attachment_required);
   if (!pass_descriptor) {
     XELOGE("BeginRenderEncoderForDraw: No render pass descriptor available");
     return false;
@@ -4337,29 +4336,27 @@ bool MetalCommandProcessor::BeginRenderEncoderForDraw(
       current_render_pass_descriptor_->retain();
     }
     UseRenderEncoderAttachmentHeaps(pass_descriptor);
+
+    // Derive the initial viewport/scissor from the active render pass texture.
+    // Metal validates scissor rectangles against the descriptor attachments, not
+    // against the cache's logical RT0 binding.
+    uint32_t rt_width = 1;
+    uint32_t rt_height = 1;
+    GetActiveRenderTargetSize(pass_descriptor, render_target_cache_.get(), 1280,
+                              720, rt_width, rt_height);
+
+    MTL::Viewport viewport = {
+        0.0, 0.0, static_cast<double>(rt_width), static_cast<double>(rt_height),
+        0.0, 1.0};
+    current_render_encoder_->setViewport(viewport);
+
+    MTL::ScissorRect scissor = {0, 0, rt_width, rt_height};
+    current_render_encoder_->setScissorRect(scissor);
+
+    // IssueDraw applies the guest viewport/scissor before dispatch.
+    viewport_dirty_ = true;
+    scissor_dirty_ = true;
   }
-
-  // Derive the initial viewport/scissor from the active render pass texture.
-  // Metal validates scissor rectangles against the descriptor attachments, not
-  // against the cache's logical RT0 binding.
-  uint32_t rt_width = 1;
-  uint32_t rt_height = 1;
-  GetActiveRenderTargetSize(pass_descriptor, render_target_cache_.get(), 1280,
-                            720, rt_width, rt_height);
-
-  // Set viewport
-  MTL::Viewport viewport = {
-      0.0, 0.0, static_cast<double>(rt_width), static_cast<double>(rt_height),
-      0.0, 1.0};
-  current_render_encoder_->setViewport(viewport);
-
-  // Set scissor (must not exceed render pass dimensions)
-  MTL::ScissorRect scissor = {0, 0, rt_width, rt_height};
-  current_render_encoder_->setScissorRect(scissor);
-
-  // Mark dirty so IssueDraw re-applies the per-draw viewport/scissor.
-  viewport_dirty_ = true;
-  scissor_dirty_ = true;
   return true;
 }
 
