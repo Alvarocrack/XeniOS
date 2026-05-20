@@ -5991,6 +5991,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
     }
+    if (resolve_clear_via_load_action && transfers_for_shaders.empty()) {
+      resolve_clear_via_load_action = false;
+    }
 
     // Depth transfers that fully overwrite the destination still need a clean
     // stencil surface before the per-bit stencil draws run. A load-action
@@ -6675,12 +6678,6 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           any_transfers_done = true;
         }
       }
-    }
-
-    if ((resolve_clear_via_load_action ||
-         transfer_stencil_clear_via_load_action) &&
-        !transfer_encoder && transfers_for_shaders.empty()) {
-      ensure_transfer_encoder();
     }
 
     if (resolve_clear_needed && !resolve_clear_via_load_action) {
