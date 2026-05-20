@@ -312,8 +312,9 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   void ApplyDrawDynamicState(const DrawDynamicState& dynamic_state);
 
-  // Host draw path — build the per-draw top-level argument buffers and bind
-  // them plus the stable descriptor heap buffers to the render encoder.
+  // Host draw path — refresh top-level argument buffers when root CBV state
+  // changes and bind them plus the stable descriptor heap buffers to the
+  // render encoder when encoder state requires it.
   bool PopulateBindlessTables(MetalShader* metal_vertex_shader,
                               MetalShader* metal_pixel_shader,
                               bool shared_memory_is_uav,
@@ -459,9 +460,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t bindless_root_argument_bind_updates = 0;
     uint64_t bindless_root_argument_bind_skips = 0;
     std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_cbv_match_hits = {};
+        bindless_stage_cbv_same = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
-        bindless_stage_cbv_match_misses = {};
+        bindless_stage_cbv_changed = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
         bindless_stage_top_level_allocations = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
@@ -739,9 +740,9 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   // Constant buffer dirty tracking (D3D12 pattern).
   // Each binding records the pool-allocated buffer, offset, and GPU address
-  // for the most recent constant upload.  When up_to_date is true the data
-  // from the previous allocation can be copied instead of re-gathering from
-  // the register file.
+  // for the most recent constant upload.  When up_to_date is true, the draw
+  // reuses that upload through the top-level argument buffer instead of
+  // gathering and uploading the same CBV again.
   struct ConstantBufferBinding {
     MTL::Buffer* buffer = nullptr;
     NS::UInteger offset = 0;
@@ -759,6 +760,10 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t gpu_address = 0;
     bool valid = false;
   };
+  // MSC root arguments are one small top-level argument buffer per shader
+  // stage.  The current tuple is carried forward while the CBV addresses,
+  // sizes, shared-memory mode, and mesh/tessellation path stay unchanged;
+  // otherwise a fresh table is written from the bump-allocated upload pool.
   StageRootArgumentKey BuildStageRootArgumentKey(
       const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
       bool shared_memory_is_uav) const;

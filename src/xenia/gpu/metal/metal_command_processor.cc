@@ -3426,9 +3426,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     }
     if (stage < BackendTelemetryStats::kBindlessTelemetryStageCount) {
       if (stage_cbvs_match) {
-        ++backend_telemetry_.bindless_stage_cbv_match_hits[stage];
+        ++backend_telemetry_.bindless_stage_cbv_same[stage];
       } else {
-        ++backend_telemetry_.bindless_stage_cbv_match_misses[stage];
+        ++backend_telemetry_.bindless_stage_cbv_changed[stage];
       }
     }
   }
@@ -4835,10 +4835,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
         }
         return formatted;
       };
-  std::string bindless_stage_cbv_hits =
-      format_stage_array(backend_telemetry_.bindless_stage_cbv_match_hits);
-  std::string bindless_stage_cbv_misses =
-      format_stage_array(backend_telemetry_.bindless_stage_cbv_match_misses);
+  std::string bindless_stage_cbv_same =
+      format_stage_array(backend_telemetry_.bindless_stage_cbv_same);
+  std::string bindless_stage_cbv_changed =
+      format_stage_array(backend_telemetry_.bindless_stage_cbv_changed);
   std::string bindless_stage_top_level_allocs =
       format_stage_array(backend_telemetry_.bindless_stage_top_level_allocations);
   std::string bindless_stage_top_level_bytes =
@@ -4944,10 +4944,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_encoder_use_heap_redundant,
       backend_telemetry_.render_encoder_use_heap_driver_calls);
   XELOGI(
-      "MetalTelemetry[{}]: root_args stage_cbv hit={{ {} }} miss={{ {} }} "
+      "MetalTelemetry[{}]: root_args stage_cbv same={{ {} }} changed={{ {} }} "
       "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }} "
       "bind update/skip={}/{}",
-      reason, bindless_stage_cbv_hits, bindless_stage_cbv_misses,
+      reason, bindless_stage_cbv_same, bindless_stage_cbv_changed,
       bindless_stage_top_level_allocs, bindless_stage_top_level_bytes,
       bindless_stage_root_writes,
       backend_telemetry_.bindless_root_argument_bind_updates,
