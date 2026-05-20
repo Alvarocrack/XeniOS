@@ -944,21 +944,16 @@ bool MetalRenderTargetCache::InitializeEdramComputeShaders() {
   // Initialize the resolve / EDRAM compute pipelines used by the Metal backend.
   const bool draw_resolution_scaled = IsDrawResolutionScaled();
   edram_store_pipeline_ = nullptr;
-  edram_dump_color_32bpp_1xmsaa_pipeline_ = nullptr;
-  edram_dump_color_32bpp_2xmsaa_pipeline_ = nullptr;
-  edram_dump_color_32bpp_4xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_32bpp_1xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_32bpp_2xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_32bpp_4xmsaa_pipeline_ = nullptr;
-  edram_dump_color_64bpp_1xmsaa_pipeline_ = nullptr;
-  edram_dump_color_64bpp_2xmsaa_pipeline_ = nullptr;
-  edram_dump_color_64bpp_4xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_64bpp_1xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_64bpp_2xmsaa_pipeline_ = nullptr;
-  edram_dump_color_uint_64bpp_4xmsaa_pipeline_ = nullptr;
-  edram_dump_depth_32bpp_1xmsaa_pipeline_ = nullptr;
-  edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
-  edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
+  for (auto& by_bpp : edram_dump_color_pipelines_) {
+    for (auto& by_source : by_bpp) {
+      for (auto*& pipeline : by_source) {
+        pipeline = nullptr;
+      }
+    }
+  }
+  for (auto*& pipeline : edram_dump_depth_pipelines_) {
+    pipeline = nullptr;
+  }
   for (auto& by_scaled : resolve_full_pipelines_) {
     for (auto*& pipeline : by_scaled) {
       pipeline = nullptr;
@@ -2023,35 +2018,35 @@ kernel void DUMP_KERNEL_NAME(
   };
   const EdramDumpConfig kEdramDumpConfigs[] = {
       {"edram_dump_color_32bpp_1xmsaa", 1, 32, 0, 0,
-       &edram_dump_color_32bpp_1xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][0][0]},
       {"edram_dump_color_32bpp_2xmsaa", 2, 32, 0, 0,
-       &edram_dump_color_32bpp_2xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][0][1]},
       {"edram_dump_color_32bpp_4xmsaa", 4, 32, 0, 0,
-       &edram_dump_color_32bpp_4xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][0][2]},
       {"edram_dump_color_uint_32bpp_1xmsaa", 1, 32, 0, 1,
-       &edram_dump_color_uint_32bpp_1xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][1][0]},
       {"edram_dump_color_uint_32bpp_2xmsaa", 2, 32, 0, 1,
-       &edram_dump_color_uint_32bpp_2xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][1][1]},
       {"edram_dump_color_uint_32bpp_4xmsaa", 4, 32, 0, 1,
-       &edram_dump_color_uint_32bpp_4xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[0][1][2]},
       {"edram_dump_depth_32bpp_1xmsaa", 1, 32, 1, 0,
-       &edram_dump_depth_32bpp_1xmsaa_pipeline_},
+       &edram_dump_depth_pipelines_[0]},
       {"edram_dump_depth_32bpp_2xmsaa", 2, 32, 1, 0,
-       &edram_dump_depth_32bpp_2xmsaa_pipeline_},
+       &edram_dump_depth_pipelines_[1]},
       {"edram_dump_depth_32bpp_4xmsaa", 4, 32, 1, 0,
-       &edram_dump_depth_32bpp_4xmsaa_pipeline_},
+       &edram_dump_depth_pipelines_[2]},
       {"edram_dump_color_64bpp_1xmsaa", 1, 64, 0, 0,
-       &edram_dump_color_64bpp_1xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][0][0]},
       {"edram_dump_color_64bpp_2xmsaa", 2, 64, 0, 0,
-       &edram_dump_color_64bpp_2xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][0][1]},
       {"edram_dump_color_64bpp_4xmsaa", 4, 64, 0, 0,
-       &edram_dump_color_64bpp_4xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][0][2]},
       {"edram_dump_color_uint_64bpp_1xmsaa", 1, 64, 0, 1,
-       &edram_dump_color_uint_64bpp_1xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][1][0]},
       {"edram_dump_color_uint_64bpp_2xmsaa", 2, 64, 0, 1,
-       &edram_dump_color_uint_64bpp_2xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][1][1]},
       {"edram_dump_color_uint_64bpp_4xmsaa", 4, 64, 0, 1,
-       &edram_dump_color_uint_64bpp_4xmsaa_pipeline_},
+       &edram_dump_color_pipelines_[1][1][2]},
   };
 
   auto append_dump_define = [](std::string& src, const char* name,
@@ -2127,68 +2122,21 @@ void MetalRenderTargetCache::ShutdownEdramComputeShaders() {
     edram_store_pipeline_->release();
     edram_store_pipeline_ = nullptr;
   }
-  // Release 32bpp color dump pipelines
-  if (edram_dump_color_32bpp_1xmsaa_pipeline_) {
-    edram_dump_color_32bpp_1xmsaa_pipeline_->release();
-    edram_dump_color_32bpp_1xmsaa_pipeline_ = nullptr;
+  for (auto& by_bpp : edram_dump_color_pipelines_) {
+    for (auto& by_source : by_bpp) {
+      for (auto*& pipeline : by_source) {
+        if (pipeline) {
+          pipeline->release();
+          pipeline = nullptr;
+        }
+      }
+    }
   }
-  if (edram_dump_color_32bpp_2xmsaa_pipeline_) {
-    edram_dump_color_32bpp_2xmsaa_pipeline_->release();
-    edram_dump_color_32bpp_2xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_32bpp_4xmsaa_pipeline_) {
-    edram_dump_color_32bpp_4xmsaa_pipeline_->release();
-    edram_dump_color_32bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_32bpp_1xmsaa_pipeline_) {
-    edram_dump_color_uint_32bpp_1xmsaa_pipeline_->release();
-    edram_dump_color_uint_32bpp_1xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_32bpp_2xmsaa_pipeline_) {
-    edram_dump_color_uint_32bpp_2xmsaa_pipeline_->release();
-    edram_dump_color_uint_32bpp_2xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_32bpp_4xmsaa_pipeline_) {
-    edram_dump_color_uint_32bpp_4xmsaa_pipeline_->release();
-    edram_dump_color_uint_32bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  // Release 64bpp color dump pipelines
-  if (edram_dump_color_64bpp_1xmsaa_pipeline_) {
-    edram_dump_color_64bpp_1xmsaa_pipeline_->release();
-    edram_dump_color_64bpp_1xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_64bpp_2xmsaa_pipeline_) {
-    edram_dump_color_64bpp_2xmsaa_pipeline_->release();
-    edram_dump_color_64bpp_2xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_64bpp_4xmsaa_pipeline_) {
-    edram_dump_color_64bpp_4xmsaa_pipeline_->release();
-    edram_dump_color_64bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_64bpp_1xmsaa_pipeline_) {
-    edram_dump_color_uint_64bpp_1xmsaa_pipeline_->release();
-    edram_dump_color_uint_64bpp_1xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_64bpp_2xmsaa_pipeline_) {
-    edram_dump_color_uint_64bpp_2xmsaa_pipeline_->release();
-    edram_dump_color_uint_64bpp_2xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_color_uint_64bpp_4xmsaa_pipeline_) {
-    edram_dump_color_uint_64bpp_4xmsaa_pipeline_->release();
-    edram_dump_color_uint_64bpp_4xmsaa_pipeline_ = nullptr;
-  }
-  // Release 32bpp depth dump pipelines
-  if (edram_dump_depth_32bpp_1xmsaa_pipeline_) {
-    edram_dump_depth_32bpp_1xmsaa_pipeline_->release();
-    edram_dump_depth_32bpp_1xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_depth_32bpp_2xmsaa_pipeline_) {
-    edram_dump_depth_32bpp_2xmsaa_pipeline_->release();
-    edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
-  }
-  if (edram_dump_depth_32bpp_4xmsaa_pipeline_) {
-    edram_dump_depth_32bpp_4xmsaa_pipeline_->release();
-    edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
+  for (auto*& pipeline : edram_dump_depth_pipelines_) {
+    if (pipeline) {
+      pipeline->release();
+      pipeline = nullptr;
+    }
   }
   for (auto& by_scaled : resolve_full_pipelines_) {
     for (auto*& pipeline : by_scaled) {
@@ -4234,65 +4182,15 @@ void MetalRenderTargetCache::DumpRenderTargets(
       dump_flags |= kMetalEdramDumpFlagGammaAsLinear;
     }
 
-    if (!key.is_depth) {
-      // Color render target
-      if (is_64bpp) {
-        // 64bpp color
-        switch (key.msaa_samples) {
-          case xenos::MsaaSamples::k1X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_64bpp_1xmsaa_pipeline_
-                                : edram_dump_color_64bpp_1xmsaa_pipeline_;
-            break;
-          case xenos::MsaaSamples::k2X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_64bpp_2xmsaa_pipeline_
-                                : edram_dump_color_64bpp_2xmsaa_pipeline_;
-            break;
-          case xenos::MsaaSamples::k4X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_64bpp_4xmsaa_pipeline_
-                                : edram_dump_color_64bpp_4xmsaa_pipeline_;
-            break;
-          default:
-            break;
-        }
+    size_t msaa_index = MsaaSamplesToIndex(key.msaa_samples);
+    if (msaa_index != SIZE_MAX) {
+      if (!key.is_depth) {
+        dump_pipeline =
+            edram_dump_color_pipelines_[is_64bpp ? 1u : 0u]
+                                       [dump_source_is_uint ? 1u : 0u]
+                                       [msaa_index];
       } else {
-        // 32bpp color
-        switch (key.msaa_samples) {
-          case xenos::MsaaSamples::k1X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_32bpp_1xmsaa_pipeline_
-                                : edram_dump_color_32bpp_1xmsaa_pipeline_;
-            break;
-          case xenos::MsaaSamples::k2X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_32bpp_2xmsaa_pipeline_
-                                : edram_dump_color_32bpp_2xmsaa_pipeline_;
-            break;
-          case xenos::MsaaSamples::k4X:
-            dump_pipeline = dump_source_is_uint
-                                ? edram_dump_color_uint_32bpp_4xmsaa_pipeline_
-                                : edram_dump_color_32bpp_4xmsaa_pipeline_;
-            break;
-          default:
-            break;
-        }
-      }
-    } else {
-      // Depth render target (always 32bpp for D24S8/D24FS8)
-      switch (key.msaa_samples) {
-        case xenos::MsaaSamples::k1X:
-          dump_pipeline = edram_dump_depth_32bpp_1xmsaa_pipeline_;
-          break;
-        case xenos::MsaaSamples::k2X:
-          dump_pipeline = edram_dump_depth_32bpp_2xmsaa_pipeline_;
-          break;
-        case xenos::MsaaSamples::k4X:
-          dump_pipeline = edram_dump_depth_32bpp_4xmsaa_pipeline_;
-          break;
-        default:
-          break;
+        dump_pipeline = edram_dump_depth_pipelines_[msaa_index];
       }
     }
 

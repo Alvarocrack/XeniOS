@@ -252,30 +252,14 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::Library* edram_load_library_msaa_ = nullptr;
 
   // EDRAM dump compute shaders for host render target → EDRAM copies.
-  // Color, 32bpp.
-  MTL::ComputePipelineState* edram_dump_color_32bpp_1xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_32bpp_2xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_32bpp_4xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_1xmsaa_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_2xmsaa_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_32bpp_4xmsaa_pipeline_ =
-      nullptr;
-  // Color, 64bpp.
-  MTL::ComputePipelineState* edram_dump_color_64bpp_1xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_64bpp_2xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_64bpp_4xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_1xmsaa_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_2xmsaa_pipeline_ =
-      nullptr;
-  MTL::ComputePipelineState* edram_dump_color_uint_64bpp_4xmsaa_pipeline_ =
-      nullptr;
-  // Depth (D24x / D24FS8 encoded as 32bpp in EDRAM snapshot).
-  MTL::ComputePipelineState* edram_dump_depth_32bpp_1xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_depth_32bpp_2xmsaa_pipeline_ = nullptr;
-  MTL::ComputePipelineState* edram_dump_depth_32bpp_4xmsaa_pipeline_ = nullptr;
+  static constexpr size_t kEdramDumpBppCount = 2;     // 32, 64
+  static constexpr size_t kEdramDumpSourceCount = 2;  // float, uint
+  static constexpr size_t kEdramDumpMsaaCount = 3;    // 1x, 2x, 4x
+  MTL::ComputePipelineState*
+      edram_dump_color_pipelines_[kEdramDumpBppCount][kEdramDumpSourceCount]
+                                 [kEdramDumpMsaaCount] = {};
+  MTL::ComputePipelineState* edram_dump_depth_pipelines_[kEdramDumpMsaaCount] =
+      {};
 
   // Resolve compute shaders (Metal XeSL -> MSL metallib).
   static constexpr size_t kResolveScaledCount = 2;    // false, true
