@@ -787,6 +787,8 @@ MetalPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   metal_layer.contentsScale = surface_scale;
   metal_layer.drawableSize =
       CGSizeMake(new_surface_width * surface_scale, new_surface_height * surface_scale);
+  metal_layer.minificationFilter = kCAFilterNearest;
+  metal_layer.magnificationFilter = kCAFilterNearest;
 
   const bool tearing_allowed = cvars::metal_allow_tearing;
   metal_layer.displaySyncEnabled = tearing_allowed ? NO : YES;
