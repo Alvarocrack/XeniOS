@@ -128,6 +128,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   void InvalidateRenderEncoderStateAfterDrawPassTransfers(
       MetalRenderTargetCache::DrawPassTransferEncoderMutationMask mutations);
   void ResetRenderEncoderResourceUsage();
+  void MarkBindlessStableResourcesDirty();
   void UseRenderEncoderResource(MTL::Resource* resource,
                                 MTL::ResourceUsage usage);
   void EnsureCommandBufferAutoreleasePool();
@@ -555,7 +556,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<MTL::Texture*> current_texture_bindless_resources_pixel_;
   bool current_bindless_table_valid_ = false;
   uint64_t current_bindless_table_serial_ = 0;
-  uint64_t render_encoder_bindless_resources_serial_ = 0;
+  uint64_t current_bindless_stable_resources_serial_ = 0;
+  uint64_t render_encoder_bindless_table_resources_serial_ = 0;
+  uint64_t render_encoder_bindless_stable_resources_serial_ = 0;
   MTL::Buffer* current_bindless_top_level_buffer_ = nullptr;
   NS::UInteger current_bindless_top_level_offset_ = 0;
   uint64_t current_bindless_top_level_gpu_address_ = 0;
@@ -567,6 +570,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::array<std::array<size_t, 7>, 2> current_bindless_cbv_sizes_ = {};
   bool current_bindless_shared_memory_is_uav_ = false;
   bool current_bindless_uses_mesh_stages_ = false;
+  bool current_bindless_stable_resources_valid_ = false;
+  bool current_bindless_stable_shared_memory_is_uav_ = false;
+  uint32_t current_bindless_stable_shared_memory_usage_bits_ = 0;
 
   // Pool for per-draw constant buffer allocations (replaces the ring's
   // uniforms_buffer_ for constant data).

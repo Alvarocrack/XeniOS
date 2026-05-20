@@ -450,13 +450,18 @@ MetalCommandProcessor::~MetalCommandProcessor() {
   }
   current_bindless_table_valid_ = false;
   current_bindless_table_serial_ = 0;
-  render_encoder_bindless_resources_serial_ = 0;
+  current_bindless_stable_resources_serial_ = 0;
+  render_encoder_bindless_table_resources_serial_ = 0;
+  render_encoder_bindless_stable_resources_serial_ = 0;
   current_bindless_top_level_buffer_ = nullptr;
   current_bindless_top_level_offset_ = 0;
   current_bindless_top_level_gpu_address_ = 0;
   current_bindless_cbv_buffer_ = nullptr;
   current_bindless_cbv_offset_ = 0;
   current_bindless_cbv_gpu_address_ = 0;
+  current_bindless_stable_resources_valid_ = false;
+  current_bindless_stable_shared_memory_is_uav_ = false;
+  current_bindless_stable_shared_memory_usage_bits_ = 0;
 }
 
 void MetalCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
@@ -2965,6 +2970,9 @@ bool MetalCommandProcessor::PrepareDrawConstants(
           texture_bindings_pixel_ptr->size());
     }
   }
+  if (descriptor_indices_vertex_written || descriptor_indices_pixel_written) {
+    MarkBindlessStableResourcesDirty();
+  }
 
   uniforms_out = {};
   auto set_uniform_cbv = [](UniformBufferInfo::Cbv& cbv,
@@ -3185,8 +3193,21 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     }
   }
 
-  if (render_encoder_bindless_resources_serial_ !=
-      current_bindless_table_serial_) {
+  const uint32_t shared_memory_usage_bits =
+      static_cast<uint32_t>(shared_memory_usage);
+  if (!current_bindless_stable_resources_valid_ ||
+      current_bindless_stable_shared_memory_is_uav_ != shared_memory_is_uav ||
+      current_bindless_stable_shared_memory_usage_bits_ !=
+          shared_memory_usage_bits) {
+    current_bindless_stable_resources_valid_ = true;
+    current_bindless_stable_shared_memory_is_uav_ = shared_memory_is_uav;
+    current_bindless_stable_shared_memory_usage_bits_ =
+        shared_memory_usage_bits;
+    MarkBindlessStableResourcesDirty();
+  }
+
+  if (render_encoder_bindless_stable_resources_serial_ !=
+      current_bindless_stable_resources_serial_) {
     MTL::Buffer* shared_mem_buffer = shared_memory_->GetBuffer();
     if (shared_mem_buffer) {
       UseRenderEncoderResource(shared_mem_buffer, shared_memory_usage);
@@ -3235,6 +3256,12 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     UseRenderEncoderResource(view_bindless_heap_, MTL::ResourceUsageRead);
     UseRenderEncoderResource(sampler_bindless_heap_, MTL::ResourceUsageRead);
     UseRenderEncoderResource(system_view_tables_, MTL::ResourceUsageRead);
+    render_encoder_bindless_stable_resources_serial_ =
+        current_bindless_stable_resources_serial_;
+  }
+
+  if (render_encoder_bindless_table_resources_serial_ !=
+      current_bindless_table_serial_) {
     UseRenderEncoderResource(current_bindless_top_level_buffer_,
                              MTL::ResourceUsageRead);
     UseRenderEncoderResource(current_bindless_cbv_buffer_,
@@ -3263,7 +3290,8 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       UseRenderEncoderResource(uniform_buffers_for_encoder[i],
                                MTL::ResourceUsageRead);
     }
-    render_encoder_bindless_resources_serial_ = current_bindless_table_serial_;
+    render_encoder_bindless_table_resources_serial_ =
+        current_bindless_table_serial_;
   }
 
   const NS::UInteger top_level_offset_vertex =
@@ -4110,7 +4138,15 @@ void MetalCommandProcessor::ResetRenderEncoderResourceUsage() {
   render_encoder_resource_usage_map_.clear();
   render_encoder_heap_usage_.clear();
   render_encoder_heap_usage_set_.clear();
-  render_encoder_bindless_resources_serial_ = 0;
+  render_encoder_bindless_table_resources_serial_ = 0;
+  render_encoder_bindless_stable_resources_serial_ = 0;
+}
+
+void MetalCommandProcessor::MarkBindlessStableResourcesDirty() {
+  ++current_bindless_stable_resources_serial_;
+  if (!current_bindless_stable_resources_serial_) {
+    current_bindless_stable_resources_serial_ = 1;
+  }
 }
 
 void MetalCommandProcessor::ResetRenderEncoderBufferBindings() {
@@ -4421,7 +4457,12 @@ void MetalCommandProcessor::EndCommandBuffer() {
     submission_has_draws_ = false;
     current_bindless_table_valid_ = false;
     current_bindless_table_serial_ = 0;
-    render_encoder_bindless_resources_serial_ = 0;
+    current_bindless_stable_resources_serial_ = 0;
+    render_encoder_bindless_table_resources_serial_ = 0;
+    render_encoder_bindless_stable_resources_serial_ = 0;
+    current_bindless_stable_resources_valid_ = false;
+    current_bindless_stable_shared_memory_is_uav_ = false;
+    current_bindless_stable_shared_memory_usage_bits_ = 0;
   }
   DrainCommandBufferAutoreleasePool();
 }
