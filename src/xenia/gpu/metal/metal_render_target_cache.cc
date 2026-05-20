@@ -2400,6 +2400,7 @@ bool MetalRenderTargetCache::Update(
   if (::cvars::metal_transfer_in_draw_pass) {
     std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets>
         fallback_transfers;
+    bool fallback_transfer_work = false;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       const std::vector<Transfer>& transfers = update_transfers[i];
       if (transfers.empty()) {
@@ -2433,11 +2434,14 @@ bool MetalRenderTargetCache::Update(
         }
       } else {
         fallback_transfers[i] = transfers;
+        fallback_transfer_work = true;
       }
     }
-    PerformTransfersAndResolveClears(
-        1 + xenos::kMaxColorRenderTargets, accumulated_targets,
-        fallback_transfers.data(), nullptr, nullptr, nullptr);
+    if (fallback_transfer_work) {
+      PerformTransfersAndResolveClears(
+          1 + xenos::kMaxColorRenderTargets, accumulated_targets,
+          fallback_transfers.data(), nullptr, nullptr, nullptr);
+    }
     if (HasPendingDrawPassTransfers() &&
         !EnsurePendingDrawPassTransfersPreflighted()) {
       if (!FlushPendingDrawPassTransfers()) {
