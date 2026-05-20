@@ -570,6 +570,77 @@ const char* RenderEncoderBufferStageName(size_t stage) {
   }
 }
 
+uint32_t CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister reg) {
+  return uint32_t(1) << uint32_t(reg);
+}
+
+uint32_t ActiveCbvMaskForShader(const MetalShader* shader) {
+  if (!shader) {
+    return 0;
+  }
+  uint32_t used_cbuffer_mask = shader->GetUsedCbufferMaskAfterTranslation();
+  if (!used_cbuffer_mask) {
+    return (uint32_t(1)
+            << (uint32_t(DxbcShaderTranslator::CbufferRegister::
+                             kDescriptorIndices) +
+                1)) -
+           1;
+  }
+  uint32_t active_cbv_mask = 0;
+  if (used_cbuffer_mask &
+      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kSystemConstants)) {
+    active_cbv_mask |=
+        uint32_t(1)
+        << uint32_t(DxbcShaderTranslator::CbufferRegister::kSystemConstants);
+  }
+  if (used_cbuffer_mask &
+      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kFloatConstants)) {
+    active_cbv_mask |=
+        uint32_t(1)
+        << uint32_t(DxbcShaderTranslator::CbufferRegister::kFloatConstants);
+  }
+  if (used_cbuffer_mask &
+      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kBoolLoopConstants)) {
+    active_cbv_mask |=
+        uint32_t(1)
+        << uint32_t(DxbcShaderTranslator::CbufferRegister::kBoolLoopConstants);
+  }
+  if (used_cbuffer_mask &
+      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kFetchConstants)) {
+    active_cbv_mask |=
+        uint32_t(1)
+        << uint32_t(DxbcShaderTranslator::CbufferRegister::kFetchConstants);
+  }
+  if (used_cbuffer_mask &
+      CbufferRegisterBit(
+          DxbcShaderTranslator::CbufferRegister::kDescriptorIndices)) {
+    active_cbv_mask |=
+        uint32_t(1)
+        << uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices);
+  }
+  return active_cbv_mask;
+}
+
+bool FetchConstantDwordMasksOverlap(
+    const DxbcShader::FetchConstantDwordMask& a,
+    const DxbcShader::FetchConstantDwordMask& b) {
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] & b[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void MarkFetchConstantDword(DxbcShader::FetchConstantDwordMask& mask,
+                            uint32_t dword_index) {
+  if (dword_index >= DxbcShader::kFetchConstantDwordCount) {
+    assert_always();
+    return;
+  }
+  mask[dword_index >> 5] |= uint32_t(1) << (dword_index & 31);
+}
+
 }  // namespace
 
 MetalCommandProcessor::MetalCommandProcessor(
@@ -3267,6 +3338,19 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                   cbuffer_binding_fetch_);
   set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotDescriptorIndices],
                   cbuffer_binding_descriptor_indices_pixel_);
+  uniforms_out.active_cbv_masks[kStageVertex] =
+      ActiveCbvMaskForShader(metal_vertex_shader);
+  uniforms_out.active_cbv_masks[kStagePixel] =
+      ActiveCbvMaskForShader(metal_pixel_shader);
+  uniforms_out.fetch_constant_dword_masks[kStageVertex] =
+      metal_vertex_shader
+          ? metal_vertex_shader->GetFetchConstantDwordMaskAfterTranslation()
+          : DxbcShader::FetchConstantDwordMask();
+  uniforms_out.fetch_constant_dword_masks[kStagePixel] =
+      metal_pixel_shader
+          ? metal_pixel_shader->GetFetchConstantDwordMaskAfterTranslation()
+          : DxbcShader::FetchConstantDwordMask();
+  current_fetch_constant_dword_masks_ = uniforms_out.fetch_constant_dword_masks;
   return true;
 }
 
@@ -3410,6 +3494,10 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   for (size_t stage = 0; stage < kStageCount; ++stage) {
     const bool stage_root_valid = current_bindless_stage_root_valid_[stage];
     bool stage_cbvs_match_local = stage_root_valid;
+    if (stage < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+      backend_telemetry_.bindless_stage_active_cbv_mask_or[stage] |=
+          uniforms.active_cbv_masks[stage];
+    }
     if (!stage_root_valid) {
       bindless_table_invalid = true;
     }
@@ -3425,6 +3513,13 @@ bool MetalCommandProcessor::PopulateBindlessTables(
             stage < BackendTelemetryStats::kBindlessTelemetryStageCount &&
             cbv < BackendTelemetryStats::kBindlessTelemetryCbvSlotsPerStage) {
           ++backend_telemetry_.bindless_table_miss_cbv_slots[stage][cbv];
+          if (uniforms.active_cbv_masks[stage] & (uint32_t(1) << cbv)) {
+            ++backend_telemetry_
+                  .bindless_table_miss_active_cbv_slots[stage][cbv];
+          } else {
+            ++backend_telemetry_
+                  .bindless_table_miss_inactive_cbv_slots[stage][cbv];
+          }
         }
       }
     }
@@ -4652,6 +4747,7 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   uint64_t changed = 0;
   uint64_t unchanged = 0;
   uint32_t changed_fetch_mask = 0;
+  DxbcShader::FetchConstantDwordMask changed_fetch_dword_mask = {};
   uint32_t* register_values = register_file_->values;
 
   const uint32_t dword_start =
@@ -4682,7 +4778,7 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
       ++changed;
       fetch_changed = true;
       changed_fetch_mask |= uint32_t(1) << fetch_index;
-      break;
+      MarkFetchConstantDword(changed_fetch_dword_mask, dword);
     }
     if (fetch_changed) {
       ++backend_telemetry_.register_write_fetch_changed_slots;
@@ -4699,6 +4795,16 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   backend_telemetry_.register_write_fetch_dwords_copied += num_registers;
   if (changed) {
     cbuffer_binding_fetch_.up_to_date = false;
+    if (FetchConstantDwordMasksOverlap(
+            changed_fetch_dword_mask,
+            current_fetch_constant_dword_masks_[kStageVertex])) {
+      ++backend_telemetry_.register_write_fetch_dirty_vertex;
+    }
+    if (FetchConstantDwordMasksOverlap(
+            changed_fetch_dword_mask,
+            current_fetch_constant_dword_masks_[kStagePixel])) {
+      ++backend_telemetry_.register_write_fetch_dirty_pixel;
+    }
   }
   if (texture_cache_ && changed_fetch_mask) {
     uint32_t mask = changed_fetch_mask;
@@ -4768,9 +4874,23 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     ++backend_telemetry_.register_write_fetch_changed;
     cbuffer_binding_fetch_.up_to_date = false;
     ++backend_telemetry_.register_write_fetch_dirty;
+    const uint32_t fetch_dword =
+        index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    DxbcShader::FetchConstantDwordMask changed_fetch_dword_mask = {};
+    MarkFetchConstantDword(changed_fetch_dword_mask, fetch_dword);
+    if (FetchConstantDwordMasksOverlap(
+            changed_fetch_dword_mask,
+            current_fetch_constant_dword_masks_[kStageVertex])) {
+      ++backend_telemetry_.register_write_fetch_dirty_vertex;
+    }
+    if (FetchConstantDwordMasksOverlap(
+            changed_fetch_dword_mask,
+            current_fetch_constant_dword_masks_[kStagePixel])) {
+      ++backend_telemetry_.register_write_fetch_dirty_pixel;
+    }
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantWritten(
-          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+          fetch_dword / 6);
       ++backend_telemetry_.texture_fetch_constant_invalidations;
     }
   }
@@ -4955,28 +5075,36 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
     descriptor_compatibility_reasons = "none";
   }
 
-  std::string bindless_cbv_slot_misses;
-  for (size_t stage = 0;
-       stage < backend_telemetry_.bindless_table_miss_cbv_slots.size();
-       ++stage) {
-    for (size_t slot = 0;
-         slot < backend_telemetry_.bindless_table_miss_cbv_slots[stage].size();
-         ++slot) {
-      uint64_t count =
-          backend_telemetry_.bindless_table_miss_cbv_slots[stage][slot];
-      if (!count) {
-        continue;
-      }
-      if (!bindless_cbv_slot_misses.empty()) {
-        bindless_cbv_slot_misses += ", ";
-      }
-      bindless_cbv_slot_misses +=
-          fmt::format("{}={}", BindlessCbvSlotName(stage, slot), count);
-    }
-  }
-  if (bindless_cbv_slot_misses.empty()) {
-    bindless_cbv_slot_misses = "none";
-  }
+  auto format_cbv_slot_counts =
+      [](const std::array<
+          std::array<uint64_t,
+                     BackendTelemetryStats::kBindlessTelemetryCbvSlotsPerStage>,
+          BackendTelemetryStats::kBindlessTelemetryStageCount>& values) {
+        std::string formatted;
+        for (size_t stage = 0; stage < values.size(); ++stage) {
+          for (size_t slot = 0; slot < values[stage].size(); ++slot) {
+            uint64_t count = values[stage][slot];
+            if (!count) {
+              continue;
+            }
+            if (!formatted.empty()) {
+              formatted += ", ";
+            }
+            formatted +=
+                fmt::format("{}={}", BindlessCbvSlotName(stage, slot), count);
+          }
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  std::string bindless_cbv_slot_misses =
+      format_cbv_slot_counts(backend_telemetry_.bindless_table_miss_cbv_slots);
+  std::string bindless_active_cbv_slot_misses = format_cbv_slot_counts(
+      backend_telemetry_.bindless_table_miss_active_cbv_slots);
+  std::string bindless_inactive_cbv_slot_misses = format_cbv_slot_counts(
+      backend_telemetry_.bindless_table_miss_inactive_cbv_slots);
 
   auto format_stage_array =
       [](const std::array<uint64_t,
@@ -5001,6 +5129,22 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       format_stage_array(backend_telemetry_.bindless_stage_top_level_bytes);
   std::string bindless_stage_root_writes =
       format_stage_array(backend_telemetry_.bindless_stage_root_cbv_pointer_writes);
+  auto format_stage_mask_array =
+      [](const std::array<uint64_t,
+                          BackendTelemetryStats::
+                              kBindlessTelemetryStageCount>& values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}=0x{:X}", BindlessStageName(i), values[i]);
+        }
+        return formatted;
+      };
+  std::string bindless_stage_active_cbv_masks =
+      format_stage_mask_array(backend_telemetry_.bindless_stage_active_cbv_mask_or);
   auto format_buffer_stage_array =
       [](const std::array<uint64_t,
                           BackendTelemetryStats::
@@ -5071,7 +5215,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "miss invalid/cbv/smem_uav={}/{}/{} resource "
       "serial hit/miss={}/{} stable_miss invalid/smem_uav/usage={}/{}/{} "
       "allocations/bytes={}/{} root_cbv_ptr_writes={} "
-      "cbv_miss_slots={{ {} }} "
+      "cbv_miss_slots={{ {} }} cbv_miss_active={{ {} }} "
+      "cbv_miss_inactive={{ {} }} "
       "tracked textures/uniform_buffers={}/{} "
       "useResource calls/redundant/driver={}/{}/{} useHeap "
       "calls/redundant/driver={}/{}/{}",
@@ -5089,7 +5234,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.bindless_table_allocations,
       backend_telemetry_.bindless_table_bytes,
       backend_telemetry_.bindless_root_cbv_pointer_writes,
-      bindless_cbv_slot_misses,
+      bindless_cbv_slot_misses, bindless_active_cbv_slot_misses,
+      bindless_inactive_cbv_slot_misses,
       backend_telemetry_.bindless_resource_textures_tracked,
       backend_telemetry_.bindless_resource_uniform_buffers_tracked,
       backend_telemetry_.render_encoder_use_resource_calls,
@@ -5101,10 +5247,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   XELOGI(
       "MetalTelemetry[{}]: root_args stage_cbv same={{ {} }} changed={{ {} }} "
       "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }} "
-      "bind update/skip={}/{}",
+      "active_mask_or={{ {} }} bind update/skip={}/{}",
       reason, bindless_stage_cbv_same, bindless_stage_cbv_changed,
       bindless_stage_top_level_allocs, bindless_stage_top_level_bytes,
-      bindless_stage_root_writes,
+      bindless_stage_root_writes, bindless_stage_active_cbv_masks,
       backend_telemetry_.bindless_root_argument_bind_updates,
       backend_telemetry_.bindless_root_argument_bind_skips);
   XELOGI(
@@ -5163,7 +5309,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "MetalTelemetry[{}]: register_write_detail float "
       "copied/compared/dirty_vs/dirty_ps/already_dirty_vs/"
       "already_dirty_ps/unused_vs/unused_ps={}/{}/{}/{}/{}/{}/{}/{} "
-      "fetch copied/slots/compared/changed_slots={}/{}/{}/{}",
+      "fetch copied/slots/compared/changed_slots/dirty_vs/dirty_ps="
+      "{}/{}/{}/{}/{}/{}",
       reason, backend_telemetry_.register_write_float_dwords_copied,
       backend_telemetry_.register_write_float_dwords_compared,
       backend_telemetry_.register_write_float_dirty_vertex,
@@ -5175,7 +5322,9 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.register_write_fetch_dwords_copied,
       backend_telemetry_.register_write_fetch_slots_tested,
       backend_telemetry_.register_write_fetch_dwords_compared,
-      backend_telemetry_.register_write_fetch_changed_slots);
+      backend_telemetry_.register_write_fetch_changed_slots,
+      backend_telemetry_.register_write_fetch_dirty_vertex,
+      backend_telemetry_.register_write_fetch_dirty_pixel);
   XELOGI(
       "MetalTelemetry[{}]: register_ranges mem/ring/wrap/fallback={}/{}/{}/{} "
       "fast_dwords float/fetch/bool_loop/regular={}/{}/{}/{}",

@@ -271,6 +271,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     };
 
     std::array<std::array<Cbv, kCbvSlotCount>, kStageCount> cbvs = {};
+    std::array<uint32_t, kStageCount> active_cbv_masks = {};
+    std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
+        fetch_constant_dword_masks = {};
   };
 
   struct DrawDynamicState {
@@ -430,6 +433,8 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t register_write_fetch_slots_tested = 0;
     uint64_t register_write_fetch_dwords_compared = 0;
     uint64_t register_write_fetch_changed_slots = 0;
+    uint64_t register_write_fetch_dirty_vertex = 0;
+    uint64_t register_write_fetch_dirty_pixel = 0;
     uint64_t texture_fetch_constant_invalidations = 0;
     uint64_t register_range_mem_calls = 0;
     uint64_t register_range_ring_calls = 0;
@@ -482,9 +487,17 @@ class MetalCommandProcessor final : public CommandProcessor {
         bindless_stage_top_level_bytes = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
         bindless_stage_root_cbv_pointer_writes = {};
+    std::array<uint64_t, kBindlessTelemetryStageCount>
+        bindless_stage_active_cbv_mask_or = {};
     std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
                kBindlessTelemetryStageCount>
         bindless_table_miss_cbv_slots = {};
+    std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
+               kBindlessTelemetryStageCount>
+        bindless_table_miss_active_cbv_slots = {};
+    std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
+               kBindlessTelemetryStageCount>
+        bindless_table_miss_inactive_cbv_slots = {};
     uint64_t bindless_resource_serial_hits = 0;
     uint64_t bindless_resource_serial_misses = 0;
     uint64_t bindless_resource_miss_invalid = 0;
@@ -831,6 +844,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       current_bindless_cbv_gpu_addresses_ = {};
   std::array<std::array<size_t, kCbvSlotCount>, kStageCount>
       current_bindless_cbv_sizes_ = {};
+  std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
+      current_fetch_constant_dword_masks_ = {};
   bool current_bindless_shared_memory_is_uav_ = false;
   bool current_bindless_stable_resources_valid_ = false;
   bool current_bindless_stable_shared_memory_is_uav_ = false;
