@@ -2466,18 +2466,33 @@ void MetalTextureCache::ReleaseOrRetireSamplerState(
   retired_sampler_states_.push_back({sampler, current_submission});
 }
 
-MTL::Texture* MetalTextureCache::CreateTexture2D(
-    uint32_t width, uint32_t height, uint32_t array_length,
-    MTL::PixelFormat format, MTL::TextureSwizzleChannels swizzle,
-    uint32_t mip_levels) {
+MTL::Texture* MetalTextureCache::CreateTexture(
+    MTL::TextureDescriptor* descriptor) {
   MTL::Device* device = command_processor_->GetMetalDevice();
   if (!device) {
     XELOGE(
         "Metal texture cache: Failed to get Metal device from command "
         "processor");
+    descriptor->release();
     return nullptr;
   }
 
+  MTL::Texture* texture = nullptr;
+  if (texture_heap_pool_ &&
+      descriptor->storageMode() == MTL::StorageModePrivate) {
+    texture = texture_heap_pool_->CreateTexture(descriptor);
+  }
+  if (!texture) {
+    texture = device->newTexture(descriptor);
+  }
+  descriptor->release();
+  return texture;
+}
+
+MTL::Texture* MetalTextureCache::CreateTexture2D(
+    uint32_t width, uint32_t height, uint32_t array_length,
+    MTL::PixelFormat format, MTL::TextureSwizzleChannels swizzle,
+    uint32_t mip_levels) {
   // Always create 2D array textures (even with a single layer) so that the
   // Metal texture type matches the shader expectation of texture2d_array,
   // mirroring the D3D12 backend which uses TEXTURE2DARRAY SRVs for 1D/2D
@@ -2497,17 +2512,7 @@ MTL::Texture* MetalTextureCache::CreateTexture2D(
   descriptor->setStorageMode(GetCacheTextureStorageMode());
   descriptor->setSwizzle(swizzle);
 
-  MTL::Texture* texture = nullptr;
-  if (texture_heap_pool_ &&
-      descriptor->storageMode() == MTL::StorageModePrivate) {
-    texture = texture_heap_pool_->CreateTexture(descriptor);
-  }
-  if (!texture) {
-    texture = device->newTexture(descriptor);
-  }
-
-  descriptor->release();
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (!texture) {
     XELOGE(
         "Metal texture cache: Failed to create 2D array texture {}x{} (layers "
@@ -2522,14 +2527,6 @@ MTL::Texture* MetalTextureCache::CreateTexture2D(
 MTL::Texture* MetalTextureCache::CreateTexture3D(
     uint32_t width, uint32_t height, uint32_t depth, MTL::PixelFormat format,
     MTL::TextureSwizzleChannels swizzle, uint32_t mip_levels) {
-  MTL::Device* device = command_processor_->GetMetalDevice();
-  if (!device) {
-    XELOGE(
-        "Metal texture cache: Failed to get Metal device from command "
-        "processor");
-    return nullptr;
-  }
-
   depth = std::max(depth, 1u);
 
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
@@ -2545,17 +2542,7 @@ MTL::Texture* MetalTextureCache::CreateTexture3D(
   descriptor->setStorageMode(GetCacheTextureStorageMode());
   descriptor->setSwizzle(swizzle);
 
-  MTL::Texture* texture = nullptr;
-  if (texture_heap_pool_ &&
-      descriptor->storageMode() == MTL::StorageModePrivate) {
-    texture = texture_heap_pool_->CreateTexture(descriptor);
-  }
-  if (!texture) {
-    texture = device->newTexture(descriptor);
-  }
-
-  descriptor->release();
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (!texture) {
     XELOGE("Metal texture cache: Failed to create 3D texture {}x{}x{}", width,
            height, depth);
@@ -2569,14 +2556,6 @@ MTL::Texture* MetalTextureCache::CreateTextureCube(
     uint32_t width, MTL::PixelFormat format,
     MTL::TextureSwizzleChannels swizzle, uint32_t mip_levels,
     uint32_t cube_count) {
-  MTL::Device* device = command_processor_->GetMetalDevice();
-  if (!device) {
-    XELOGE(
-        "Metal texture cache: Failed to get Metal device from command "
-        "processor");
-    return nullptr;
-  }
-
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
   // Use cube for single-cube textures to match non-array cube bindings in the
   // translated MSL, and cube-array only when multiple cubes are present.
@@ -2593,17 +2572,7 @@ MTL::Texture* MetalTextureCache::CreateTextureCube(
   descriptor->setStorageMode(GetCacheTextureStorageMode());
   descriptor->setSwizzle(swizzle);
 
-  MTL::Texture* texture = nullptr;
-  if (texture_heap_pool_ &&
-      descriptor->storageMode() == MTL::StorageModePrivate) {
-    texture = texture_heap_pool_->CreateTexture(descriptor);
-  }
-  if (!texture) {
-    texture = device->newTexture(descriptor);
-  }
-
-  descriptor->release();
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (!texture) {
     XELOGE("Metal texture cache: Failed to create Cube texture {}x{}", width,
            width);
@@ -2615,12 +2584,6 @@ MTL::Texture* MetalTextureCache::CreateTextureCube(
 
 MTL::Texture* MetalTextureCache::CreateNullTexture2D() {
   SCOPE_profile_cpu_f("gpu");
-
-  MTL::Device* device = command_processor_->GetMetalDevice();
-  if (!device) {
-    XELOGE("Metal texture cache: Failed to get Metal device for null texture");
-    return nullptr;
-  }
 
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
   // Null 2D textures are created as 2D arrays with a single layer so they can
@@ -2634,9 +2597,7 @@ MTL::Texture* MetalTextureCache::CreateNullTexture2D() {
                        MTL::TextureUsagePixelFormatView);
   descriptor->setStorageMode(MTL::StorageModeShared);
 
-  MTL::Texture* texture = device->newTexture(descriptor);
-  descriptor->release();  // Immediate release following pattern
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (texture) {
     // Match D3D12 null-SRV semantics: missing textures should sample zero.
     uint32_t default_color = 0x00000000;
@@ -2652,13 +2613,6 @@ MTL::Texture* MetalTextureCache::CreateNullTexture2D() {
 MTL::Texture* MetalTextureCache::CreateNullTexture3D() {
   SCOPE_profile_cpu_f("gpu");
 
-  MTL::Device* device = command_processor_->GetMetalDevice();
-  if (!device) {
-    XELOGE(
-        "Metal texture cache: Failed to get Metal device for null 3D texture");
-    return nullptr;
-  }
-
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
   descriptor->setTextureType(MTL::TextureType3D);
   descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
@@ -2669,9 +2623,7 @@ MTL::Texture* MetalTextureCache::CreateNullTexture3D() {
                        MTL::TextureUsagePixelFormatView);
   descriptor->setStorageMode(MTL::StorageModeShared);
 
-  MTL::Texture* texture = device->newTexture(descriptor);
-  descriptor->release();  // Immediate release following pattern
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (texture) {
     // Match D3D12 null-SRV semantics: missing textures should sample zero.
     uint32_t default_color = 0x00000000;
@@ -2687,14 +2639,6 @@ MTL::Texture* MetalTextureCache::CreateNullTexture3D() {
 MTL::Texture* MetalTextureCache::CreateNullTextureCube() {
   SCOPE_profile_cpu_f("gpu");
 
-  MTL::Device* device = command_processor_->GetMetalDevice();
-  if (!device) {
-    XELOGE(
-        "Metal texture cache: Failed to get Metal device for null cube "
-        "texture");
-    return nullptr;
-  }
-
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
   // Null cube texture must match non-array cube bindings in translated MSL.
   descriptor->setTextureType(MTL::TextureTypeCube);
@@ -2707,9 +2651,7 @@ MTL::Texture* MetalTextureCache::CreateNullTextureCube() {
                        MTL::TextureUsagePixelFormatView);
   descriptor->setStorageMode(MTL::StorageModeShared);
 
-  MTL::Texture* texture = device->newTexture(descriptor);
-  descriptor->release();  // Immediate release following pattern
-
+  MTL::Texture* texture = CreateTexture(descriptor);
   if (texture) {
     // Match D3D12 null-SRV semantics: missing textures should sample zero.
     uint32_t default_color = 0x00000000;

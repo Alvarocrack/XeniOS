@@ -260,6 +260,7 @@ class MetalTextureCache : public TextureCache {
 
  private:
   // Metal texture creation helpers
+  MTL::Texture* CreateTexture(MTL::TextureDescriptor* descriptor);
   MTL::Texture* CreateTexture2D(uint32_t width, uint32_t height,
                                 uint32_t array_length, MTL::PixelFormat format,
                                 MTL::TextureSwizzleChannels swizzle,
