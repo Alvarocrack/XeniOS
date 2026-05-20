@@ -11,16 +11,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
-#include <limits>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
-#include "third_party/stb/stb_image_write.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
@@ -368,137 +365,6 @@ enum class MetalEdramDumpFormat : uint32_t {
 constexpr uint32_t kMetalEdramDumpFlagHasStencil = 1u << 0;
 constexpr uint32_t kMetalEdramDumpFlagDepthRound = 1u << 1;
 constexpr uint32_t kMetalEdramDumpFlagGammaAsLinear = 1u << 2;
-
-struct DebugColor {
-  float r;
-  float g;
-  float b;
-  float a;
-};
-
-uint32_t FloatToBits(float value) {
-  uint32_t bits = 0;
-  std::memcpy(&bits, &value, sizeof(bits));
-  return bits;
-}
-
-float BitsToFloat(uint32_t value) {
-  float out = 0.0f;
-  std::memcpy(&out, &value, sizeof(out));
-  return out;
-}
-
-float HalfToFloat(uint16_t value) {
-  uint32_t sign = (value >> 15) & 1u;
-  uint32_t exponent = (value >> 10) & 0x1Fu;
-  uint32_t mantissa = value & 0x3FFu;
-  if (exponent == 0u) {
-    if (mantissa == 0u) {
-      return sign ? -0.0f : 0.0f;
-    }
-    float base = float(mantissa) * (1.0f / 1024.0f);
-    float result = std::ldexp(base, -14);
-    return sign ? -result : result;
-  }
-  if (exponent == 31u) {
-    float inf = std::numeric_limits<float>::infinity();
-    return sign ? -inf : inf;
-  }
-  float base = 1.0f + float(mantissa) * (1.0f / 1024.0f);
-  float result = std::ldexp(base, int(exponent) - 15);
-  return sign ? -result : result;
-}
-
-uint16_t FloatToHalf(float value) {
-  uint32_t bits = FloatToBits(value);
-  uint32_t sign = (bits >> 16) & 0x8000u;
-  int exponent = int((bits >> 23) & 0xFFu) - 127 + 15;
-  uint32_t mantissa = bits & 0x7FFFFFu;
-  if (exponent <= 0) {
-    if (exponent < -10) {
-      return uint16_t(sign);
-    }
-    mantissa |= 0x800000u;
-    uint32_t shift = uint32_t(14 - exponent);
-    uint32_t half = mantissa >> shift;
-    if ((mantissa >> (shift - 1u)) & 1u) {
-      ++half;
-    }
-    return uint16_t(sign | half);
-  }
-  if (exponent >= 31) {
-    return uint16_t(sign | 0x7C00u);
-  }
-  uint32_t half = (uint32_t(exponent) << 10) | (mantissa >> 13);
-  if (mantissa & 0x1000u) {
-    ++half;
-  }
-  return uint16_t(sign | half);
-}
-
-uint32_t PackUnorm(float value, float scale) {
-  float clamped = std::min(std::max(value, 0.0f), 1.0f);
-  return uint32_t(clamped * scale + 0.5f);
-}
-
-uint32_t PackSnorm16(float value) {
-  float clamped = std::min(std::max(value, -1.0f), 1.0f);
-  float bias = clamped >= 0.0f ? 0.5f : -0.5f;
-  int packed = int(clamped * 32767.0f + bias);
-  return uint32_t(packed) & 0xFFFFu;
-}
-
-uint32_t XePreClampedFloat32To7e3(float value) {
-  uint32_t f32 = FloatToBits(value);
-  uint32_t biased_f32;
-  if (f32 < 0x3E800000u) {
-    uint32_t f32_exp = f32 >> 23u;
-    uint32_t shift = 125u - f32_exp;
-    shift = std::min(shift, 24u);
-    uint32_t mantissa = (f32 & 0x7FFFFFu) | 0x800000u;
-    biased_f32 = mantissa >> shift;
-  } else {
-    biased_f32 = f32 + 0xC2000000u;
-  }
-  uint32_t round_bit = (biased_f32 >> 16u) & 1u;
-  uint32_t f10 = biased_f32 + 0x7FFFu + round_bit;
-  return (f10 >> 16u) & 0x3FFu;
-}
-
-uint32_t XeUnclampedFloat32To7e3(float value) {
-  if (!std::isfinite(value)) {
-    value = 0.0f;
-  }
-  float clamped = std::min(std::max(value, 0.0f), 31.875f);
-  return XePreClampedFloat32To7e3(clamped);
-}
-
-float XeFloat7e3To32(uint32_t f10) {
-  f10 &= 0x3FFu;
-  if (!f10) {
-    return 0.0f;
-  }
-  uint32_t mantissa = f10 & 0x7Fu;
-  uint32_t exponent = f10 >> 7u;
-  if (exponent == 0u) {
-    uint32_t lzcnt = 0;
-    if (mantissa != 0u) {
-      lzcnt = uint32_t(__builtin_clz(mantissa)) - 24u;
-    }
-    exponent = uint32_t(int32_t(1) - int32_t(lzcnt));
-    mantissa = (mantissa << lzcnt) & 0x7Fu;
-  }
-  uint32_t f32 = ((exponent + 124u) << 23u) | (mantissa << 16u);
-  return BitsToFloat(f32);
-}
-
-uint32_t PackR8G8B8A8Unorm(const DebugColor& color) {
-  uint32_t r = PackUnorm(color.r, 255.0f);
-  uint32_t g = PackUnorm(color.g, 255.0f);
-  uint32_t b = PackUnorm(color.b, 255.0f);
-  uint32_t a = PackUnorm(color.a, 255.0f);
-  return r | (g << 8u) | (b << 16u) | (a << 24u);
-}
 
 size_t MsaaSamplesToIndex(xenos::MsaaSamples samples) {
   switch (samples) {
