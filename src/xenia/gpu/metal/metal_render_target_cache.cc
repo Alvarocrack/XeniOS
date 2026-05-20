@@ -342,6 +342,28 @@ constexpr char kDirectHostResolveEncoderLabel[] =
 constexpr uint32_t kDirectHostResolveDepthFlagHasStencil = 1u << 0;
 constexpr uint32_t kDirectHostResolveDepthFlagRoundDepth = 1u << 1;
 
+struct AttachmentLoadStoreActions {
+  MTL::LoadAction load = MTL::LoadActionLoad;
+  MTL::StoreAction store = MTL::StoreActionStore;
+};
+
+AttachmentLoadStoreActions GetRealAttachmentLoadStoreActions(
+    bool needs_initial_clear) {
+  return {needs_initial_clear ? MTL::LoadActionClear : MTL::LoadActionLoad,
+          MTL::StoreActionStore};
+}
+
+AttachmentLoadStoreActions GetTransientAttachmentLoadStoreActions() {
+  return {MTL::LoadActionDontCare, MTL::StoreActionDontCare};
+}
+
+void SetAttachmentLoadStoreActions(
+    MTL::RenderPassAttachmentDescriptor* attachment,
+    AttachmentLoadStoreActions actions) {
+  attachment->setLoadAction(actions.load);
+  attachment->setStoreAction(actions.store);
+}
+
 size_t DirectHostResolveBppIndex(bool is_64bpp) { return is_64bpp ? 1u : 0u; }
 
 size_t DirectHostResolveMsaaIndex(xenos::MsaaSamples msaa_samples) {
@@ -3420,15 +3442,14 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
 
     // Clear on first bind to avoid synchronous clears at creation.
     bool depth_needs_clear = current_depth_target_->needs_initial_clear();
+    AttachmentLoadStoreActions depth_load_store =
+        GetRealAttachmentLoadStoreActions(depth_needs_clear);
+    SetAttachmentLoadStoreActions(depth_attachment, depth_load_store);
     if (depth_needs_clear) {
-      depth_attachment->setLoadAction(MTL::LoadActionClear);
       depth_attachment->setClearDepth(GetDepthTargetClearDepth());
       current_depth_target_->SetNeedsInitialClear(false);
       needs_descriptor_refresh = true;
-    } else {
-      depth_attachment->setLoadAction(MTL::LoadActionLoad);
     }
-    depth_attachment->setStoreAction(MTL::StoreActionStore);
 
     // If the depth texture includes stencil, bind the same texture to the
     // stencil attachment too (Metal requires explicit stencil attachment
@@ -3441,13 +3462,10 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       auto* stencil_attachment =
           cached_render_pass_descriptor_->stencilAttachment();
       stencil_attachment->setTexture(current_depth_target_->draw_texture());
+      SetAttachmentLoadStoreActions(stencil_attachment, depth_load_store);
       if (depth_needs_clear) {
-        stencil_attachment->setLoadAction(MTL::LoadActionClear);
         stencil_attachment->setClearStencil(0);
-      } else {
-        stencil_attachment->setLoadAction(MTL::LoadActionLoad);
       }
-      stencil_attachment->setStoreAction(MTL::StoreActionStore);
     }
 
     has_any_render_target = true;
@@ -3478,16 +3496,15 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
 
       // Clear on first bind to avoid synchronous clears at creation.
       bool color_needs_clear = current_color_targets_[i]->needs_initial_clear();
+      AttachmentLoadStoreActions color_load_store =
+          GetRealAttachmentLoadStoreActions(color_needs_clear);
+      SetAttachmentLoadStoreActions(color_attachment, color_load_store);
       if (color_needs_clear) {
-        color_attachment->setLoadAction(MTL::LoadActionClear);
         color_attachment->setClearColor(
             MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.0));
         current_color_targets_[i]->SetNeedsInitialClear(false);
         needs_descriptor_refresh = true;
-      } else {
-        color_attachment->setLoadAction(MTL::LoadActionLoad);
       }
-      color_attachment->setStoreAction(MTL::StoreActionStore);
 
       has_any_render_target = true;
       has_any_color_target = true;
@@ -3650,8 +3667,8 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     auto* color_attachment =
         cached_render_pass_descriptor_->colorAttachments()->object(0);
     color_attachment->setTexture(dummy_color_target_->draw_texture());
-    color_attachment->setLoadAction(MTL::LoadActionDontCare);
-    color_attachment->setStoreAction(MTL::StoreActionDontCare);
+    SetAttachmentLoadStoreActions(color_attachment,
+                                  GetTransientAttachmentLoadStoreActions());
 
     has_any_render_target = true;
     if (!coverage_width && dummy_color_target_->draw_texture()) {
@@ -3686,8 +3703,8 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
 
     auto* depth_attachment = cached_render_pass_descriptor_->depthAttachment();
     depth_attachment->setTexture(fallback_depth_texture);
-    depth_attachment->setLoadAction(MTL::LoadActionDontCare);
-    depth_attachment->setStoreAction(MTL::StoreActionDontCare);
+    SetAttachmentLoadStoreActions(depth_attachment,
+                                  GetTransientAttachmentLoadStoreActions());
     fallback_depth_texture->release();
 
     has_any_render_target = true;
