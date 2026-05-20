@@ -2651,29 +2651,6 @@ void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
   pending_draw_pass_transfer_mask_ = 0;
 }
 
-MetalRenderTargetCache::TransferShaderKey
-MetalRenderTargetCache::GetColorToColorTransferShaderKey(
-    RenderTargetKey source_key, RenderTargetKey dest_key) const {
-  TransferShaderKey shader_key = {};
-  shader_key.source_msaa_samples = source_key.msaa_samples;
-  shader_key.dest_msaa_samples = dest_key.msaa_samples;
-  shader_key.source_resource_format = source_key.resource_format;
-  shader_key.dest_resource_format = dest_key.resource_format;
-  shader_key.mode = TransferMode::kColorToColor;
-  shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
-  shader_key.host_depth_source_is_copy = 0;
-
-  bool transfer_use_sample_id =
-      dest_key.msaa_samples != xenos::MsaaSamples::k1X &&
-      ::cvars::metal_transfer_msaa_sample_id;
-  if (transfer_use_sample_id &&
-      source_key.msaa_samples == xenos::MsaaSamples::k1X) {
-    transfer_use_sample_id = false;
-  }
-  shader_key.dest_sample_id_from_sample = transfer_use_sample_id ? 1u : 0u;
-  return shader_key;
-}
-
 MetalRenderTargetCache::DrawPassTransferRejectionReason
 MetalRenderTargetCache::GetDrawPassTransferRejectionReason(
     uint32_t render_target_index, RenderTarget* const* render_targets,

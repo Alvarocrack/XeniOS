@@ -523,11 +523,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     kSourceFormatMismatch,
     kSourceActiveInDrawPass,
     kInvalidRectangles,
-    kCount,
   };
-
-  static constexpr size_t kDrawPassTransferRejectionReasonCount =
-      size_t(DrawPassTransferRejectionReason::kCount);
 
   std::unordered_map<TransferPipelineKey, MTL::RenderPipelineState*,
                      TransferPipelineKey::Hasher>
@@ -609,8 +605,6 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       xenos::ColorRenderTargetFormat format, bool* is_integer_out) const;
   MTL::PixelFormat GetDepthPixelFormat(
       xenos::DepthRenderTargetFormat format) const;
-  TransferShaderKey GetColorToColorTransferShaderKey(
-      RenderTargetKey source_key, RenderTargetKey dest_key) const;
   bool GetActiveTransferAttachmentFormats(
       MTL::RenderPassDescriptor* pass_descriptor,
       TransferColorAttachmentFormats& color_attachment_formats_out,
