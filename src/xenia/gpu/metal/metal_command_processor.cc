@@ -3805,9 +3805,9 @@ bool MetalCommandProcessor::IssueCopy() {
   }
 
   MTL::CommandBuffer* copy_command_buffer = nullptr;
-  if (resolve_plan.needs_render_encoder_boundary) {
-    // End any in-flight rendering only when resolve work needs render target
-    // contents or a transfer pass.
+  if (resolve_plan.needs_render_encoder_end) {
+    // End only the render encoder here. The resolve/transfer work may still
+    // reuse the current Metal command buffer and submission ordering.
     EndRenderEncoder();
     copy_command_buffer = EnsureCommandBuffer();
     if (!copy_command_buffer) {

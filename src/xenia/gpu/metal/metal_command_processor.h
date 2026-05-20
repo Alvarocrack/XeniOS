@@ -94,16 +94,17 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool HasActiveSubmission() const {
     return current_command_buffer_ != nullptr;
   }
-  // Returns true when upload/transfer work can be encoded onto the current
-  // submission's command buffer without a standalone detour.  This is the
-  // case when a command buffer exists but no render encoder is open.
+  // Returns true when upload/transfer work can join the current submission's
+  // command buffer. This is the case when a command buffer exists but no render
+  // encoder is open.
   bool CanJoinActiveSubmissionForTransfer() const {
     return current_command_buffer_ != nullptr &&
            current_render_encoder_ == nullptr;
   }
   // Returns a command buffer suitable for transfer (blit/compute) work.
   // If a render encoder is active it is ended first; if no command buffer
-  // exists one is created.  Returns nullptr on failure.
+  // exists one is created. This is an encoder-lifetime break, not necessarily
+  // a command-buffer submission break. Returns nullptr on failure.
   MTL::CommandBuffer* RequestTransferCommandBuffer();
 
   // Standalone (detached) transfer command-buffer helpers.

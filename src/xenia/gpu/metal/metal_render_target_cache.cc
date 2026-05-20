@@ -5166,10 +5166,14 @@ bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
   plan_out.needs_copy_export = resolve_info.copy_dest_extent_length != 0;
   plan_out.needs_resolve_clear =
       resolve_info.IsClearingDepth() || resolve_info.IsClearingColor();
-  plan_out.can_defer_clear_to_next_pass =
-      !plan_out.needs_copy_export && plan_out.needs_resolve_clear &&
-      GetPath() == Path::kHostRenderTargets;
-  plan_out.needs_render_encoder_boundary =
+  // TODO (xenios-jp): Add a queued resolve-clear system for clear-only resolves
+  // that can be materialized before the next observer. Full clears could become
+  // descriptor-time loadActionClear in the next render pass, avoiding an
+  // immediate render encoder end on Apple TBDR GPUs. This needs a real
+  // ownership transaction because PrepareHostRenderTargetsResolveClear mutates
+  // tile ownership, and every later draw, transfer, export, readback, or
+  // ownership query must observe the cleared contents.
+  plan_out.needs_render_encoder_end =
       plan_out.needs_copy_export || plan_out.needs_resolve_clear;
   if (plan_out.needs_copy_export) {
     plan_out.written_address = resolve_info.copy_dest_extent_start;
@@ -5482,8 +5486,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
   if (use_active_render_encoder) {
     cmd = command_processor_.GetCurrentCommandBuffer();
   } else if (!cmd) {
-    // RequestTransferCommandBuffer ends any active render encoder and
-    // ensures a command buffer exists in one step.
+    // RequestTransferCommandBuffer ends any active render encoder and ensures
+    // transfer work has a command buffer. It does not require a standalone
+    // command-buffer submission if the current one can be reused.
     cmd = command_processor_.RequestTransferCommandBuffer();
   } else {
     // An externally-provided command buffer still requires the render

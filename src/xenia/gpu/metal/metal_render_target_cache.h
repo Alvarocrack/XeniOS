@@ -209,8 +209,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     bool noop = false;
     bool needs_copy_export = false;
     bool needs_resolve_clear = false;
-    bool can_defer_clear_to_next_pass = false;
-    bool needs_render_encoder_boundary = false;
+    bool needs_render_encoder_end = false;
     uint32_t written_address = 0;
     uint32_t written_length = 0;
   };
@@ -305,8 +304,6 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
 
   // Host depth store compute shaders (1x/2x/4x MSAA).
   MTL::ComputePipelineState* host_depth_store_pipelines_[3] = {};
-
-  // Transfer shaders (host RT ownership transfers) - modeled after D3D12.
 
   // TransferMode list mirrors D3D12RenderTargetCache::TransferMode so logs and
   // structure stay in sync, even if many modes are not implemented yet.
@@ -634,8 +631,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   bool InitializeEdramComputeShaders();
   void ShutdownEdramComputeShaders();
 
-  // Transfer pipeline setup (host RT ownership transfers) - Metal analogue of
-  // D3D12RenderTargetCache::GetOrCreateTransferPipelines.
+  // Transfer pipeline setup for host RT ownership transfers. The shader keys
+  // intentionally mirror D3D12RenderTargetCache transfer modes.
   MTL::RenderPipelineState* GetOrCreateTransferPipelines(
       const TransferShaderKey& key, MTL::PixelFormat dest_format,
       bool dest_is_uint, bool native_stencil_output,
