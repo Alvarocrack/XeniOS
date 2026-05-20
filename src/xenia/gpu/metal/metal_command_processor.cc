@@ -536,12 +536,6 @@ const char* BindlessCbvSlotName(size_t stage, size_t slot) {
     case 4:
       slot_name = "descriptor_indices";
       break;
-    case 5:
-      slot_name = "spare5";
-      break;
-    case 6:
-      slot_name = "spare6";
-      break;
     default:
       slot_name = "invalid";
       break;
@@ -611,9 +605,6 @@ MetalCommandProcessor::~MetalCommandProcessor() {
   current_bindless_top_level_buffer_ = nullptr;
   current_bindless_top_level_offset_ = 0;
   current_bindless_top_level_gpu_address_ = 0;
-  current_bindless_cbv_buffer_ = nullptr;
-  current_bindless_cbv_offset_ = 0;
-  current_bindless_cbv_gpu_address_ = 0;
   current_bindless_stable_resources_valid_ = false;
   current_bindless_stable_shared_memory_is_uav_ = false;
   current_bindless_stable_shared_memory_usage_bits_ = 0;
@@ -3232,11 +3223,6 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     cbv.gpu_address = binding.gpu_address;
     cbv.size = binding.size;
   };
-  constexpr size_t kCbvSlotSystem = 0;
-  constexpr size_t kCbvSlotFloat = 1;
-  constexpr size_t kCbvSlotBoolLoop = 2;
-  constexpr size_t kCbvSlotFetch = 3;
-  constexpr size_t kCbvSlotDescriptorIndices = 4;
   set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotSystem],
                   cbuffer_binding_system_);
   set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFloat],
@@ -3309,9 +3295,6 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   constexpr size_t kStageVertex = 0;
   constexpr size_t kStagePixel = 1;
   constexpr size_t kBindlessTableCount = kStageCount;
-  constexpr size_t kBindlessCBVTableBytes = kBindlessTableCount *
-                                            kCbvHeapSlotsPerTable *
-                                            sizeof(IRDescriptorTableEntry);
   constexpr size_t kBindlessTopLevelTableBytes =
       kBindlessTableCount * kTopLevelABBytesPerTable;
 
@@ -3320,7 +3303,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   bool bindless_cbv_mismatch = false;
   for (size_t stage = 0; stage < kStageCount && current_bindless_table_valid_;
        ++stage) {
-    for (size_t cbv = 0; cbv < kCbvHeapSlotsPerTable; ++cbv) {
+    for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
       const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
       if (current_bindless_cbv_gpu_addresses_[stage][cbv] !=
               uniform_cbv.gpu_address ||
@@ -3362,16 +3345,8 @@ bool MetalCommandProcessor::PopulateBindlessTables(
 
   if (!reuse_bindless_table) {
     ++backend_telemetry_.bindless_table_allocations;
-    backend_telemetry_.bindless_table_bytes +=
-        kBindlessCBVTableBytes + kBindlessTopLevelTableBytes;
+    backend_telemetry_.bindless_table_bytes += kBindlessTopLevelTableBytes;
     uint64_t submission = submission_current_ ? submission_current_ : 1;
-    MTL::Buffer* cbv_table_buffer = nullptr;
-    size_t cbv_table_offset = 0;
-    uint64_t cbv_table_gpu_address = 0;
-    auto* cbv_entries_all = reinterpret_cast<IRDescriptorTableEntry*>(
-        constant_buffer_pool_->Request(
-            submission, kBindlessCBVTableBytes, kCbvSizeBytes,
-            &cbv_table_buffer, cbv_table_offset, cbv_table_gpu_address));
     MTL::Buffer* top_level_buffer = nullptr;
     size_t top_level_offset = 0;
     uint64_t top_level_gpu_address = 0;
@@ -3379,7 +3354,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
         reinterpret_cast<uint64_t*>(constant_buffer_pool_->Request(
             submission, kBindlessTopLevelTableBytes, kTopLevelABBytesPerTable,
             &top_level_buffer, top_level_offset, top_level_gpu_address));
-    if (!cbv_entries_all || !top_level_entries_all) {
+    if (!top_level_entries_all) {
       XELOGE("IssueDraw: bindless table allocation failed");
       return false;
     }
@@ -3401,9 +3376,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     uint64_t null_uav_gpu =
         system_view_gpu + kSystemViewTableUAVNullStart * kDescriptorEntrySize;
 
-    auto write_top_level_and_cbvs_bindless =
-        [&](size_t stage_index, IRDescriptorTableEntry* cbv_entries,
-            const std::array<UniformBufferInfo::Cbv, kCbvHeapSlotsPerTable>&
+    auto write_top_level_root_arguments =
+        [&](size_t stage_index,
+            const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>&
                 uniform_cbvs) {
           auto* top_level_ptrs = reinterpret_cast<uint64_t*>(
               reinterpret_cast<uint8_t*>(top_level_entries_all) +
@@ -3421,45 +3396,31 @@ bool MetalCommandProcessor::PopulateBindlessTables(
           top_level_ptrs[kTopLevelABSlotUAVSpace3] = null_uav_gpu;
           top_level_ptrs[kTopLevelABSlotSamplerSpace0] = sampler_heap_gpu;
 
-          for (size_t cbv = 0; cbv < kCbvHeapSlotsPerTable; ++cbv) {
+          auto write_root_cbv = [&](TopLevelABSlot slot,
+                                    const UniformBufferInfo::Cbv& uniform_cbv) {
+            ++backend_telemetry_.bindless_root_cbv_pointer_writes;
+            top_level_ptrs[slot] =
+                uniform_cbv.gpu_address ? uniform_cbv.gpu_address
+                                        : null_buffer_->gpuAddress();
+          };
+          for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
             const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
-            ++backend_telemetry_.bindless_cbv_entry_writes;
-            if (uniform_cbv.gpu_address) {
-              IRDescriptorTableSetBuffer(
-                  &cbv_entries[cbv], uniform_cbv.gpu_address,
-                  uniform_cbv.size ? uniform_cbv.size : kCbvSizeBytes);
-            } else {
-              IRDescriptorTableSetBuffer(
-                  &cbv_entries[cbv], null_buffer_->gpuAddress(), kCbvSizeBytes);
-            }
+            write_root_cbv(static_cast<TopLevelABSlot>(
+                               kTopLevelABSlotCBVSystem + cbv),
+                           uniform_cbv);
           }
-
-          uint64_t cbv_table_gpu_base =
-              cbv_table_gpu_address +
-              stage_index * kCbvHeapSlotsPerTable * kDescriptorEntrySize;
-          top_level_ptrs[kTopLevelABSlotCBVSpace0] = cbv_table_gpu_base;
-          top_level_ptrs[kTopLevelABSlotCBVSpace1] = cbv_table_gpu_base;
-          top_level_ptrs[kTopLevelABSlotCBVSpace2] = cbv_table_gpu_base;
-          top_level_ptrs[kTopLevelABSlotCBVSpace3] = cbv_table_gpu_base;
         };
 
-    write_top_level_and_cbvs_bindless(
-        kStageVertex, cbv_entries_all + kStageVertex * kCbvHeapSlotsPerTable,
-        uniforms.cbvs[kStageVertex]);
-    write_top_level_and_cbvs_bindless(
-        kStagePixel, cbv_entries_all + kStagePixel * kCbvHeapSlotsPerTable,
-        uniforms.cbvs[kStagePixel]);
+    write_top_level_root_arguments(kStageVertex, uniforms.cbvs[kStageVertex]);
+    write_top_level_root_arguments(kStagePixel, uniforms.cbvs[kStagePixel]);
 
     current_bindless_table_valid_ = true;
     current_bindless_top_level_buffer_ = top_level_buffer;
     current_bindless_top_level_offset_ =
         static_cast<NS::UInteger>(top_level_offset);
     current_bindless_top_level_gpu_address_ = top_level_gpu_address;
-    current_bindless_cbv_buffer_ = cbv_table_buffer;
-    current_bindless_cbv_offset_ = static_cast<NS::UInteger>(cbv_table_offset);
-    current_bindless_cbv_gpu_address_ = cbv_table_gpu_address;
     for (size_t stage = 0; stage < kStageCount; ++stage) {
-      for (size_t cbv = 0; cbv < kCbvHeapSlotsPerTable; ++cbv) {
+      for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         current_bindless_cbv_gpu_addresses_[stage][cbv] =
             uniforms.cbvs[stage][cbv].gpu_address;
         current_bindless_cbv_sizes_[stage][cbv] =
@@ -3564,17 +3525,14 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       current_bindless_table_serial_) {
     UseRenderEncoderResource(current_bindless_top_level_buffer_,
                              MTL::ResourceUsageRead);
-    UseRenderEncoderResource(current_bindless_cbv_buffer_,
-                             MTL::ResourceUsageRead);
-    std::array<MTL::Buffer*, kStageCount * kCbvHeapSlotsPerTable>
+    std::array<MTL::Buffer*, kStageCount * kCbvSlotCount>
         uniform_buffers_for_encoder;
     uint32_t uniform_buffer_count = 0;
     auto track_uniform_buffer_usage = [&](MTL::Buffer* uniform_buffer) {
       if (!uniform_buffer) {
         return;
       }
-      if (uniform_buffer == current_bindless_top_level_buffer_ ||
-          uniform_buffer == current_bindless_cbv_buffer_) {
+      if (uniform_buffer == current_bindless_top_level_buffer_) {
         return;
       }
       for (uint32_t i = 0; i < uniform_buffer_count; ++i) {
@@ -3586,7 +3544,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       uniform_buffers_for_encoder[uniform_buffer_count++] = uniform_buffer;
     };
     for (size_t stage = 0; stage < kStageCount; ++stage) {
-      for (size_t cbv = 0; cbv < kCbvHeapSlotsPerTable; ++cbv) {
+      for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         track_uniform_buffer_usage(uniforms.cbvs[stage][cbv].buffer);
       }
     }
@@ -4809,7 +4767,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "MetalTelemetry[{}]: bindless calls={} reuse hit/miss={}/{} "
       "miss invalid/cbv/smem_uav/mesh={}/{}/{}/{} resource "
       "serial hit/miss={}/{} stable_miss invalid/smem_uav/usage={}/{}/{} "
-      "allocations/bytes={}/{} cbv_entry_writes={} cbv_miss_slots={{ {} }} "
+      "allocations/bytes={}/{} root_cbv_ptr_writes={} "
+      "cbv_miss_slots={{ {} }} "
       "tracked textures/uniform_buffers={}/{} "
       "useResource calls/redundant/driver={}/{}/{} useHeap "
       "calls/redundant/driver={}/{}/{}",
@@ -4827,7 +4786,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.bindless_resource_miss_usage,
       backend_telemetry_.bindless_table_allocations,
       backend_telemetry_.bindless_table_bytes,
-      backend_telemetry_.bindless_cbv_entry_writes,
+      backend_telemetry_.bindless_root_cbv_pointer_writes,
       bindless_cbv_slot_misses,
       backend_telemetry_.bindless_resource_textures_tracked,
       backend_telemetry_.bindless_resource_uniform_buffers_tracked,

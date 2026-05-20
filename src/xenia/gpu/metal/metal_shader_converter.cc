@@ -99,97 +99,92 @@ void* MetalShaderConverter::CreateXbox360RootSignature(
     }
   }
 
-  // Create descriptor ranges for Xbox 360 shader resources
-  // This matches the layout in xbox360_rootsig_helper.h
+  // Create root parameters for Xbox 360 shader resources. Descriptor tables
+  // keep the heap-backed texture/UAV/sampler resources, while shader constants
+  // use MSC root CBVs matching the D3D12 bindless root-signature shape.
   IRDescriptorRange1 ranges[20] = {};
-  int rangeIdx = 0;
+  IRRootDescriptorTable1 tables[20] = {};
+  IRRootParameter1 params[20] = {};
+  int range_count = 0;
+  int table_count = 0;
+  int param_count = 0;
 
-  // SRVs in spaces 0-3
-  for (int space = 0; space < 4; space++) {
-    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSRV;
-    ranges[rangeIdx].NumDescriptors = bindless_resources_used
-                                          ? UINT32_MAX
-                                          : 1025;  // Match kResourceHeapSlots.
-    ranges[rangeIdx].BaseShaderRegister = 0;
-    ranges[rangeIdx].RegisterSpace = space;
-    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-    rangeIdx++;
+  auto append_descriptor_table = [&](IRDescriptorRangeType type,
+                                     uint32_t descriptor_count,
+                                     uint32_t base_shader_register,
+                                     uint32_t register_space) {
+    IRDescriptorRange1& range = ranges[range_count++];
+    range.RangeType = type;
+    range.NumDescriptors = descriptor_count;
+    range.BaseShaderRegister = base_shader_register;
+    range.RegisterSpace = register_space;
+    range.Flags = IRDescriptorRangeFlagNone;
+    range.OffsetInDescriptorsFromTableStart = 0;
+
+    IRRootDescriptorTable1& table = tables[table_count++];
+    table.NumDescriptorRanges = 1;
+    table.pDescriptorRanges = &range;
+
+    IRRootParameter1& param = params[param_count++];
+    param.ParameterType = IRRootParameterTypeDescriptorTable;
+    param.DescriptorTable = table;
+    param.ShaderVisibility = visibility;
+  };
+
+  auto append_root_cbv = [&](uint32_t shader_register) {
+    IRRootParameter1& param = params[param_count++];
+    param.ParameterType = IRRootParameterTypeCBV;
+    param.Descriptor.ShaderRegister = shader_register;
+    param.Descriptor.RegisterSpace = 0;
+    param.Descriptor.Flags = IRRootDescriptorFlagNone;
+    param.ShaderVisibility = visibility;
+  };
+
+  const uint32_t resource_descriptor_count =
+      bindless_resources_used ? UINT32_MAX : 1025;
+  const uint32_t sampler_descriptor_count =
+      bindless_resources_used ? UINT32_MAX : 257;
+
+  // SRVs in spaces 0-3.
+  for (uint32_t space = 0; space < 4; ++space) {
+    append_descriptor_table(IRDescriptorRangeTypeSRV,
+                            resource_descriptor_count, 0, space);
   }
 
-  // SRV in space 10 for hull shaders
-  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSRV;
-  ranges[rangeIdx].NumDescriptors = bindless_resources_used ? UINT32_MAX : 1025;
-  ranges[rangeIdx].BaseShaderRegister = 0;
-  ranges[rangeIdx].RegisterSpace = 10;
-  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-  rangeIdx++;
+  // SRV in space 10 for hull shaders.
+  append_descriptor_table(IRDescriptorRangeTypeSRV, resource_descriptor_count,
+                          0, 10);
 
-  // UAVs in spaces 0-3
-  for (int space = 0; space < 4; space++) {
-    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeUAV;
-    ranges[rangeIdx].NumDescriptors =
-        bindless_resources_used ? UINT32_MAX : 1025;
-    ranges[rangeIdx].BaseShaderRegister = 0;
-    ranges[rangeIdx].RegisterSpace = space;
-    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-    rangeIdx++;
+  // UAVs in spaces 0-3.
+  for (uint32_t space = 0; space < 4; ++space) {
+    append_descriptor_table(IRDescriptorRangeTypeUAV,
+                            resource_descriptor_count, 0, space);
   }
 
-  // Samplers in space 0
-  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSampler;
-  ranges[rangeIdx].NumDescriptors = bindless_resources_used ? UINT32_MAX : 257;
-  ranges[rangeIdx].BaseShaderRegister = 0;
-  ranges[rangeIdx].RegisterSpace = 0;
-  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-  rangeIdx++;
+  // Samplers in space 0.
+  append_descriptor_table(IRDescriptorRangeTypeSampler, sampler_descriptor_count,
+                          0, 0);
 
-  // CBVs in spaces 0-3
-  // Xenia uses 5 CBVs (b0-b4) in space 0:
+  // Xenia uses five shader-constant CBVs in space 0:
   //   b0 = system constants
   //   b1 = float constants
   //   b2 = bool/loop constants
   //   b3 = fetch constants
-  //   b4 = descriptor indices (bindless)
-  // We limit to 5 descriptors to match our heap allocation
-  for (int space = 0; space < 4; space++) {
-    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeCBV;
-    ranges[rangeIdx].NumDescriptors =
-        (space == 0) ? 5 : 1;  // Only space 0 has multiple CBVs
-    ranges[rangeIdx].BaseShaderRegister = 0;
-    ranges[rangeIdx].RegisterSpace = space;
-    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-    rangeIdx++;
+  //   b4 = descriptor indices
+  for (uint32_t shader_register = 0; shader_register < 5;
+       ++shader_register) {
+    append_root_cbv(shader_register);
   }
 
-  // Function-constant CBV space for MSC.
-  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeCBV;
-  ranges[rangeIdx].NumDescriptors = 1;
-  ranges[rangeIdx].BaseShaderRegister = 0;
-  ranges[rangeIdx].RegisterSpace = kFunctionConstantRegisterSpace;
-  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
-  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
-  rangeIdx++;
-
-  // Create descriptor tables and parameters
-  IRRootDescriptorTable1 tables[20] = {};
-  IRRootParameter1 params[20] = {};
-
-  for (int i = 0; i < rangeIdx; i++) {
-    tables[i].NumDescriptorRanges = 1;
-    tables[i].pDescriptorRanges = &ranges[i];
-    params[i].ParameterType = IRRootParameterTypeDescriptorTable;
-    params[i].DescriptorTable = tables[i];
-    params[i].ShaderVisibility = visibility;
-  }
+  // Function-constant CBV space for MSC. MSC documentation requires it to be
+  // declared when function constants are enabled, but the converter skips it
+  // when laying out the top-level argument buffer.
+  append_descriptor_table(IRDescriptorRangeTypeCBV, 1, 0,
+                          kFunctionConstantRegisterSpace);
 
   // Create root signature descriptor
   IRRootSignatureDescriptor1 desc = {};
-  desc.NumParameters = rangeIdx;
+  desc.NumParameters = param_count;
   desc.pParameters = params;
   desc.NumStaticSamplers = 0;
   desc.pStaticSamplers = nullptr;

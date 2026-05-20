@@ -249,6 +249,16 @@ class MetalCommandProcessor final : public CommandProcessor {
   void WriteFetchConstantsFromMem(uint32_t start_index, uint32_t* base,
                                   uint32_t num_registers);
 
+  static constexpr size_t kStageCount = 2;  // Vertex + pixel.
+  static constexpr size_t kCbvSlotCount = 5;
+  enum CbvSlot : size_t {
+    kCbvSlotSystem,
+    kCbvSlotFloat,
+    kCbvSlotBoolLoop,
+    kCbvSlotFetch,
+    kCbvSlotDescriptorIndices,
+  };
+
   // Per-draw uniform buffer coordinates passed between IssueDraw sub-methods.
   struct UniformBufferInfo {
     struct Cbv {
@@ -258,7 +268,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       size_t size = 0;
     };
 
-    std::array<std::array<Cbv, 7>, 2> cbvs = {};
+    std::array<std::array<Cbv, kCbvSlotCount>, kStageCount> cbvs = {};
   };
 
   struct DrawDynamicState {
@@ -302,9 +312,8 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   void ApplyDrawDynamicState(const DrawDynamicState& dynamic_state);
 
-  // Host draw path — build the per-draw bindless descriptor tables (top-level
-  // argument buffer, CBV table) and bind them plus the heap buffers to the
-  // render encoder.
+  // Host draw path — build the per-draw top-level argument buffers and bind
+  // them plus the stable descriptor heap buffers to the render encoder.
   bool PopulateBindlessTables(MetalShader* metal_vertex_shader,
                               MetalShader* metal_pixel_shader,
                               bool shared_memory_is_uav,
@@ -354,7 +363,7 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   struct BackendTelemetryStats {
     static constexpr size_t kBindlessTelemetryStageCount = 2;
-    static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 7;
+    static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 5;
 
     uint64_t swaps = 0;
     uint64_t draw_calls = 0;
@@ -445,7 +454,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t bindless_table_miss_mesh_stages = 0;
     uint64_t bindless_table_allocations = 0;
     uint64_t bindless_table_bytes = 0;
-    uint64_t bindless_cbv_entry_writes = 0;
+    uint64_t bindless_root_cbv_pointer_writes = 0;
     std::array<std::array<uint64_t, kBindlessTelemetryCbvSlotsPerStage>,
                kBindlessTelemetryStageCount>
         bindless_table_miss_cbv_slots = {};
@@ -520,14 +529,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ApplyRasterizerState(bool primitive_polygonal);
 
   // Constants for the MSC path.
-  static constexpr size_t kStageCount = 2;  // Vertex + pixel.
   static constexpr size_t kNullBufferSize = 4096;
   static constexpr size_t kCbvSizeBytes = 4096;
 
   // Constants for MSC descriptor heap sizes.
   static constexpr size_t kResourceHeapSlotsPerTable = 1025 + 2;
   static constexpr size_t kSamplerHeapSlotsPerTable = 257 + 2;
-  static constexpr size_t kCbvHeapSlotsPerTable = 5 + 2;
   static constexpr size_t kTopLevelABSlotsPerTable = 32;
   static constexpr size_t kTopLevelABBytesPerTable =
       kTopLevelABSlotsPerTable * sizeof(uint64_t);
@@ -545,10 +552,11 @@ class MetalCommandProcessor final : public CommandProcessor {
     kTopLevelABSlotUAVSpace2,
     kTopLevelABSlotUAVSpace3,
     kTopLevelABSlotSamplerSpace0,
-    kTopLevelABSlotCBVSpace0,
-    kTopLevelABSlotCBVSpace1,
-    kTopLevelABSlotCBVSpace2,
-    kTopLevelABSlotCBVSpace3,
+    kTopLevelABSlotCBVSystem,
+    kTopLevelABSlotCBVFloat,
+    kTopLevelABSlotCBVBoolLoop,
+    kTopLevelABSlotCBVFetch,
+    kTopLevelABSlotCBVDescriptorIndices,
   };
 
   // System constants population (mirrors D3D12 implementation)
@@ -756,12 +764,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   MTL::Buffer* current_bindless_top_level_buffer_ = nullptr;
   NS::UInteger current_bindless_top_level_offset_ = 0;
   uint64_t current_bindless_top_level_gpu_address_ = 0;
-  MTL::Buffer* current_bindless_cbv_buffer_ = nullptr;
-  NS::UInteger current_bindless_cbv_offset_ = 0;
-  uint64_t current_bindless_cbv_gpu_address_ = 0;
-  std::array<std::array<uint64_t, 7>, 2> current_bindless_cbv_gpu_addresses_ =
-      {};
-  std::array<std::array<size_t, 7>, 2> current_bindless_cbv_sizes_ = {};
+  std::array<std::array<uint64_t, kCbvSlotCount>, kStageCount>
+      current_bindless_cbv_gpu_addresses_ = {};
+  std::array<std::array<size_t, kCbvSlotCount>, kStageCount>
+      current_bindless_cbv_sizes_ = {};
   bool current_bindless_shared_memory_is_uav_ = false;
   bool current_bindless_uses_mesh_stages_ = false;
   bool current_bindless_stable_resources_valid_ = false;
