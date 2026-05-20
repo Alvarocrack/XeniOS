@@ -3476,9 +3476,123 @@ MetalCommandProcessor::BuildStageRootArgumentKey(
   return key;
 }
 
+uint64_t MetalCommandProcessor::HashStageRootArgumentKey(
+    const StageRootArgumentKey& key, size_t stage_index) const {
+  uint64_t pointers_hash = XXH3_64bits(
+      key.pointers.data(), key.pointers.size() * sizeof(key.pointers[0]));
+  uint64_t sizes_hash = XXH3_64bits(key.cbv_sizes.data(),
+                                    key.cbv_sizes.size() *
+                                        sizeof(key.cbv_sizes[0]));
+  return pointers_hash ^ xe::rotate_left(sizes_hash, 1) ^
+         xe::rotate_left(static_cast<uint64_t>(stage_index), 33);
+}
+
 void MetalCommandProcessor::WriteStageRootArgumentTable(
     uint64_t* top_level_ptrs, const StageRootArgumentKey& key) const {
   std::memcpy(top_level_ptrs, key.pointers.data(), kTopLevelABBytesPerTable);
+}
+
+void MetalCommandProcessor::ResetStageRootArgumentCacheForSubmission(
+    uint64_t submission) {
+  if (stage_root_argument_cache_submission_ == submission) {
+    return;
+  }
+  for (StageRootArgumentCacheSlot& slot : stage_root_argument_cache_) {
+    slot.entries.clear();
+    slot.index.clear();
+  }
+  stage_root_argument_cache_submission_ = submission;
+}
+
+bool MetalCommandProcessor::AllocateStageRootArgument(
+    size_t stage_index, const StageRootArgumentKey& key,
+    StageRootArgumentAllocation& allocation_out) {
+  const uint64_t submission = submission_current_ ? submission_current_ : 1;
+  MTL::Buffer* top_level_buffer = nullptr;
+  size_t top_level_offset = 0;
+  uint64_t top_level_gpu_address = 0;
+  auto* top_level_entries = reinterpret_cast<uint64_t*>(
+      constant_buffer_pool_->Request(submission, kTopLevelABBytesPerTable,
+                                     kTopLevelABBytesPerTable,
+                                     &top_level_buffer, top_level_offset,
+                                     top_level_gpu_address));
+  if (!top_level_entries) {
+    XELOGE("IssueDraw: bindless table allocation failed");
+    return false;
+  }
+
+  WriteStageRootArgumentTable(top_level_entries, key);
+  ++backend_telemetry_.bindless_table_allocations;
+  backend_telemetry_.bindless_table_bytes += kTopLevelABBytesPerTable;
+  if (stage_index < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+    ++backend_telemetry_.bindless_stage_top_level_allocations[stage_index];
+    backend_telemetry_.bindless_stage_top_level_bytes[stage_index] +=
+        kTopLevelABBytesPerTable;
+    backend_telemetry_.bindless_stage_root_cbv_pointer_writes[stage_index] +=
+        kCbvSlotCount;
+  }
+  backend_telemetry_.bindless_root_cbv_pointer_writes += kCbvSlotCount;
+
+  allocation_out = {top_level_buffer,
+                    static_cast<NS::UInteger>(top_level_offset),
+                    top_level_gpu_address,
+                    key,
+                    true};
+  return true;
+}
+
+bool MetalCommandProcessor::GetOrCreateStageRootArgument(
+    size_t stage_index, const StageRootArgumentKey& key,
+    StageRootArgumentAllocation& allocation_out) {
+  const uint64_t submission = submission_current_ ? submission_current_ : 1;
+  ResetStageRootArgumentCacheForSubmission(submission);
+
+  assert_true(stage_index < stage_root_argument_cache_.size());
+  if (stage_index >= stage_root_argument_cache_.size()) {
+    return AllocateStageRootArgument(stage_index, key, allocation_out);
+  }
+
+  auto increment_stage_stat = [&](auto& counters) {
+    if (stage_index < BackendTelemetryStats::kBindlessTelemetryStageCount) {
+      ++counters[stage_index];
+    }
+  };
+  StageRootArgumentCacheSlot& cache_slot =
+      stage_root_argument_cache_[stage_index];
+  const uint64_t hash = HashStageRootArgumentKey(key, stage_index);
+  auto range = cache_slot.index.equal_range(hash);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second >= cache_slot.entries.size()) {
+      continue;
+    }
+    const StageRootArgumentCacheEntry& entry = cache_slot.entries[it->second];
+    if (entry.key != key) {
+      continue;
+    }
+    allocation_out = entry.allocation;
+    increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_hits);
+    return true;
+  }
+
+  increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_misses);
+  if (!AllocateStageRootArgument(stage_index, key, allocation_out)) {
+    return false;
+  }
+
+  if (cache_slot.entries.size() >=
+      kStageRootArgumentCacheEntryLimitPerStage) {
+    increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_bypasses);
+    return true;
+  }
+
+  StageRootArgumentCacheEntry entry;
+  entry.key = key;
+  entry.allocation = allocation_out;
+  const size_t entry_index = cache_slot.entries.size();
+  cache_slot.entries.push_back(entry);
+  cache_slot.index.emplace(hash, entry_index);
+  increment_stage_stat(backend_telemetry_.bindless_stage_root_cache_stores);
+  return true;
 }
 
 bool MetalCommandProcessor::PopulateBindlessTables(
@@ -3489,9 +3603,6 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   ++backend_telemetry_.bindless_populate_calls;
   constexpr size_t kStageVertex = 0;
   constexpr size_t kStagePixel = 1;
-  constexpr size_t kBindlessTableCount = kStageCount;
-  constexpr size_t kBindlessTopLevelTableBytes =
-      kBindlessTableCount * kTopLevelABBytesPerTable;
 
   bool bindless_cbvs_match = current_bindless_table_valid_;
   bool bindless_table_invalid = !current_bindless_table_valid_;
@@ -3549,57 +3660,15 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   }
 
   if (!reuse_bindless_table) {
-    ++backend_telemetry_.bindless_table_allocations;
-    backend_telemetry_.bindless_table_bytes += kBindlessTopLevelTableBytes;
-    uint64_t submission = submission_current_ ? submission_current_ : 1;
-    MTL::Buffer* top_level_buffer = nullptr;
-    size_t top_level_offset = 0;
-    uint64_t top_level_gpu_address = 0;
-    auto* top_level_entries_all =
-        reinterpret_cast<uint64_t*>(constant_buffer_pool_->Request(
-            submission, kBindlessTopLevelTableBytes, kTopLevelABBytesPerTable,
-            &top_level_buffer, top_level_offset, top_level_gpu_address));
-    if (!top_level_entries_all) {
-      XELOGE("IssueDraw: bindless table allocation failed");
-      return false;
+    for (size_t stage = 0; stage < kStageCount; ++stage) {
+      StageRootArgumentKey key =
+          BuildStageRootArgumentKey(uniforms.cbvs[stage],
+                                    shared_memory_is_uav);
+      if (!GetOrCreateStageRootArgument(
+              stage, key, current_bindless_stage_root_arguments_[stage])) {
+        return false;
+      }
     }
-
-    auto write_top_level_root_arguments =
-        [&](size_t stage_index,
-            const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>&
-                uniform_cbvs) {
-          if (stage_index <
-              BackendTelemetryStats::kBindlessTelemetryStageCount) {
-            ++backend_telemetry_
-                  .bindless_stage_top_level_allocations[stage_index];
-            backend_telemetry_.bindless_stage_top_level_bytes[stage_index] +=
-                kTopLevelABBytesPerTable;
-          }
-          auto* top_level_ptrs = reinterpret_cast<uint64_t*>(
-              reinterpret_cast<uint8_t*>(top_level_entries_all) +
-              stage_index * kTopLevelABBytesPerTable);
-          StageRootArgumentKey key =
-              BuildStageRootArgumentKey(uniform_cbvs, shared_memory_is_uav);
-          WriteStageRootArgumentTable(top_level_ptrs, key);
-          current_bindless_stage_root_arguments_[stage_index] = {
-              top_level_buffer,
-              static_cast<NS::UInteger>(
-                  top_level_offset + stage_index * kTopLevelABBytesPerTable),
-              top_level_gpu_address + stage_index * kTopLevelABBytesPerTable,
-              key,
-              true};
-          for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
-            ++backend_telemetry_.bindless_root_cbv_pointer_writes;
-            if (stage_index <
-                BackendTelemetryStats::kBindlessTelemetryStageCount) {
-              ++backend_telemetry_
-                    .bindless_stage_root_cbv_pointer_writes[stage_index];
-            }
-          }
-        };
-
-    write_top_level_root_arguments(kStageVertex, uniforms.cbvs[kStageVertex]);
-    write_top_level_root_arguments(kStagePixel, uniforms.cbvs[kStagePixel]);
 
     current_bindless_table_valid_ = true;
     for (size_t stage = 0; stage < kStageCount; ++stage) {
@@ -4955,6 +5024,14 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       format_stage_array(backend_telemetry_.bindless_stage_top_level_bytes);
   std::string bindless_stage_root_writes =
       format_stage_array(backend_telemetry_.bindless_stage_root_cbv_pointer_writes);
+  std::string bindless_stage_root_cache_hits =
+      format_stage_array(backend_telemetry_.bindless_stage_root_cache_hits);
+  std::string bindless_stage_root_cache_misses =
+      format_stage_array(backend_telemetry_.bindless_stage_root_cache_misses);
+  std::string bindless_stage_root_cache_stores =
+      format_stage_array(backend_telemetry_.bindless_stage_root_cache_stores);
+  std::string bindless_stage_root_cache_bypasses =
+      format_stage_array(backend_telemetry_.bindless_stage_root_cache_bypasses);
 
   auto format_buffer_stage_array =
       [](const std::array<uint64_t,
@@ -5079,10 +5156,13 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_encoder_use_heap_driver_calls);
   XELOGI(
       "MetalTelemetry[{}]: root_args stage_cbv hit={{ {} }} miss={{ {} }} "
-      "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }}",
+      "top_level allocs={{ {} }} bytes={{ {} }} root_writes={{ {} }} "
+      "cache hit={{ {} }} miss={{ {} }} store={{ {} }} bypass={{ {} }}",
       reason, bindless_stage_cbv_hits, bindless_stage_cbv_misses,
       bindless_stage_top_level_allocs, bindless_stage_top_level_bytes,
-      bindless_stage_root_writes);
+      bindless_stage_root_writes, bindless_stage_root_cache_hits,
+      bindless_stage_root_cache_misses, bindless_stage_root_cache_stores,
+      bindless_stage_root_cache_bypasses);
   XELOGI(
       "MetalTelemetry[{}]: encoder_buffers full={{ {} }} offset={{ {} }} "
       "skip={{ {} }} null={{ {} }} untracked_full={{ {} }}",
@@ -5766,6 +5846,7 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_bindless_stable_shared_memory_is_uav_ = false;
     current_bindless_stable_shared_memory_usage_bits_ = 0;
     ResetConstantPayloadCacheForSubmission(0);
+    ResetStageRootArgumentCacheForSubmission(0);
   }
   DrainCommandBufferAutoreleasePool();
 }
