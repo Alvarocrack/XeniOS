@@ -593,10 +593,18 @@ bool MetalTextureCache::EndDeferredUploadEncoderBatch() {
   if (deferred_upload_batch_depth_ != 0) {
     return true;
   }
+  if (!deferred_upload_compute_encoder_ && deferred_upload_copies_.empty()) {
+    deferred_upload_command_buffer_ = nullptr;
+    return true;
+  }
   return FlushDeferredUploadEncoderBatch();
 }
 
 bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
+  if (!deferred_upload_compute_encoder_ && deferred_upload_copies_.empty()) {
+    deferred_upload_command_buffer_ = nullptr;
+    return true;
+  }
   MTL::CommandBuffer* cmd = deferred_upload_command_buffer_;
   if (deferred_upload_compute_encoder_) {
     MTL::ComputeCommandEncoder* compute_encoder =
