@@ -449,6 +449,8 @@ MetalCommandProcessor::~MetalCommandProcessor() {
     null_sampler_ = nullptr;
   }
   current_bindless_table_valid_ = false;
+  current_bindless_table_serial_ = 0;
+  render_encoder_bindless_resources_serial_ = 0;
   current_bindless_top_level_buffer_ = nullptr;
   current_bindless_top_level_offset_ = 0;
   current_bindless_top_level_gpu_address_ = 0;
@@ -3171,7 +3173,14 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     current_bindless_shared_memory_is_uav_ = shared_memory_is_uav;
     current_bindless_uses_mesh_stages_ =
         use_geometry_emulation || use_tessellation_emulation;
+    ++current_bindless_table_serial_;
+    if (!current_bindless_table_serial_) {
+      current_bindless_table_serial_ = 1;
+    }
+  }
 
+  if (render_encoder_bindless_resources_serial_ !=
+      current_bindless_table_serial_) {
     MTL::Buffer* shared_mem_buffer = shared_memory_->GetBuffer();
     if (shared_mem_buffer) {
       UseRenderEncoderResource(shared_mem_buffer, shared_memory_usage);
@@ -3248,67 +3257,68 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       UseRenderEncoderResource(uniform_buffers_for_encoder[i],
                                MTL::ResourceUsageRead);
     }
+    render_encoder_bindless_resources_serial_ = current_bindless_table_serial_;
+  }
 
-    const NS::UInteger top_level_offset_vertex =
-        current_bindless_top_level_offset_ +
-        NS::UInteger(kStageVertex * kTopLevelABBytesPerTable);
-    const NS::UInteger top_level_offset_pixel =
-        current_bindless_top_level_offset_ +
-        NS::UInteger(kStagePixel * kTopLevelABBytesPerTable);
-    if (use_geometry_emulation || use_tessellation_emulation) {
-      SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
-                                   top_level_offset_vertex,
-                                   kIRArgumentBufferBindPoint);
-      SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
+  const NS::UInteger top_level_offset_vertex =
+      current_bindless_top_level_offset_ +
+      NS::UInteger(kStageVertex * kTopLevelABBytesPerTable);
+  const NS::UInteger top_level_offset_pixel =
+      current_bindless_top_level_offset_ +
+      NS::UInteger(kStagePixel * kTopLevelABBytesPerTable);
+  if (use_geometry_emulation || use_tessellation_emulation) {
+    SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
                                  top_level_offset_vertex,
                                  kIRArgumentBufferBindPoint);
-      SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
-                                     top_level_offset_pixel,
-                                     kIRArgumentBufferBindPoint);
+    SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
+                               top_level_offset_vertex,
+                               kIRArgumentBufferBindPoint);
+    SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
+                                   top_level_offset_pixel,
+                                   kIRArgumentBufferBindPoint);
 
-      if (use_tessellation_emulation) {
-        SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
-                                     top_level_offset_vertex,
-                                     kIRArgumentBufferHullDomainBindPoint);
-        SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
+    if (use_tessellation_emulation) {
+      SetRenderEncoderObjectBuffer(current_bindless_top_level_buffer_,
                                    top_level_offset_vertex,
                                    kIRArgumentBufferHullDomainBindPoint);
-      }
+      SetRenderEncoderMeshBuffer(current_bindless_top_level_buffer_,
+                                 top_level_offset_vertex,
+                                 kIRArgumentBufferHullDomainBindPoint);
+    }
 
-      if (!heap_binds_set_on_encoder_) {
-        SetRenderEncoderObjectBuffer(view_bindless_heap_, 0,
-                                     kIRDescriptorHeapBindPoint);
-        SetRenderEncoderMeshBuffer(view_bindless_heap_, 0,
+    if (!heap_binds_set_on_encoder_) {
+      SetRenderEncoderObjectBuffer(view_bindless_heap_, 0,
                                    kIRDescriptorHeapBindPoint);
-        SetRenderEncoderFragmentBuffer(view_bindless_heap_, 0,
-                                       kIRDescriptorHeapBindPoint);
-        SetRenderEncoderObjectBuffer(sampler_bindless_heap_, 0,
-                                     kIRSamplerHeapBindPoint);
-        SetRenderEncoderMeshBuffer(sampler_bindless_heap_, 0,
-                                   kIRSamplerHeapBindPoint);
-        SetRenderEncoderFragmentBuffer(sampler_bindless_heap_, 0,
-                                       kIRSamplerHeapBindPoint);
-        heap_binds_set_on_encoder_ = true;
-      }
-    } else {
-      SetRenderEncoderVertexBuffer(current_bindless_top_level_buffer_,
-                                   top_level_offset_vertex,
-                                   kIRArgumentBufferBindPoint);
-      SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
-                                     top_level_offset_pixel,
-                                     kIRArgumentBufferBindPoint);
-
-      if (!heap_binds_set_on_encoder_) {
-        SetRenderEncoderVertexBuffer(view_bindless_heap_, 0,
+      SetRenderEncoderMeshBuffer(view_bindless_heap_, 0,
+                                 kIRDescriptorHeapBindPoint);
+      SetRenderEncoderFragmentBuffer(view_bindless_heap_, 0,
                                      kIRDescriptorHeapBindPoint);
-        SetRenderEncoderFragmentBuffer(view_bindless_heap_, 0,
-                                       kIRDescriptorHeapBindPoint);
-        SetRenderEncoderVertexBuffer(sampler_bindless_heap_, 0,
+      SetRenderEncoderObjectBuffer(sampler_bindless_heap_, 0,
+                                   kIRSamplerHeapBindPoint);
+      SetRenderEncoderMeshBuffer(sampler_bindless_heap_, 0,
+                                 kIRSamplerHeapBindPoint);
+      SetRenderEncoderFragmentBuffer(sampler_bindless_heap_, 0,
                                      kIRSamplerHeapBindPoint);
-        SetRenderEncoderFragmentBuffer(sampler_bindless_heap_, 0,
-                                       kIRSamplerHeapBindPoint);
-        heap_binds_set_on_encoder_ = true;
-      }
+      heap_binds_set_on_encoder_ = true;
+    }
+  } else {
+    SetRenderEncoderVertexBuffer(current_bindless_top_level_buffer_,
+                                 top_level_offset_vertex,
+                                 kIRArgumentBufferBindPoint);
+    SetRenderEncoderFragmentBuffer(current_bindless_top_level_buffer_,
+                                   top_level_offset_pixel,
+                                   kIRArgumentBufferBindPoint);
+
+    if (!heap_binds_set_on_encoder_) {
+      SetRenderEncoderVertexBuffer(view_bindless_heap_, 0,
+                                   kIRDescriptorHeapBindPoint);
+      SetRenderEncoderFragmentBuffer(view_bindless_heap_, 0,
+                                     kIRDescriptorHeapBindPoint);
+      SetRenderEncoderVertexBuffer(sampler_bindless_heap_, 0,
+                                   kIRSamplerHeapBindPoint);
+      SetRenderEncoderFragmentBuffer(sampler_bindless_heap_, 0,
+                                     kIRSamplerHeapBindPoint);
+      heap_binds_set_on_encoder_ = true;
     }
   }
 
@@ -3982,6 +3992,7 @@ void MetalCommandProcessor::EndRenderEncoder() {
       current_render_pass_descriptor_ = nullptr;
     }
     ResetRenderEncoderBufferBindings();
+    ResetRenderEncoderResourceUsage();
     return;
   }
   UpdateSharedMemoryFenceForActiveRenderEncoder();
@@ -3989,6 +4000,7 @@ void MetalCommandProcessor::EndRenderEncoder() {
   current_render_encoder_->release();
   current_render_encoder_ = nullptr;
   ResetRenderEncoderBufferBindings();
+  ResetRenderEncoderResourceUsage();
   if (current_render_pass_descriptor_) {
     current_render_pass_descriptor_->release();
     current_render_pass_descriptor_ = nullptr;
@@ -3998,7 +4010,6 @@ void MetalCommandProcessor::EndRenderEncoder() {
   current_depth_stencil_state_ = nullptr;
   stencil_reference_valid_ = false;
   heap_binds_set_on_encoder_ = false;
-  current_bindless_table_valid_ = false;
   ResetRenderEncoderBufferBindings();
 }
 
@@ -4011,7 +4022,6 @@ void MetalCommandProcessor::InvalidateRenderEncoderStateAfterExternalEncoding() 
   viewport_dirty_ = true;
   scissor_dirty_ = true;
   heap_binds_set_on_encoder_ = false;
-  current_bindless_table_valid_ = false;
 }
 
 MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {
@@ -4060,6 +4070,7 @@ void MetalCommandProcessor::ResetRenderEncoderResourceUsage() {
   render_encoder_resource_usage_map_.clear();
   render_encoder_heap_usage_.clear();
   render_encoder_heap_usage_set_.clear();
+  render_encoder_bindless_resources_serial_ = 0;
 }
 
 void MetalCommandProcessor::ResetRenderEncoderBufferBindings() {
@@ -4369,6 +4380,8 @@ void MetalCommandProcessor::EndCommandBuffer() {
     current_command_buffer_ = nullptr;
     submission_has_draws_ = false;
     current_bindless_table_valid_ = false;
+    current_bindless_table_serial_ = 0;
+    render_encoder_bindless_resources_serial_ = 0;
   }
   DrainCommandBufferAutoreleasePool();
 }

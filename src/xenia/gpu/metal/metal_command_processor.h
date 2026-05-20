@@ -553,6 +553,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<MTL::Texture*> current_texture_bindless_resources_vertex_;
   std::vector<MTL::Texture*> current_texture_bindless_resources_pixel_;
   bool current_bindless_table_valid_ = false;
+  uint64_t current_bindless_table_serial_ = 0;
+  uint64_t render_encoder_bindless_resources_serial_ = 0;
   MTL::Buffer* current_bindless_top_level_buffer_ = nullptr;
   NS::UInteger current_bindless_top_level_offset_ = 0;
   uint64_t current_bindless_top_level_gpu_address_ = 0;
