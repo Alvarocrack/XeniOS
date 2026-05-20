@@ -4646,42 +4646,57 @@ void MetalCommandProcessor::WriteBoolLoopConstantsFromMem(
 void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
                                                        uint32_t* base,
                                                        uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
   uint64_t changed = 0;
   uint64_t unchanged = 0;
   uint32_t changed_fetch_mask = 0;
   uint32_t* register_values = register_file_->values;
-  for (uint32_t i = 0; i < num_registers; ++i) {
-    const uint32_t index = start_index + i;
-    const uint32_t value = xe::load_and_swap<uint32_t>(base + i);
-    const uint32_t old_value = register_values[index];
-    register_values[index] = value;
-    if (old_value == value) {
-      ++unchanged;
-      continue;
-    }
-    ++changed;
-    const uint32_t fetch_index =
-        (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6;
-    if (fetch_index < xenos::kTextureFetchConstantCount) {
+
+  const uint32_t dword_start =
+      start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+  const uint32_t dword_end = dword_start + num_registers;
+  const uint32_t first_fetch = dword_start / 6;
+  const uint32_t last_fetch = (dword_end - 1) / 6;
+  for (uint32_t fetch_index = first_fetch; fetch_index <= last_fetch;
+       ++fetch_index) {
+    ++backend_telemetry_.register_write_fetch_slots_tested;
+    const uint32_t fetch_dword_start = fetch_index * 6;
+    const uint32_t fetch_dword_end = fetch_dword_start + 6;
+    const uint32_t compare_dword_start =
+        std::max(dword_start, fetch_dword_start);
+    const uint32_t compare_dword_end = std::min(dword_end, fetch_dword_end);
+    bool fetch_changed = false;
+    for (uint32_t dword = compare_dword_start; dword < compare_dword_end;
+         ++dword) {
+      ++backend_telemetry_.register_write_fetch_dwords_compared;
+      const uint32_t value =
+          xe::load_and_swap<uint32_t>(base + (dword - dword_start));
+      const uint32_t old_value =
+          register_values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + dword];
+      if (old_value == value) {
+        ++unchanged;
+        continue;
+      }
+      ++changed;
+      fetch_changed = true;
       changed_fetch_mask |= uint32_t(1) << fetch_index;
+      break;
+    }
+    if (fetch_changed) {
+      ++backend_telemetry_.register_write_fetch_changed_slots;
     }
   }
+
+  xe::copy_and_swap_32_unaligned(&register_values[start_index], base,
+                                 num_registers);
+
   backend_telemetry_.register_write_fetch_total += num_registers;
   backend_telemetry_.register_write_fetch_changed += changed;
   backend_telemetry_.register_write_fetch_unchanged += unchanged;
   backend_telemetry_.register_write_fetch_dirty += changed;
   backend_telemetry_.register_write_fetch_dwords_copied += num_registers;
-  backend_telemetry_.register_write_fetch_dwords_compared += num_registers;
-  if (num_registers) {
-    const uint32_t fetch_relative_start =
-        start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    const uint32_t fetch_relative_end =
-        fetch_relative_start + num_registers;
-    backend_telemetry_.register_write_fetch_slots_tested +=
-        (fetch_relative_end - 1) / 6 - fetch_relative_start / 6 + 1;
-  }
-  backend_telemetry_.register_write_fetch_changed_slots +=
-      xe::bit_count(changed_fetch_mask);
   if (changed) {
     cbuffer_binding_fetch_.up_to_date = false;
   }
