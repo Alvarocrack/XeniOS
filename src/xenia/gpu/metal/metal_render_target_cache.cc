@@ -13,7 +13,6 @@
 #include <array>
 #include <cstring>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2206,8 +2205,6 @@ void MetalRenderTargetCache::ClearCache() {
   current_depth_target_ = nullptr;
   render_pass_descriptor_dirty_ = true;
 
-  // Clear the tracking of which render targets have been cleared
-  cleared_render_targets_this_frame_.clear();
   dummy_color_targets_.clear();
   dummy_color_target_ = nullptr;
   render_target_map_.clear();
@@ -2220,9 +2217,6 @@ void MetalRenderTargetCache::BeginFrame() {
   (void)FlushPendingDrawPassTransfers();
 
   ++frame_id_;
-
-  // Clear the tracking of which render targets have been cleared this frame
-  cleared_render_targets_this_frame_.clear();
 
   // Call base implementation
   RenderTargetCache::BeginFrame();

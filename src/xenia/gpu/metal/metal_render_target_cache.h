@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/register_file.h"
@@ -550,9 +549,6 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       dummy_color_targets_;
   mutable MetalRenderTarget* dummy_color_target_ = nullptr;
   uint64_t frame_id_ = 0;
-
-  // Track which render targets have been cleared this frame
-  std::unordered_set<uint32_t> cleared_render_targets_this_frame_;
 
   // Debug helper to log a small region of the current color RT0.
   // Helper methods
