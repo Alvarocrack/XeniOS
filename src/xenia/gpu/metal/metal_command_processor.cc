@@ -2315,16 +2315,22 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   if (render_target_cache_ &&
       render_target_cache_->HasPendingDrawPassTransfers()) {
+    MetalRenderTargetCache::DrawPassTransferEncoderMutationMask
+        transfer_mutations =
+            MetalRenderTargetCache::kDrawPassTransferEncoderMutationNone;
     if (!render_target_cache_->EncodePendingDrawPassTransfers(
-            current_render_encoder_, current_render_pass_descriptor_)) {
+            current_render_encoder_, current_render_pass_descriptor_,
+            &transfer_mutations)) {
       if (!render_target_cache_->FlushPendingDrawPassTransfers()) {
         return false;
       }
       if (!BeginRenderEncoderForDraw(fallback_depth_attachment_required)) {
         return false;
       }
+      transfer_mutations =
+          MetalRenderTargetCache::kDrawPassTransferEncoderMutationNone;
     }
-    InvalidateRenderEncoderStateAfterExternalEncoding();
+    InvalidateRenderEncoderStateAfterDrawPassTransfers(transfer_mutations);
   }
 
   std::array<SharedMemoryRange, 96> shared_memory_hazard_ranges = {};
@@ -4013,15 +4019,49 @@ void MetalCommandProcessor::EndRenderEncoder() {
   ResetRenderEncoderBufferBindings();
 }
 
-void MetalCommandProcessor::InvalidateRenderEncoderStateAfterExternalEncoding() {
-  current_render_pipeline_state_ = nullptr;
-  ff_blend_factor_valid_ = false;
-  rasterizer_state_valid_ = false;
-  current_depth_stencil_state_ = nullptr;
-  stencil_reference_valid_ = false;
-  viewport_dirty_ = true;
-  scissor_dirty_ = true;
-  heap_binds_set_on_encoder_ = false;
+void MetalCommandProcessor::InvalidateRenderEncoderStateAfterDrawPassTransfers(
+    MetalRenderTargetCache::DrawPassTransferEncoderMutationMask mutations) {
+  if (!mutations) {
+    return;
+  }
+  using RTC = MetalRenderTargetCache;
+  if (mutations & RTC::kDrawPassTransferEncoderMutationPipeline) {
+    current_render_pipeline_state_ = nullptr;
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationDepthStencil) {
+    current_depth_stencil_state_ = nullptr;
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationStencilReference) {
+    stencil_reference_valid_ = false;
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationViewport) {
+    viewport_dirty_ = true;
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationScissor) {
+    scissor_dirty_ = true;
+  }
+
+  constexpr RTC::DrawPassTransferEncoderMutationMask
+      kTransferBufferMutations =
+          RTC::kDrawPassTransferEncoderMutationVertexSlot0 |
+          RTC::kDrawPassTransferEncoderMutationVertexSlot1 |
+          RTC::kDrawPassTransferEncoderMutationFragmentSlot0 |
+          RTC::kDrawPassTransferEncoderMutationFragmentSlot1;
+  if (mutations & RTC::kDrawPassTransferEncoderMutationVertexSlot0) {
+    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kVertex, 0);
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationVertexSlot1) {
+    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kVertex, 1);
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationFragmentSlot0) {
+    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kFragment, 0);
+  }
+  if (mutations & RTC::kDrawPassTransferEncoderMutationFragmentSlot1) {
+    InvalidateRenderEncoderBufferBinding(RenderEncoderBufferStage::kFragment, 1);
+  }
+  if (mutations & kTransferBufferMutations) {
+    heap_binds_set_on_encoder_ = false;
+  }
 }
 
 MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {

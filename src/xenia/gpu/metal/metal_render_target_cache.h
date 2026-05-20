@@ -161,9 +161,24 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   bool HasPendingDrawPassTransfers() const {
     return pending_draw_pass_transfer_mask_ != 0;
   }
+  enum DrawPassTransferEncoderMutation : uint32_t {
+    kDrawPassTransferEncoderMutationNone = 0,
+    kDrawPassTransferEncoderMutationPipeline = 1u << 0,
+    kDrawPassTransferEncoderMutationDepthStencil = 1u << 1,
+    kDrawPassTransferEncoderMutationStencilReference = 1u << 2,
+    kDrawPassTransferEncoderMutationViewport = 1u << 3,
+    kDrawPassTransferEncoderMutationScissor = 1u << 4,
+    kDrawPassTransferEncoderMutationVertexSlot0 = 1u << 5,
+    kDrawPassTransferEncoderMutationVertexSlot1 = 1u << 6,
+    kDrawPassTransferEncoderMutationFragmentSlot0 = 1u << 7,
+    kDrawPassTransferEncoderMutationFragmentSlot1 = 1u << 8,
+    kDrawPassTransferEncoderMutationFragmentTextures = 1u << 9,
+  };
+  using DrawPassTransferEncoderMutationMask = uint32_t;
   bool EncodePendingDrawPassTransfers(
       MTL::RenderCommandEncoder* encoder,
-      MTL::RenderPassDescriptor* pass_descriptor);
+      MTL::RenderPassDescriptor* pass_descriptor,
+      DrawPassTransferEncoderMutationMask* mutations_out = nullptr);
   bool FlushPendingDrawPassTransfers();
 
   bool IsRenderPassDescriptorDirty() const {
@@ -683,7 +698,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
       MTL::CommandBuffer* command_buffer = nullptr,
       MTL::RenderCommandEncoder* active_render_encoder = nullptr,
-      MTL::RenderPassDescriptor* active_render_pass_descriptor = nullptr);
+      MTL::RenderPassDescriptor* active_render_pass_descriptor = nullptr,
+      DrawPassTransferEncoderMutationMask* mutations_out = nullptr);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.

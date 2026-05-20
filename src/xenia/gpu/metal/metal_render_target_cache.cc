@@ -2948,7 +2948,11 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
 
 bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
     MTL::RenderCommandEncoder* encoder,
-    MTL::RenderPassDescriptor* pass_descriptor) {
+    MTL::RenderPassDescriptor* pass_descriptor,
+    DrawPassTransferEncoderMutationMask* mutations_out) {
+  if (mutations_out) {
+    *mutations_out = kDrawPassTransferEncoderMutationNone;
+  }
   if (!HasPendingDrawPassTransfers()) {
     return true;
   }
@@ -2963,7 +2967,7 @@ bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
       1 + xenos::kMaxColorRenderTargets,
       pending_draw_pass_render_targets_.data(),
       pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr, encoder,
-      pass_descriptor);
+      pass_descriptor, mutations_out);
   if (success) {
     ClearPendingDrawPassTransfers();
   }
@@ -5424,7 +5428,11 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle,
     MTL::CommandBuffer* command_buffer,
     MTL::RenderCommandEncoder* active_render_encoder,
-    MTL::RenderPassDescriptor* active_render_pass_descriptor) {
+    MTL::RenderPassDescriptor* active_render_pass_descriptor,
+    DrawPassTransferEncoderMutationMask* mutations_out) {
+  if (mutations_out) {
+    *mutations_out = kDrawPassTransferEncoderMutationNone;
+  }
   if (!render_targets || !render_target_transfers) {
     return false;
   }
@@ -5436,6 +5444,12 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       (resolve_clear_needed || !active_render_pass_descriptor)) {
     return false;
   }
+  auto mark_active_encoder_mutation =
+      [&](DrawPassTransferEncoderMutationMask mutations) {
+        if (use_active_render_encoder && mutations_out) {
+          *mutations_out |= mutations;
+        }
+      };
   TransferAttachmentFormats active_attachment_formats;
   if (use_active_render_encoder &&
       !GetActiveTransferAttachmentFormats(
@@ -5734,12 +5748,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       vp.znear = 0.0;
       vp.zfar = 1.0;
       encoder->setViewport(vp);
+      mark_active_encoder_mutation(kDrawPassTransferEncoderMutationViewport);
       MTL::ScissorRect scissor;
       scissor.x = scaled_x;
       scissor.y = scaled_y;
       scissor.width = scaled_width;
       scissor.height = scaled_height;
       encoder->setScissorRect(scissor);
+      mark_active_encoder_mutation(kDrawPassTransferEncoderMutationScissor);
       return true;
     };
 
@@ -6173,9 +6189,17 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             TransferClearDepthConstants constants = {};
             constants.depth = 0.0f;
             encoder->setRenderPipelineState(clear_pipeline);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationPipeline);
             encoder->setDepthStencilState(stencil_clear_state);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationDepthStencil);
             encoder->setStencilReferenceValue(0);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationStencilReference);
             encoder->setFragmentBytes(&constants, sizeof(constants), 0);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationFragmentSlot0);
             for (const Transfer& transfer : transfers_for_shaders) {
               Transfer::Rectangle
                   rectangles[Transfer::kMaxRectanglesWithCutout];
@@ -6221,12 +6245,16 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         auto bind_transfer_pipeline = [&](MTL::RenderPipelineState* pipeline) {
           if (last_transfer_pipeline != pipeline) {
             encoder->setRenderPipelineState(pipeline);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationPipeline);
             last_transfer_pipeline = pipeline;
           }
         };
         auto bind_transfer_depth_state = [&](MTL::DepthStencilState* state) {
           if (last_transfer_depth_state != state) {
             encoder->setDepthStencilState(state);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationDepthStencil);
             last_transfer_depth_state = state;
           }
         };
@@ -6237,12 +6265,16 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           }
           if (last_transfer_fragment_textures[index] != texture) {
             encoder->setFragmentTexture(texture, index);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationFragmentTextures);
             last_transfer_fragment_textures[index] = texture;
           }
         };
         auto bind_transfer_fragment_buffer_1 = [&](MTL::Buffer* buffer) {
           if (last_transfer_fragment_buffer_1 != buffer) {
             encoder->setFragmentBuffer(buffer, 0, 1);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationFragmentSlot1);
             last_transfer_fragment_buffer_1 = buffer;
           }
         };
@@ -6250,6 +6282,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           if (!last_transfer_stencil_reference_valid ||
               last_transfer_stencil_reference != reference) {
             encoder->setStencilReferenceValue(reference);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationStencilReference);
             last_transfer_stencil_reference = reference;
             last_transfer_stencil_reference_valid = true;
           }
@@ -6261,6 +6295,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                               sizeof(constants)) != 0) {
                 encoder->setVertexBytes(&constants, sizeof(constants), 0);
                 encoder->setFragmentBytes(&constants, sizeof(constants), 0);
+                mark_active_encoder_mutation(
+                    kDrawPassTransferEncoderMutationVertexSlot0 |
+                    kDrawPassTransferEncoderMutationFragmentSlot0);
                 last_transfer_constants = constants;
                 transfer_constants_valid = true;
               }
@@ -6272,6 +6309,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
               last_transfer_scissor.width != scissor.width ||
               last_transfer_scissor.height != scissor.height) {
             encoder->setScissorRect(scissor);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationScissor);
             last_transfer_scissor = scissor;
             last_transfer_scissor_valid = true;
           }
@@ -6283,6 +6322,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                               sizeof(rect_instance)) != 0) {
                 encoder->setVertexBytes(&rect_instance, sizeof(rect_instance),
                                         1);
+                mark_active_encoder_mutation(
+                    kDrawPassTransferEncoderMutationVertexSlot1);
                 last_transfer_vertex_bytes_1 = rect_instance;
                 last_transfer_vertex_bytes_1_valid = true;
               }
@@ -6297,6 +6338,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                   rect_instances,
                   size_t(rect_instance_count) * sizeof(TransferRectInstance),
                   1);
+              mark_active_encoder_mutation(
+                  kDrawPassTransferEncoderMutationVertexSlot1);
               last_transfer_vertex_bytes_1_valid = false;
             };
         auto set_full_transfer_viewport_scissor = [&]() {
@@ -6309,6 +6352,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             vp.znear = 0.0;
             vp.zfar = 1.0;
             encoder->setViewport(vp);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationViewport);
             transfer_viewport_full_set = true;
           }
           MTL::ScissorRect scissor;
@@ -6711,10 +6756,18 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             TransferClearDepthConstants constants = {};
             constants.depth = depth_host_clear_value;
             clear_encoder->setRenderPipelineState(clear_pipeline);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationPipeline);
             clear_encoder->setDepthStencilState(clear_state);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationDepthStencil);
             clear_encoder->setStencilReferenceValue(uint32_t(clear_value) &
                                                     0xFF);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationStencilReference);
             clear_encoder->setFragmentBytes(&constants, sizeof(constants), 0);
+            mark_active_encoder_mutation(
+                kDrawPassTransferEncoderMutationFragmentSlot0);
             Transfer::Rectangle clear_rect = *resolve_clear_rectangle;
             if (set_rect_viewport(clear_encoder, clear_rect)) {
               uint32_t scaled_x = 0;
@@ -6863,7 +6916,11 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                 continue;
               }
               clear_encoder->setRenderPipelineState(clear_pipeline);
+              mark_active_encoder_mutation(
+                  kDrawPassTransferEncoderMutationPipeline);
               clear_encoder->setDepthStencilState(no_depth_state);
+              mark_active_encoder_mutation(
+                  kDrawPassTransferEncoderMutationDepthStencil);
               if (clear_use_uint) {
                 clear_encoder->setFragmentBytes(&uint_constants,
                                                 sizeof(uint_constants), 0);
@@ -6871,6 +6928,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                 clear_encoder->setFragmentBytes(&float_constants,
                                                 sizeof(float_constants), 0);
               }
+              mark_active_encoder_mutation(
+                  kDrawPassTransferEncoderMutationFragmentSlot0);
               Transfer::Rectangle clear_rect = *resolve_clear_rectangle;
               if (set_rect_viewport(clear_encoder, clear_rect)) {
                 uint32_t scaled_x = 0;

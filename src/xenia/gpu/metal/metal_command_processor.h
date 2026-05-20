@@ -125,7 +125,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t GetLatestSubmissionStarted() const { return submission_current_; }
   MTL::CommandBuffer* EnsureCommandBuffer();
   void EndRenderEncoder();
-  void InvalidateRenderEncoderStateAfterExternalEncoding();
+  void InvalidateRenderEncoderStateAfterDrawPassTransfers(
+      MetalRenderTargetCache::DrawPassTransferEncoderMutationMask mutations);
   void ResetRenderEncoderResourceUsage();
   void UseRenderEncoderResource(MTL::Resource* resource,
                                 MTL::ResourceUsage usage);
