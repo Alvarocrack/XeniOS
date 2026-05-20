@@ -268,6 +268,9 @@ class MetalCommandProcessor final : public CommandProcessor {
       NS::UInteger offset = 0;
       uint64_t gpu_address = 0;
       size_t size = 0;
+      // Inactive slots are canonicalized to null in the top-level argument
+      // table, matching the fixed MSC layout without treating unused CBVs as
+      // per-draw state.
       bool active = false;
     };
 
@@ -803,6 +806,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_float_vertex_;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
+  // Fetch constants are one physical register file, but MSC root arguments are
+  // bound per stage.  Keep one full-buffer snapshot per stage so a write only
+  // churns the stage whose translated shader reads the changed dwords.
   std::array<ConstantBufferBinding, kStageCount> cbuffer_binding_fetch_stage_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;

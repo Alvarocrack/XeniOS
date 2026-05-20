@@ -570,55 +570,20 @@ const char* RenderEncoderBufferStageName(size_t stage) {
   }
 }
 
-uint32_t CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister reg) {
-  return uint32_t(1) << uint32_t(reg);
-}
-
 uint32_t ActiveCbvMaskForShader(const MetalShader* shader) {
+  constexpr uint32_t kAllTranslatedCbvMask =
+      (uint32_t(1)
+       << (uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices) +
+           1)) -
+      1;
   if (!shader) {
     return 0;
   }
   uint32_t used_cbuffer_mask = shader->GetUsedCbufferMaskAfterTranslation();
   if (!used_cbuffer_mask) {
-    return (uint32_t(1)
-            << (uint32_t(DxbcShaderTranslator::CbufferRegister::
-                             kDescriptorIndices) +
-                1)) -
-           1;
+    return kAllTranslatedCbvMask;
   }
-  uint32_t active_cbv_mask = 0;
-  if (used_cbuffer_mask &
-      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kSystemConstants)) {
-    active_cbv_mask |=
-        uint32_t(1)
-        << uint32_t(DxbcShaderTranslator::CbufferRegister::kSystemConstants);
-  }
-  if (used_cbuffer_mask &
-      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kFloatConstants)) {
-    active_cbv_mask |=
-        uint32_t(1)
-        << uint32_t(DxbcShaderTranslator::CbufferRegister::kFloatConstants);
-  }
-  if (used_cbuffer_mask &
-      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kBoolLoopConstants)) {
-    active_cbv_mask |=
-        uint32_t(1)
-        << uint32_t(DxbcShaderTranslator::CbufferRegister::kBoolLoopConstants);
-  }
-  if (used_cbuffer_mask &
-      CbufferRegisterBit(DxbcShaderTranslator::CbufferRegister::kFetchConstants)) {
-    active_cbv_mask |=
-        uint32_t(1)
-        << uint32_t(DxbcShaderTranslator::CbufferRegister::kFetchConstants);
-  }
-  if (used_cbuffer_mask &
-      CbufferRegisterBit(
-          DxbcShaderTranslator::CbufferRegister::kDescriptorIndices)) {
-    active_cbv_mask |=
-        uint32_t(1)
-        << uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices);
-  }
-  return active_cbv_mask;
+  return used_cbuffer_mask & kAllTranslatedCbvMask;
 }
 
 bool FetchConstantDwordMasksOverlap(
