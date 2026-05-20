@@ -5452,16 +5452,24 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     if (transfers.empty()) {
       continue;
     }
-    any_work = true;
-    if (!dest_rt->key().is_depth) {
-      continue;
-    }
+    RenderTargetKey dest_key = dest_rt->key();
+    bool transfers_have_rectangles = false;
     for (const Transfer& transfer : transfers) {
-      if (transfer.host_depth_source == dest_rt) {
+      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+      if (!transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
+                                  dest_key.msaa_samples, dest_key.Is64bpp(),
+                                  rectangles, resolve_clear_rectangle)) {
+        continue;
+      }
+      transfers_have_rectangles = true;
+      if (dest_key.is_depth && transfer.host_depth_source == dest_rt) {
         host_depth_store_needed = true;
-        break;
       }
     }
+    if (!transfers_have_rectangles) {
+      continue;
+    }
+    any_work = true;
   }
   if (!any_work) {
     return true;
