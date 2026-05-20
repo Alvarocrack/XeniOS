@@ -473,6 +473,8 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t bindless_table_allocations = 0;
     uint64_t bindless_table_bytes = 0;
     uint64_t bindless_root_cbv_pointer_writes = 0;
+    uint64_t bindless_root_argument_bind_updates = 0;
+    uint64_t bindless_root_argument_bind_skips = 0;
     std::array<uint64_t, kBindlessTelemetryStageCount>
         bindless_stage_cbv_match_hits = {};
     std::array<uint64_t, kBindlessTelemetryStageCount>
@@ -879,6 +881,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t current_bindless_stable_resources_serial_ = 0;
   uint64_t render_encoder_bindless_table_resources_serial_ = 0;
   uint64_t render_encoder_bindless_stable_resources_serial_ = 0;
+  uint64_t render_encoder_bindless_table_bind_serial_ = 0;
+  bool render_encoder_bindless_table_bind_mesh_path_ = false;
+  bool render_encoder_bindless_table_bind_tessellation_ = false;
   std::array<StageRootArgumentAllocation, kStageCount>
       current_bindless_stage_root_arguments_ = {};
   std::array<StageRootArgumentCacheSlot, kStageCount>
