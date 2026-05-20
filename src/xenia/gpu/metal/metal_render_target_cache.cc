@@ -5211,8 +5211,8 @@ bool MetalRenderTargetCache::Resolve(
   // D3D12/Vulkan behavior for the supported cases.
   if (edram_buffer_) {
     // Copy dispatch -- only when there is an actual copy extent.
-    bool copy_succeeded = !resolve_info.copy_dest_extent_length;
-    if (resolve_info.copy_dest_extent_length) {
+    bool copy_succeeded = !resolve_plan.needs_copy_export;
+    if (resolve_plan.needs_copy_export) {
       draw_util::ResolveCopyShaderConstants copy_constants;
       uint32_t group_count_x = 0, group_count_y = 0;
       draw_util::ResolveCopyShaderIndex copy_shader =
@@ -5354,8 +5354,8 @@ bool MetalRenderTargetCache::Resolve(
                   command_processor_.CommitStandaloneAndWait(cmd);
                 }
 
-                written_address = resolve_info.copy_dest_extent_start;
-                written_length = resolve_info.copy_dest_extent_length;
+                written_address = resolve_plan.written_address;
+                written_length = resolve_plan.written_length;
 
                 // Mark the range as resolved in the texture cache so that any
                 // textures overlapping this range will be reloaded from the
@@ -5377,12 +5377,14 @@ bool MetalRenderTargetCache::Resolve(
             "MetalRenderTargetCache::Resolve: no valid GPU resolve shader / "
             "pipeline for this configuration");
       }
-    }  // if (copy_dest_extent_length)
+    }  // if (needs_copy_export)
 
     // Clearing -- runs independently of whether the copy succeeded, matching
     // D3D12/Vulkan behavior.
-    bool clear_depth = resolve_info.IsClearingDepth();
-    bool clear_color = resolve_info.IsClearingColor();
+    bool clear_depth =
+        resolve_plan.needs_resolve_clear && resolve_info.IsClearingDepth();
+    bool clear_color =
+        resolve_plan.needs_resolve_clear && resolve_info.IsClearingColor();
     bool clear_succeeded = !(clear_depth || clear_color);
     if (clear_depth || clear_color) {
       clear_succeeded = true;
