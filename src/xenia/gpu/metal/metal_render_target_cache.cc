@@ -167,10 +167,6 @@ DEFINE_bool(metal_direct_host_resolve, true,
             "Resolve eligible fast color/depth copies directly from Metal host "
             "render targets to shared/scaled resolve memory",
             "Metal");
-DEFINE_int32(metal_memory_log_rate, 0,
-             "Log Metal render target/pipeline/instance buffer sizes every N "
-             "frames (0 to disable)",
-             "Metal");
 DEFINE_bool(metal_use_heaps, true,
             "Use MTLHeap-backed texture allocations in Metal to reduce "
             "allocation overhead and fragmentation.",
@@ -2470,19 +2466,6 @@ void MetalRenderTargetCache::BeginFrame() {
   // Call base implementation
   RenderTargetCache::BeginFrame();
 
-  if (::cvars::metal_memory_log_rate > 0 &&
-      (frame_id_ % uint64_t(::cvars::metal_memory_log_rate)) == 0) {
-    XELOGI("Metal mem: frame={} rt={} map={} dummy={} pipelines={}", frame_id_,
-           render_target_map_.size(), render_target_map_.size(),
-           dummy_color_targets_.size(), transfer_pipelines_.size());
-  }
-}
-
-
-
-void MetalRenderTargetCache::RecordDirectHostResolveRejection(
-    DirectHostResolveRejectionReason reason) {
-  (void)reason;
 }
 
 bool MetalRenderTargetCache::PrepareResolveDestinationBuffer(
@@ -2570,16 +2553,6 @@ bool MetalRenderTargetCache::Update(
                                  normalized_color_mask, vertex_shader)) {
     XELOGE("MetalRenderTargetCache::Update - Base class Update failed");
     return false;
-  }
-
-  if (::cvars::metal_memory_log_rate > 0) {
-    static uint64_t memory_log_counter = 0;
-    if ((++memory_log_counter % uint64_t(::cvars::metal_memory_log_rate)) ==
-        0) {
-      XELOGI("Metal mem: frame={} rt={} map={} dummy={} pipelines={}",
-             frame_id_, render_target_map_.size(), render_target_map_.size(),
-             dummy_color_targets_.size(), transfer_pipelines_.size());
-    }
   }
 
   // After base class update, retrieve the actual render targets that were
@@ -4619,31 +4592,10 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     MTL::CommandBuffer* command_buffer, uint32_t& written_address,
     uint32_t& written_length) {
 
-  auto reject = [&](DirectHostResolveRejectionReason reason) {
-    RecordDirectHostResolveRejection(reason);
-    return false;
-  };
-  auto reject_copy_shader_not_fast = [&]() {
-    switch (copy_shader) {
-      case draw_util::ResolveCopyShaderIndex::kFull8bpp:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderFull8bpp);
-      case draw_util::ResolveCopyShaderIndex::kFull16bpp:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderFull16bpp);
-      case draw_util::ResolveCopyShaderIndex::kFull32bpp:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderFull32bpp);
-      case draw_util::ResolveCopyShaderIndex::kFull64bpp:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderFull64bpp);
-      case draw_util::ResolveCopyShaderIndex::kFull128bpp:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderFull128bpp);
-      case draw_util::ResolveCopyShaderIndex::kUnknown:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderUnknown);
-      default:
-        return reject(DirectHostResolveRejectionReason::kCopyShaderNotFast);
-    }
-  };
+  auto reject = []() { return false; };
 
   if (GetPath() != Path::kHostRenderTargets) {
-    return reject(DirectHostResolveRejectionReason::kNotHostPath);
+    return reject();
   }
   const bool resolve_is_depth = resolve_info.IsCopyingDepth();
   const bool copy_shader_is_fast =
@@ -4658,10 +4610,10 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   if (resolve_is_depth) {
     if (!xenos::IsSingleCopySampleSelected(
             resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-      return reject(DirectHostResolveRejectionReason::kSampleSelect);
+      return reject();
     }
     if (!copy_shader_is_fast) {
-      return reject_copy_shader_not_fast();
+      return reject();
     }
     resolve_depth_format =
         xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format);
@@ -4670,39 +4622,37 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format);
     if (resolve_color_format ==
         xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-      return reject(gamma_render_target_as_unorm16_
-                        ? DirectHostResolveRejectionReason::kGammaAsUnorm16
-                        : DirectHostResolveRejectionReason::kGammaColor);
+      return reject();
     }
     if (copy_shader_is_fast) {
       if (!xenos::IsSingleCopySampleSelected(
               resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-        return reject(DirectHostResolveRejectionReason::kSampleSelect);
+        return reject();
       }
       if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
-        return reject(DirectHostResolveRejectionReason::kExpBias);
+        return reject();
       }
       if (!xenos::IsColorResolveFormatBitwiseEquivalent(
               resolve_color_format,
               xenos::ColorFormat(
                   resolve_info.copy_dest_info.copy_dest_format))) {
-        return reject(DirectHostResolveRejectionReason::kFormatNotBitwise);
+        return reject();
       }
     } else if (!copy_shader_is_full_color) {
       if (!xenos::IsSingleCopySampleSelected(
               resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-        return reject(DirectHostResolveRejectionReason::kSampleSelect);
+        return reject();
       }
       if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
-        return reject(DirectHostResolveRejectionReason::kExpBias);
+        return reject();
       }
       if (!xenos::IsColorResolveFormatBitwiseEquivalent(
               resolve_color_format,
               xenos::ColorFormat(
                   resolve_info.copy_dest_info.copy_dest_format))) {
-        return reject(DirectHostResolveRejectionReason::kFormatNotBitwise);
+        return reject();
       }
-      return reject_copy_shader_not_fast();
+      return reject();
     }
   }
 
@@ -4738,7 +4688,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
                                  dump_pitch, rectangles);
   if (rectangles.empty()) {
-    return reject(DirectHostResolveRejectionReason::kSourceCoverage);
+    return reject();
   }
 
   uint64_t covered_tiles = 0;
@@ -4766,7 +4716,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
 
   for (const ResolveCopyDumpRectangle& rect : rectangles) {
     if (!rect.rows || rect.row_last_end <= rect.row_first_start) {
-      return reject(DirectHostResolveRejectionReason::kSourceCoverage);
+      return reject();
     }
     if (rect.rows == 1) {
       covered_tiles += rect.row_last_end - rect.row_first_start;
@@ -4778,11 +4728,11 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
 
     auto* rt = static_cast<MetalRenderTarget*>(rect.render_target);
     if (!rt) {
-      return reject(DirectHostResolveRejectionReason::kMissingTexture);
+      return reject();
     }
     RenderTargetKey key = rt->key();
     if (key.is_depth != resolve_is_depth) {
-      return reject(DirectHostResolveRejectionReason::kSourceTypeMismatch);
+      return reject();
     }
 
     bool source_is_uint = false;
@@ -4795,7 +4745,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     if (resolve_is_depth) {
       if (key.GetDepthFormat() != resolve_depth_format ||
           key.msaa_samples != resolve_info.depth_edram_info.msaa_samples) {
-        return reject(DirectHostResolveRejectionReason::kFormatNotBitwise);
+        return reject();
       }
       texture = rt->texture();
       expected_format = GetDepthPixelFormat(key.GetDepthFormat());
@@ -4812,12 +4762,11 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     } else {
       if (key.GetColorFormat() != resolve_color_format ||
           key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
-        return reject(DirectHostResolveRejectionReason::kFormatNotBitwise);
+        return reject();
       }
       if (copy_shader_is_full_color &&
           !is_direct_full_color_source_packable(resolve_color_format)) {
-        return reject(
-            DirectHostResolveRejectionReason::kSourceFormatNotPackable);
+        return reject();
       }
 
       MTL::PixelFormat ownership_transfer_format =
@@ -4842,13 +4791,13 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
                                                     source_is_uint);
     }
     if (!texture) {
-      return reject(DirectHostResolveRejectionReason::kMissingTexture);
+      return reject();
     }
     if (texture->pixelFormat() != expected_format) {
-      return reject(DirectHostResolveRejectionReason::kSourceFormatMismatch);
+      return reject();
     }
     if (!pipeline) {
-      return reject(DirectHostResolveRejectionReason::kMissingPipeline);
+      return reject();
     }
 
     DirectHostResolveSource source = {};
@@ -4865,7 +4814,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     source.is_64bpp = is_64bpp;
     source.is_depth = resolve_is_depth;
     if (!source.dispatch_count) {
-      return reject(DirectHostResolveRejectionReason::kSourceCoverage);
+      return reject();
     }
     const uint32_t tile_size_x =
         (source.is_64bpp ? 40u : 80u) * draw_resolution_scale_x();
@@ -4876,7 +4825,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
       uint32_t dispatch_pixel_width =
           source.dispatches[i].width_tiles * tile_pixel_size_x;
       if (dispatch_pixel_width % source.pixels_per_thread) {
-        return reject(DirectHostResolveRejectionReason::kDispatchAlignment);
+        return reject();
       }
     }
     sources.push_back(source);
@@ -4885,7 +4834,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   const uint64_t required_tiles =
       uint64_t(dump_row_length_used) * uint64_t(dump_rows);
   if (covered_tiles != required_tiles) {
-    return reject(DirectHostResolveRejectionReason::kSourceCoverage);
+    return reject();
   }
 
   auto* texture_cache = command_processor_.texture_cache();
@@ -4893,7 +4842,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   ResolveDestinationBuffer destination = {};
   if (!PrepareResolveDestinationBuffer(resolve_info, draw_resolution_scaled,
                                        destination)) {
-    return reject(DirectHostResolveRejectionReason::kMissingTexture);
+    return reject();
   }
 
   command_processor_.SetSwapDestSwap(
@@ -4906,7 +4855,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     cmd = command_processor_.CreateStandaloneTransferCommandBuffer(
         "XeniaCB reason=direct-host-resolve");
     if (!cmd) {
-      return reject(DirectHostResolveRejectionReason::kMissingPipeline);
+      return reject();
     }
     standalone = true;
   }
@@ -4916,7 +4865,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     if (standalone) {
       cmd->release();
     }
-    return reject(DirectHostResolveRejectionReason::kMissingPipeline);
+    return reject();
   }
 
   SetEncoderLabel(encoder, kDirectHostResolveEncoderLabel);

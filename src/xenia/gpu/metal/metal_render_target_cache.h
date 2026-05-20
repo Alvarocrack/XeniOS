@@ -529,31 +529,6 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   static constexpr size_t kDrawPassTransferRejectionReasonCount =
       size_t(DrawPassTransferRejectionReason::kCount);
 
-  enum class DirectHostResolveRejectionReason : uint32_t {
-    kNotHostPath,
-    kSourceTypeMismatch,
-    kCopyShaderNotFast,
-    kCopyShaderFull8bpp,
-    kCopyShaderFull16bpp,
-    kCopyShaderFull32bpp,
-    kCopyShaderFull64bpp,
-    kCopyShaderFull128bpp,
-    kCopyShaderUnknown,
-    kExpBias,
-    kSampleSelect,
-    kFormatNotBitwise,
-    kMissingTexture,
-    kSourceFormatMismatch,
-    kMissingPipeline,
-    kSourceCoverage,
-    kDispatchAlignment,
-    kSourceFormatNotPackable,
-    kGammaColor,
-    kGammaAsUnorm16,
-    kCount,
-  };
-
-
   std::unordered_map<TransferPipelineKey, MTL::RenderPipelineState*,
                      TransferPipelineKey::Hasher>
       transfer_pipelines_;
@@ -736,8 +711,6 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       draw_util::ResolveCopyShaderIndex copy_shader) const;
   MTL::ComputePipelineState* GetDirectHostDepthResolvePipeline(
       xenos::MsaaSamples msaa_samples, bool scaled) const;
-  void RecordDirectHostResolveRejection(
-      DirectHostResolveRejectionReason reason);
 };
 
 }  // namespace metal
