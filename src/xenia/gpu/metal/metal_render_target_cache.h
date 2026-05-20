@@ -605,6 +605,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       xenos::ColorRenderTargetFormat format, bool* is_integer_out) const;
   MTL::PixelFormat GetDepthPixelFormat(
       xenos::DepthRenderTargetFormat format) const;
+  TransferShaderKey GetTransferShaderKey(
+      RenderTargetKey source_key, RenderTargetKey dest_key,
+      const RenderTargetKey* host_depth_source_key,
+      bool host_depth_source_is_copy, bool stencil_bit,
+      bool dest_sample_id_from_sample_default) const;
   bool GetActiveTransferAttachmentFormats(
       MTL::RenderPassDescriptor* pass_descriptor,
       TransferColorAttachmentFormats& color_attachment_formats_out,

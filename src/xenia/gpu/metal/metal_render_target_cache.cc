@@ -2840,51 +2840,6 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
     return false;
   }
 
-  auto make_transfer_shader_key = [&](RenderTargetKey source_key,
-                                      RenderTargetKey dest_key,
-                                      const RenderTargetKey* host_depth_key,
-                                      bool stencil_bit) -> TransferShaderKey {
-    TransferShaderKey shader_key = {};
-    shader_key.source_msaa_samples = source_key.msaa_samples;
-    shader_key.dest_msaa_samples = dest_key.msaa_samples;
-    shader_key.source_resource_format = source_key.resource_format;
-    shader_key.dest_resource_format = dest_key.resource_format;
-    shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
-    shader_key.host_depth_source_is_copy = 0;
-    if (stencil_bit) {
-      shader_key.mode = source_key.is_depth ? TransferMode::kDepthToStencilBit
-                                            : TransferMode::kColorToStencilBit;
-    } else if (dest_key.is_depth) {
-      if (host_depth_key) {
-        shader_key.mode = source_key.is_depth
-                              ? TransferMode::kDepthAndHostDepthToDepth
-                              : TransferMode::kColorAndHostDepthToDepth;
-        shader_key.host_depth_source_msaa_samples =
-            host_depth_key->msaa_samples;
-      } else {
-        shader_key.mode = source_key.is_depth ? TransferMode::kDepthToDepth
-                                              : TransferMode::kColorToDepth;
-      }
-    } else {
-      shader_key.mode = source_key.is_depth ? TransferMode::kDepthToColor
-                                            : TransferMode::kColorToColor;
-    }
-
-    bool transfer_use_sample_id =
-        dest_key.msaa_samples != xenos::MsaaSamples::k1X &&
-        ::cvars::metal_transfer_msaa_sample_id;
-    bool host_depth_is_multisample =
-        host_depth_key &&
-        host_depth_key->msaa_samples != xenos::MsaaSamples::k1X;
-    if (transfer_use_sample_id &&
-        source_key.msaa_samples == xenos::MsaaSamples::k1X &&
-        !host_depth_is_multisample) {
-      transfer_use_sample_id = false;
-    }
-    shader_key.dest_sample_id_from_sample = transfer_use_sample_id ? 1u : 0u;
-    return shader_key;
-  };
-
   // Shared RenderTargetCache state uses slot 0 for depth and slots 1..4 for
   // color, so preflight depth transfers against the active depth attachment.
   for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
@@ -3020,9 +2975,12 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
       if (source_key.is_depth && !GetStencilTextureView(source_rt)) {
         return false;
       }
-      TransferShaderKey shader_key = make_transfer_shader_key(
+      bool dest_sample_id_from_sample_default =
+          dest_key.msaa_samples != xenos::MsaaSamples::k1X &&
+          ::cvars::metal_transfer_msaa_sample_id;
+      TransferShaderKey shader_key = GetTransferShaderKey(
           source_key, dest_key, host_depth_rt ? &host_depth_key : nullptr,
-          false);
+          false, false, dest_sample_id_from_sample_default);
       if (!GetOrCreateTransferPipelines(
               shader_key, dest_format, false, false, color_attachment_index,
               &color_attachment_formats, depth_attachment_format,
@@ -3030,8 +2988,9 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
         return false;
       }
       if (dest_key.is_depth) {
-        TransferShaderKey stencil_shader_key =
-            make_transfer_shader_key(source_key, dest_key, nullptr, true);
+        TransferShaderKey stencil_shader_key = GetTransferShaderKey(
+            source_key, dest_key, nullptr, false, true,
+            dest_sample_id_from_sample_default);
         bool native_stencil_output_ready =
             ::cvars::metal_transfer_native_stencil_output &&
             GetTransferStencilOutputState() &&
@@ -3090,6 +3049,59 @@ bool MetalRenderTargetCache::FlushPendingDrawPassTransfers() {
   }
   ClearPendingDrawPassTransfers();
   return true;
+}
+
+MetalRenderTargetCache::TransferShaderKey
+MetalRenderTargetCache::GetTransferShaderKey(
+    RenderTargetKey source_key, RenderTargetKey dest_key,
+    const RenderTargetKey* host_depth_source_key,
+    bool host_depth_source_is_copy, bool stencil_bit,
+    bool dest_sample_id_from_sample_default) const {
+  TransferShaderKey shader_key = {};
+  shader_key.source_msaa_samples = source_key.msaa_samples;
+  shader_key.dest_msaa_samples = dest_key.msaa_samples;
+  shader_key.source_resource_format = source_key.resource_format;
+  shader_key.dest_resource_format = dest_key.resource_format;
+  shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
+  shader_key.host_depth_source_is_copy = 0;
+
+  if (stencil_bit) {
+    shader_key.mode = source_key.is_depth ? TransferMode::kDepthToStencilBit
+                                          : TransferMode::kColorToStencilBit;
+  } else if (dest_key.is_depth) {
+    if (host_depth_source_key) {
+      shader_key.mode = source_key.is_depth
+                            ? TransferMode::kDepthAndHostDepthToDepth
+                            : TransferMode::kColorAndHostDepthToDepth;
+      shader_key.host_depth_source_is_copy =
+          host_depth_source_is_copy ? 1 : 0;
+      shader_key.host_depth_source_msaa_samples =
+          host_depth_source_is_copy ? xenos::MsaaSamples::k1X
+                                    : host_depth_source_key->msaa_samples;
+    } else {
+      shader_key.mode = source_key.is_depth ? TransferMode::kDepthToDepth
+                                            : TransferMode::kColorToDepth;
+    }
+  } else {
+    shader_key.mode = source_key.is_depth ? TransferMode::kDepthToColor
+                                          : TransferMode::kColorToColor;
+  }
+
+  const TransferModeInfo& mode_info = kTransferModeInfos[size_t(shader_key.mode)];
+  bool transfer_use_sample_id = dest_sample_id_from_sample_default;
+  if (transfer_use_sample_id) {
+    bool source_is_multisample =
+        source_key.msaa_samples != xenos::MsaaSamples::k1X;
+    bool host_depth_is_multisample =
+        mode_info.uses_host_depth &&
+        shader_key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X &&
+        !shader_key.host_depth_source_is_copy;
+    if (!source_is_multisample && !host_depth_is_multisample) {
+      transfer_use_sample_id = false;
+    }
+  }
+  shader_key.dest_sample_id_from_sample = transfer_use_sample_id ? 1u : 0u;
+  return shader_key;
 }
 
 uint32_t MetalRenderTargetCache::GetMaxRenderTargetWidth() const {
@@ -6245,65 +6257,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           ensure_sort_index(host_depth_rt);
 
           RenderTargetKey source_key = source_rt->key();
-          TransferShaderKey shader_key = {};
-          shader_key.source_msaa_samples = source_key.msaa_samples;
-          shader_key.dest_msaa_samples = dest_key.msaa_samples;
-          shader_key.source_resource_format = source_key.resource_format;
-          shader_key.dest_resource_format = dest_key.resource_format;
-
-          if (pass) {
-            shader_key.mode = source_key.is_depth
-                                  ? TransferMode::kDepthToStencilBit
-                                  : TransferMode::kColorToStencilBit;
-            shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
-            shader_key.host_depth_source_is_copy = 0;
-          } else {
-            if (dest_is_depth) {
-              if (host_depth_rt) {
-                bool host_depth_is_copy = host_depth_rt == dest_metal_rt;
-                shader_key.mode = source_key.is_depth
-                                      ? TransferMode::kDepthAndHostDepthToDepth
-                                      : TransferMode::kColorAndHostDepthToDepth;
-                shader_key.host_depth_source_is_copy =
-                    host_depth_is_copy ? 1 : 0;
-                shader_key.host_depth_source_msaa_samples =
-                    host_depth_is_copy ? xenos::MsaaSamples::k1X
-                                       : host_depth_rt->key().msaa_samples;
-              } else {
-                shader_key.mode = source_key.is_depth
-                                      ? TransferMode::kDepthToDepth
-                                      : TransferMode::kColorToDepth;
-                shader_key.host_depth_source_msaa_samples =
-                    xenos::MsaaSamples::k1X;
-                shader_key.host_depth_source_is_copy = 0;
-              }
-            } else {
-              shader_key.mode = source_key.is_depth
-                                    ? TransferMode::kDepthToColor
-                                    : TransferMode::kColorToColor;
-              shader_key.host_depth_source_msaa_samples =
-                  xenos::MsaaSamples::k1X;
-              shader_key.host_depth_source_is_copy = 0;
-            }
+          bool host_depth_is_copy = host_depth_rt == dest_metal_rt;
+          RenderTargetKey host_depth_key;
+          if (host_depth_rt) {
+            host_depth_key = host_depth_rt->key();
           }
-
-          const TransferModeInfo& mode_info =
-              kTransferModeInfos[size_t(shader_key.mode)];
-          bool transfer_use_sample_id = transfer_use_sample_id_default;
-          if (transfer_use_sample_id) {
-            bool source_is_multisample =
-                source_key.msaa_samples != xenos::MsaaSamples::k1X;
-            bool host_depth_is_multisample =
-                mode_info.uses_host_depth &&
-                shader_key.host_depth_source_msaa_samples !=
-                    xenos::MsaaSamples::k1X &&
-                !shader_key.host_depth_source_is_copy;
-            if (!source_is_multisample && !host_depth_is_multisample) {
-              transfer_use_sample_id = false;
-            }
-          }
-          shader_key.dest_sample_id_from_sample =
-              transfer_use_sample_id ? 1u : 0u;
+          TransferShaderKey shader_key = GetTransferShaderKey(
+              source_key, dest_key, host_depth_rt ? &host_depth_key : nullptr,
+              host_depth_is_copy, pass != 0, transfer_use_sample_id_default);
 
           transfer_invocations_.emplace_back(transfer, shader_key);
           if (pass) {
