@@ -9,15 +9,13 @@
 
 #include "xenia/gpu/metal/metal_shared_memory.h"
 
-#include "xenia/base/logging.h"
-#include "xenia/base/memory.h"
-#include "xenia/gpu/gpu_flags.h"
-#include "xenia/gpu/metal/metal_command_processor.h"
+#include <algorithm>
+#include <cstring>
 
-DEFINE_bool(metal_shared_memory_zero_copy, true,
-            "Use MTLBuffer bytes-no-copy for guest memory on unified memory "
-            "devices when possible.",
-            "Metal");
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
+#include "xenia/gpu/metal/metal_command_processor.h"
 
 namespace xe {
 namespace gpu {
@@ -30,9 +28,6 @@ MetalSharedMemory::MetalSharedMemory(MetalCommandProcessor& command_processor,
 MetalSharedMemory::~MetalSharedMemory() { Shutdown(); }
 
 bool MetalSharedMemory::Initialize() {
-  // Try to alias guest memory on unified-memory devices and fall back to a
-  // dedicated shared buffer when not supported.
-  // Initialize base class
   if (!InitializeCommon()) {
     return false;
   }
@@ -54,52 +49,30 @@ bool MetalSharedMemory::Initialize() {
     return false;
   }
 
-  if (cvars::metal_shared_memory_zero_copy && device->hasUnifiedMemory()) {
-    size_t system_page_size = xe::memory::page_size();
-    if (reinterpret_cast<uintptr_t>(xbox_ram) % system_page_size == 0) {
-      buffer_ = device->newBuffer(xbox_ram, kBufferSize,
-                                  MTL::ResourceStorageModeShared, nullptr);
-      if (buffer_) {
-        use_zero_copy_ = true;
-        XELOGD("Metal shared memory: using bytes-no-copy buffer");
-      } else {
-        XELOGW("Metal shared memory: bytes-no-copy buffer creation failed");
-      }
-    } else {
-      XELOGW(
-          "Metal shared memory: Xbox RAM not page-aligned for bytes-no-copy");
-    }
-  }
-
-  if (!buffer_) {
-    buffer_ = device->newBuffer(kBufferSize, MTL::ResourceStorageModeShared);
-  }
+  buffer_ = device->newBuffer(kBufferSize, MTL::ResourceStorageModeShared);
   if (!buffer_) {
     XELOGE("Failed to create Metal shared memory buffer");
     return false;
   }
 
-  // For trace dump, do initial full copy; UploadRanges handles incremental
-  // updates for normal runs.
-  if (!use_zero_copy_) {
-    if (xbox_ram) {
-      memcpy(buffer_->contents(), xbox_ram, kBufferSize);
-    }
-  } else {
-    XELOGD("Metal shared memory: skipping initial copy (zero-copy)");
-  }
+  upload_buffer_pool_ = std::make_unique<MetalUploadBufferPool>(
+      device, xe::align(ui::GraphicsUploadBufferPool::kDefaultPageSize,
+                        size_t(1) << page_size_log2()));
 
   return true;
 }
 
-void MetalSharedMemory::ClearCache() { SharedMemory::ClearCache(); }
+void MetalSharedMemory::ClearCache() {
+  SharedMemory::ClearCache();
+
+  if (upload_buffer_pool_) {
+    upload_buffer_pool_->ClearCache();
+  }
+}
 
 bool MetalSharedMemory::UploadRanges(
     const std::pair<uint32_t, uint32_t>* upload_page_ranges,
     uint32_t num_upload_ranges) {
-  // Copy modified ranges from Xbox memory to Metal buffer when not using
-  // bytes-no-copy shared memory.
-
   static bool first_upload = true;
   if (first_upload) {
     first_upload = false;
@@ -118,34 +91,78 @@ bool MetalSharedMemory::UploadRanges(
   if (!buffer_ || num_upload_ranges == 0) {
     return true;
   }
-
-  uint8_t* buffer_data = nullptr;
-  uint8_t* xbox_data = nullptr;
-  if (!use_zero_copy_) {
-    void* xbox_ram = memory().TranslatePhysical(0);
-    if (!xbox_ram) {
-      XELOGE("MetalSharedMemory::UploadRanges: Xbox RAM is null");
-      return false;
-    }
-    buffer_data = static_cast<uint8_t*>(buffer_->contents());
-    xbox_data = static_cast<uint8_t*>(xbox_ram);
+  if (!upload_buffer_pool_) {
+    XELOGE("MetalSharedMemory::UploadRanges: upload buffer pool is null");
+    return false;
   }
 
+  void* xbox_ram = memory().TranslatePhysical(0);
+  if (!xbox_ram) {
+    XELOGE("MetalSharedMemory::UploadRanges: Xbox RAM is null");
+    return false;
+  }
+  uint8_t* xbox_data = static_cast<uint8_t*>(xbox_ram);
+
   const uint32_t page_size = 1u << page_size_log2();
+  upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+
+  MTL::CommandBuffer* command_buffer =
+      command_processor_.RequestTransferCommandBuffer();
+  if (!command_buffer) {
+    XELOGE("MetalSharedMemory::UploadRanges: failed to get command buffer");
+    return false;
+  }
+
+  MTL::BlitCommandEncoder* blit_encoder = command_buffer->blitCommandEncoder();
+  if (!blit_encoder) {
+    XELOGE("MetalSharedMemory::UploadRanges: failed to create blit encoder");
+    return false;
+  }
+  blit_encoder->setLabel(
+      NS::String::string("XeniaSharedMemoryUpload", NS::UTF8StringEncoding));
 
   uint32_t merged_start = 0;
   uint32_t merged_end = 0;
   bool have_merged = false;
 
-  auto flush_merged_range = [&](uint32_t start, uint32_t end) {
+  auto flush_merged_range = [&](uint32_t start, uint32_t end) -> bool {
     if (end <= start) {
-      return;
+      return true;
     }
-    uint32_t length = end - start;
-    MakeRangeValid(start, length, false);
-    if (!use_zero_copy_) {
-      memcpy(buffer_data + start, xbox_data + start, length);
+    uint32_t offset = start;
+    uint32_t remaining = end - start;
+    while (remaining) {
+      MTL::Buffer* upload_buffer = nullptr;
+      size_t upload_offset = 0;
+      uint64_t upload_gpu_address = 0;
+      size_t upload_size = 0;
+      uint8_t* upload_mapping = upload_buffer_pool_->RequestPartial(
+          command_processor_.GetCurrentSubmission(), remaining, page_size,
+          &upload_buffer, upload_offset, upload_gpu_address, upload_size);
+      if (!upload_mapping || !upload_buffer || !upload_size) {
+        XELOGE(
+            "MetalSharedMemory::UploadRanges: failed to allocate upload "
+            "staging buffer");
+        return false;
+      }
+
+      MakeRangeValid(offset, static_cast<uint32_t>(upload_size), false);
+      if (upload_size < (1ULL << 32) && upload_size > 8192) {
+        memory::vastcpy(upload_mapping, xbox_data + offset,
+                        static_cast<uint32_t>(upload_size));
+        swcache::WriteFence();
+      } else {
+        std::memcpy(upload_mapping, xbox_data + offset, upload_size);
+      }
+      blit_encoder->copyFromBuffer(
+          upload_buffer, static_cast<NS::UInteger>(upload_offset), buffer_,
+          static_cast<NS::UInteger>(offset),
+          static_cast<NS::UInteger>(upload_size));
+
+      offset += static_cast<uint32_t>(upload_size);
+      remaining -= static_cast<uint32_t>(upload_size);
     }
+    return true;
   };
 
   for (uint32_t i = 0; i < num_upload_ranges; ++i) {
@@ -172,28 +189,36 @@ bool MetalSharedMemory::UploadRanges(
         merged_end = end;
       }
     } else {
-      flush_merged_range(merged_start, merged_end);
+      if (!flush_merged_range(merged_start, merged_end)) {
+        blit_encoder->endEncoding();
+        return false;
+      }
       merged_start = start;
       merged_end = end;
     }
   }
 
   if (have_merged) {
-    flush_merged_range(merged_start, merged_end);
+    if (!flush_merged_range(merged_start, merged_end)) {
+      blit_encoder->endEncoding();
+      return false;
+    }
   }
 
-  XELOGD("MetalSharedMemory::UploadRanges: Copied {} ranges to Metal buffer",
+  blit_encoder->endEncoding();
+
+  XELOGD("MetalSharedMemory::UploadRanges: Staged {} ranges to Metal buffer",
          num_upload_ranges);
 
   return true;
 }
 
 void MetalSharedMemory::Shutdown() {
+  upload_buffer_pool_.reset();
   if (buffer_) {
     buffer_->release();
     buffer_ = nullptr;
   }
-  use_zero_copy_ = false;
 
   ShutdownCommon();  // Base class cleanup
 }

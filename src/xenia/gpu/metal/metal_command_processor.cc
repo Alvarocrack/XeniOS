@@ -2492,6 +2492,13 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   MTL::ResourceUsage shared_memory_usage =
       shared_memory_is_uav ? (MTL::ResourceUsageRead | MTL::ResourceUsageWrite)
                            : MTL::ResourceUsageRead;
+  const bool guest_dma_index_buffer_read =
+      !memexport_used &&
+      primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+  const bool shader_primitive_index_load =
+      primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA;
 
   // Sync shared memory before drawing - ensure GPU has latest data
   // This is particularly important for trace playback where memory is
@@ -2556,6 +2563,48 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             base_bytes, memexport_range.size_bytes);
         return false;
       }
+    }
+
+    auto request_guest_index_range =
+        [&](uint64_t index_base, uint32_t index_count,
+            xenos::IndexFormat index_format, const char* label) -> bool {
+      uint32_t index_stride = index_format == xenos::IndexFormat::kInt16
+                                  ? sizeof(uint16_t)
+                                  : sizeof(uint32_t);
+      uint64_t index_length = uint64_t(index_count) * index_stride;
+      if (index_base > SharedMemory::kBufferSize ||
+          SharedMemory::kBufferSize - index_base < index_length) {
+        XELOGW(
+            "{} index buffer range out of bounds (base=0x{:08X} size={} "
+            "count={})",
+            label, static_cast<uint32_t>(index_base), index_length,
+            index_count);
+        return false;
+      }
+      if (!shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
+                                        static_cast<uint32_t>(index_length))) {
+        XELOGE(
+            "Failed to request {} index buffer at 0x{:08X} (size {}) in "
+            "shared memory",
+            label, static_cast<uint32_t>(index_base), index_length);
+        return false;
+      }
+      return true;
+    };
+    if (guest_dma_index_buffer_read &&
+        !request_guest_index_range(
+            primitive_processing_result.guest_index_base,
+            primitive_processing_result.host_draw_vertex_count,
+            primitive_processing_result.host_index_format, "guest DMA")) {
+      return false;
+    }
+    if (shader_primitive_index_load &&
+        !request_guest_index_range(
+            primitive_processing_result.guest_index_base,
+            primitive_processing_result.guest_draw_vertex_count,
+            regs.Get<reg::VGT_DRAW_INITIATOR>().index_size,
+            "shader primitive")) {
+      return false;
     }
 
     for (const auto& binding : vb_bindings) {
@@ -2660,17 +2709,19 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     add_shared_memory_hazard_range(vertex_ranges[i].offset,
                                    vertex_ranges[i].length);
   }
-  if (!memexport_used &&
-      primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
-    uint32_t index_stride =
-        primitive_processing_result.host_index_format ==
-                xenos::IndexFormat::kInt16
-            ? sizeof(uint16_t)
-            : sizeof(uint32_t);
-    uint64_t index_length =
-        uint64_t(primitive_processing_result.host_draw_vertex_count) *
-        index_stride;
+  if (guest_dma_index_buffer_read || shader_primitive_index_load) {
+    const xenos::IndexFormat index_format =
+        shader_primitive_index_load
+            ? regs.Get<reg::VGT_DRAW_INITIATOR>().index_size
+            : primitive_processing_result.host_index_format;
+    uint32_t index_stride = index_format == xenos::IndexFormat::kInt16
+                                ? sizeof(uint16_t)
+                                : sizeof(uint32_t);
+    uint32_t index_count =
+        shader_primitive_index_load
+            ? primitive_processing_result.guest_draw_vertex_count
+            : primitive_processing_result.host_draw_vertex_count;
+    uint64_t index_length = uint64_t(index_count) * index_stride;
     if (index_length <= SharedMemory::kBufferSize) {
       add_shared_memory_hazard_range(
           static_cast<uint32_t>(primitive_processing_result.guest_index_base),
@@ -2685,10 +2736,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
   MTL::RenderStages shared_memory_consumer_stages = MTL::RenderStages(0);
-  if (vertex_range_count ||
-      (!memexport_used &&
-       primitive_processing_result.index_buffer_type ==
-           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA)) {
+  if (vertex_range_count || guest_dma_index_buffer_read ||
+      shader_primitive_index_load) {
     shared_memory_consumer_stages =
         (use_geometry_emulation || use_tessellation_emulation)
             ? MTL::RenderStages(MTL::RenderStageObject | MTL::RenderStageMesh)
@@ -4149,9 +4198,9 @@ bool MetalCommandProcessor::DispatchDraw(
     }
   }
 
-  auto request_guest_index_range = [&](uint64_t index_base,
-                                       uint32_t index_count,
-                                       MTL::IndexType index_type) -> bool {
+  auto validate_guest_index_range = [&](uint64_t index_base,
+                                        uint32_t index_count,
+                                        MTL::IndexType index_type) -> bool {
     if (!shared_memory_) {
       return false;
     }
@@ -4166,8 +4215,7 @@ bool MetalCommandProcessor::DispatchDraw(
           static_cast<uint32_t>(index_base), index_length, index_count);
       return false;
     }
-    return shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
-                                        static_cast<uint32_t>(index_length));
+    return true;
   };
   auto resolve_guest_dma_index_buffer =
       [&](uint64_t guest_index_base, uint32_t index_count,
@@ -4187,7 +4235,8 @@ bool MetalCommandProcessor::DispatchDraw(
       index_offset_out = prepared_guest_dma_index_buffer->offset;
       return true;
     }
-    if (!request_guest_index_range(guest_index_base, index_count, index_type)) {
+    if (!validate_guest_index_range(guest_index_base, index_count,
+                                    index_type)) {
       return false;
     }
     MTL::Buffer* shared_mem_buffer =

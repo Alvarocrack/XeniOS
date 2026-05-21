@@ -10,9 +10,12 @@
 #ifndef XENIA_GPU_METAL_METAL_SHARED_MEMORY_H_
 #define XENIA_GPU_METAL_METAL_SHARED_MEMORY_H_
 
-// Metal shared memory attempts bytes-no-copy aliasing on unified-memory
-// devices and falls back to staged uploads when unsupported.
+// Metal shared memory keeps a Metal-owned guest-memory buffer and updates dirty
+// guest ranges through submission-owned upload staging buffers.
 
+#include <memory>
+
+#include "xenia/gpu/metal/metal_upload_buffer_pool.h"
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/ui/metal/metal_api.h"
 
@@ -44,8 +47,8 @@ class MetalSharedMemory : public SharedMemory {
 
  private:
   MetalCommandProcessor& command_processor_;
+  std::unique_ptr<MetalUploadBufferPool> upload_buffer_pool_;
   MTL::Buffer* buffer_ = nullptr;
-  bool use_zero_copy_ = false;
 };
 
 }  // namespace metal
