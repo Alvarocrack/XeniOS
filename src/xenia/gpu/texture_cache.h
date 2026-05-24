@@ -128,6 +128,9 @@ class TextureCache {
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
   bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
+  // Conservative non-mutating check for whether RequestTextures may call
+  // LoadTextureDataFromResidentMemoryImpl for any used texture.
+  bool MayRequestTexturesLoadData(uint32_t used_texture_mask) const;
   uint32_t GetUsedTextureRequestWorkMask(uint32_t used_texture_mask) const;
   uint32_t GetUsedTextureRangeOverlapMask(uint32_t used_texture_mask,
                                           uint32_t start,
@@ -603,6 +606,21 @@ class TextureCache {
   }
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
+  virtual bool PrepareTextureDataLoadRanges(Texture** textures,
+                                            uint32_t texture_count,
+                                            uint64_t base_outdated_mask,
+                                            uint64_t mips_outdated_mask) {
+    return true;
+  }
+  enum class TextureDataRangeSource {
+    kBase,
+    kMips,
+  };
+  virtual bool RequestTextureDataRange(Texture& texture,
+                                       TextureDataRangeSource source,
+                                       uint32_t start, uint32_t length) {
+    return shared_memory().RequestRange(start, length);
+  }
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
