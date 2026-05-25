@@ -837,6 +837,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
   std::vector<MTL::Texture*> current_texture_bindless_resources_vertex_;
   std::vector<MTL::Texture*> current_texture_bindless_resources_pixel_;
+  std::vector<uint32_t> scratch_texture_bindless_indices_vertex_;
+  std::vector<MTL::Texture*> scratch_texture_bindless_resources_vertex_;
+  std::vector<uint32_t> scratch_sampler_bindless_indices_vertex_;
+  std::vector<uint32_t> scratch_texture_bindless_indices_pixel_;
+  std::vector<MTL::Texture*> scratch_texture_bindless_resources_pixel_;
+  std::vector<uint32_t> scratch_sampler_bindless_indices_pixel_;
   std::array<bool, kStageCount> current_bindless_stage_root_valid_ = {};
   std::array<uint64_t, kStageCount> current_bindless_stage_root_serials_ = {};
   uint64_t current_bindless_stable_resources_serial_ = 0;

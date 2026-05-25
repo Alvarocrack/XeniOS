@@ -2992,9 +2992,15 @@ bool MetalCommandProcessor::PrepareDrawConstants(
       metal_vertex_shader->GetTextureBindingLayoutUserUID();
   size_t sampler_layout_uid_vertex =
       metal_vertex_shader->GetSamplerBindingLayoutUserUID();
-  std::vector<uint32_t> next_texture_bindless_indices_vertex;
-  std::vector<MTL::Texture*> next_texture_bindless_resources_vertex;
-  std::vector<uint32_t> next_sampler_bindless_indices_vertex;
+  auto& next_texture_bindless_indices_vertex =
+      scratch_texture_bindless_indices_vertex_;
+  auto& next_texture_bindless_resources_vertex =
+      scratch_texture_bindless_resources_vertex_;
+  auto& next_sampler_bindless_indices_vertex =
+      scratch_sampler_bindless_indices_vertex_;
+  next_texture_bindless_indices_vertex.clear();
+  next_texture_bindless_resources_vertex.clear();
+  next_sampler_bindless_indices_vertex.clear();
   if (sampler_count_vertex) {
     if (current_sampler_layout_uid_vertex_ != sampler_layout_uid_vertex) {
       current_sampler_layout_uid_vertex_ = sampler_layout_uid_vertex;
@@ -3065,9 +3071,15 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   size_t sampler_layout_uid_pixel = 0;
   const std::vector<DxbcShader::TextureBinding>* texture_bindings_pixel_ptr =
       nullptr;
-  std::vector<uint32_t> next_texture_bindless_indices_pixel;
-  std::vector<MTL::Texture*> next_texture_bindless_resources_pixel;
-  std::vector<uint32_t> next_sampler_bindless_indices_pixel;
+  auto& next_texture_bindless_indices_pixel =
+      scratch_texture_bindless_indices_pixel_;
+  auto& next_texture_bindless_resources_pixel =
+      scratch_texture_bindless_resources_pixel_;
+  auto& next_sampler_bindless_indices_pixel =
+      scratch_sampler_bindless_indices_pixel_;
+  next_texture_bindless_indices_pixel.clear();
+  next_texture_bindless_resources_pixel.clear();
+  next_sampler_bindless_indices_pixel.clear();
   if (metal_pixel_shader) {
     const auto& texture_bindings_pixel =
         metal_pixel_shader->GetTextureBindingsAfterTranslation();
@@ -3402,11 +3414,11 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (descriptor_indices_vertex_written) {
     current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
     current_texture_bindless_indices_vertex_ =
-        std::move(next_texture_bindless_indices_vertex);
+        next_texture_bindless_indices_vertex;
     current_texture_bindless_resources_vertex_ =
-        std::move(next_texture_bindless_resources_vertex);
+        next_texture_bindless_resources_vertex;
     current_sampler_bindless_indices_vertex_ =
-        std::move(next_sampler_bindless_indices_vertex);
+        next_sampler_bindless_indices_vertex;
     if (texture_count_vertex) {
       current_texture_srv_keys_vertex_.resize(std::max(
           current_texture_srv_keys_vertex_.size(), texture_count_vertex));
@@ -3418,11 +3430,11 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (descriptor_indices_pixel_written) {
     current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
     current_texture_bindless_indices_pixel_ =
-        std::move(next_texture_bindless_indices_pixel);
+        next_texture_bindless_indices_pixel;
     current_texture_bindless_resources_pixel_ =
-        std::move(next_texture_bindless_resources_pixel);
+        next_texture_bindless_resources_pixel;
     current_sampler_bindless_indices_pixel_ =
-        std::move(next_sampler_bindless_indices_pixel);
+        next_sampler_bindless_indices_pixel;
     if (texture_bindings_pixel_ptr && !texture_bindings_pixel_ptr->empty()) {
       current_texture_srv_keys_pixel_.resize(
           std::max(current_texture_srv_keys_pixel_.size(),
