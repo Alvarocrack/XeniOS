@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_METAL_METAL_SHADER_H_
 #define XENIA_GPU_METAL_METAL_SHADER_H_
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,14 @@ class MetalShader : public DxbcShader {
               const uint32_t* ucode_dwords, size_t ucode_dword_count,
               std::endian ucode_source_endian = std::endian::big);
 
+  struct DrawConstantMetadata {
+    DxbcShader::FetchConstantDwordMask shader_fetch_constant_dword_mask = {};
+    uint32_t descriptor_indices_word_count = 1;
+    uint32_t active_cbv_mask = 0;
+  };
+
+  const DrawConstantMetadata& GetDrawConstantMetadata() const;
+
   // For owning subsystem like the pipeline cache, accessors for unique
   // identifiers (used instead of hashes to make sure collisions can't happen)
   // of binding layouts used by the shader, for invalidation if a shader with an
@@ -100,6 +109,8 @@ class MetalShader : public DxbcShader {
   std::atomic_flag binding_layout_user_uids_set_up_ = ATOMIC_FLAG_INIT;
   size_t texture_binding_layout_user_uid_ = 0;
   size_t sampler_binding_layout_user_uid_ = 0;
+  mutable std::once_flag draw_constant_metadata_once_;
+  mutable DrawConstantMetadata draw_constant_metadata_ = {};
 };
 
 }  // namespace metal

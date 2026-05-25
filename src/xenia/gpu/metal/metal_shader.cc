@@ -11,9 +11,11 @@
 
 #include <dispatch/dispatch.h>
 #include <inttypes.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #ifndef DISPATCH_DATA_DESTRUCTOR_NONE
 #define DISPATCH_DATA_DESTRUCTOR_NONE DISPATCH_DATA_DESTRUCTOR_DEFAULT
@@ -22,6 +24,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/string.h"
 #include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -34,12 +37,113 @@ namespace xe {
 namespace gpu {
 namespace metal {
 
+namespace {
+
+constexpr uint32_t kAllTranslatedCbvMask =
+    (uint32_t(1)
+     << (uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices) +
+         1)) -
+    1;
+constexpr uint32_t kDescriptorIndicesCbvSizeBytes = 4096;
+
+void MarkFetchConstantDword(DxbcShader::FetchConstantDwordMask& mask,
+                            uint32_t dword_index) {
+  if (dword_index >= DxbcShader::kFetchConstantDwordCount) {
+    assert_always();
+    return;
+  }
+  mask[dword_index >> 5] |= uint32_t(1) << (dword_index & 31);
+}
+
+void MarkVertexFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
+                             uint32_t fetch_constant_index) {
+  if (fetch_constant_index >= xenos::kVertexFetchConstantCount) {
+    assert_always();
+    return;
+  }
+  const uint32_t dword_index = fetch_constant_index * 2;
+  MarkFetchConstantDword(mask, dword_index);
+  MarkFetchConstantDword(mask, dword_index + 1);
+}
+
+void MarkTextureFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
+                              uint32_t fetch_constant_index) {
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    assert_always();
+    return;
+  }
+  const uint32_t dword_index = fetch_constant_index * 6;
+  for (uint32_t i = 0; i < 6; ++i) {
+    MarkFetchConstantDword(mask, dword_index + i);
+  }
+}
+
+}  // namespace
+
 MetalShader::MetalShader(xenos::ShaderType shader_type,
                          uint64_t ucode_data_hash, const uint32_t* ucode_dwords,
                          size_t ucode_dword_count,
                          std::endian ucode_source_endian)
     : DxbcShader(shader_type, ucode_data_hash, ucode_dwords, ucode_dword_count,
                  ucode_source_endian) {}
+
+const MetalShader::DrawConstantMetadata&
+MetalShader::GetDrawConstantMetadata() const {
+  std::call_once(draw_constant_metadata_once_, [this]() {
+    DrawConstantMetadata metadata = {};
+
+    const Shader::ConstantRegisterMap& constant_map = constant_register_map();
+    for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap);
+         ++i) {
+      uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+      uint32_t bit_index;
+      while (xe::bit_scan_forward(vfetch_bits_remaining, &bit_index)) {
+        vfetch_bits_remaining = xe::clear_lowest_bit(vfetch_bits_remaining);
+        MarkVertexFetchConstant(metadata.shader_fetch_constant_dword_mask,
+                                i * 32 + bit_index);
+      }
+    }
+
+    for (const Shader::VertexBinding& binding : vertex_bindings()) {
+      MarkVertexFetchConstant(metadata.shader_fetch_constant_dword_mask,
+                              binding.fetch_constant);
+    }
+    for (const Shader::TextureBinding& binding : texture_bindings()) {
+      MarkTextureFetchConstant(metadata.shader_fetch_constant_dword_mask,
+                               binding.fetch_constant);
+    }
+
+    constexpr uint32_t kMaxDescriptorIndexWords =
+        kDescriptorIndicesCbvSizeBytes / sizeof(uint32_t);
+    metadata.descriptor_indices_word_count = 1;
+    for (const DxbcShader::TextureBinding& binding :
+         GetTextureBindingsAfterTranslation()) {
+      assert_true(binding.bindless_descriptor_index < kMaxDescriptorIndexWords);
+      if (binding.bindless_descriptor_index < kMaxDescriptorIndexWords) {
+        metadata.descriptor_indices_word_count =
+            std::max(metadata.descriptor_indices_word_count,
+                     binding.bindless_descriptor_index + 1);
+      }
+    }
+    for (const DxbcShader::SamplerBinding& binding :
+         GetSamplerBindingsAfterTranslation()) {
+      assert_true(binding.bindless_descriptor_index < kMaxDescriptorIndexWords);
+      if (binding.bindless_descriptor_index < kMaxDescriptorIndexWords) {
+        metadata.descriptor_indices_word_count =
+            std::max(metadata.descriptor_indices_word_count,
+                     binding.bindless_descriptor_index + 1);
+      }
+    }
+
+    const uint32_t used_cbuffer_mask = GetUsedCbufferMaskAfterTranslation();
+    metadata.active_cbv_mask =
+        used_cbuffer_mask ? (used_cbuffer_mask & kAllTranslatedCbvMask)
+                          : kAllTranslatedCbvMask;
+
+    draw_constant_metadata_ = metadata;
+  });
+  return draw_constant_metadata_;
+}
 
 MetalShader::MetalTranslation::~MetalTranslation() {
   if (metal_function_) {

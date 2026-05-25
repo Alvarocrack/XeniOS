@@ -570,22 +570,6 @@ const char* RenderEncoderBufferStageName(size_t stage) {
   }
 }
 
-uint32_t ActiveCbvMaskForShader(const MetalShader* shader) {
-  constexpr uint32_t kAllTranslatedCbvMask =
-      (uint32_t(1)
-       << (uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices) +
-           1)) -
-      1;
-  if (!shader) {
-    return 0;
-  }
-  uint32_t used_cbuffer_mask = shader->GetUsedCbufferMaskAfterTranslation();
-  if (!used_cbuffer_mask) {
-    return kAllTranslatedCbvMask;
-  }
-  return used_cbuffer_mask & kAllTranslatedCbvMask;
-}
-
 bool FetchConstantDwordMasksOverlap(
     const DxbcShader::FetchConstantDwordMask& a,
     const DxbcShader::FetchConstantDwordMask& b) {
@@ -620,61 +604,11 @@ void MarkFetchConstantDword(DxbcShader::FetchConstantDwordMask& mask,
   mask[dword_index >> 5] |= uint32_t(1) << (dword_index & 31);
 }
 
-void MarkVertexFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
-                             uint32_t fetch_constant_index) {
-  if (fetch_constant_index >= xenos::kVertexFetchConstantCount) {
-    assert_always();
-    return;
-  }
-  const uint32_t dword_index = fetch_constant_index * 2;
-  MarkFetchConstantDword(mask, dword_index);
-  MarkFetchConstantDword(mask, dword_index + 1);
-}
-
-void MarkTextureFetchConstant(DxbcShader::FetchConstantDwordMask& mask,
-                              uint32_t fetch_constant_index) {
-  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
-    assert_always();
-    return;
-  }
-  const uint32_t dword_index = fetch_constant_index * 6;
-  for (uint32_t i = 0; i < 6; ++i) {
-    MarkFetchConstantDword(mask, dword_index + i);
-  }
-}
-
 void MergeFetchConstantDwordMask(DxbcShader::FetchConstantDwordMask& dest,
                                  const DxbcShader::FetchConstantDwordMask& src) {
   for (size_t i = 0; i < dest.size(); ++i) {
     dest[i] |= src[i];
   }
-}
-
-DxbcShader::FetchConstantDwordMask GetShaderFetchConstantDwordMask(
-    const Shader* shader) {
-  DxbcShader::FetchConstantDwordMask mask = {};
-  if (!shader) {
-    return mask;
-  }
-
-  const Shader::ConstantRegisterMap& constant_map =
-      shader->constant_register_map();
-  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap); ++i) {
-    uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
-    uint32_t bit_index;
-    while (xe::bit_scan_forward(vfetch_bits_remaining, &bit_index)) {
-      vfetch_bits_remaining = xe::clear_lowest_bit(vfetch_bits_remaining);
-      MarkVertexFetchConstant(mask, i * 32 + bit_index);
-    }
-  }
-
-  for (const Shader::VertexBinding& binding : shader->vertex_bindings()) {
-    MarkVertexFetchConstant(mask, binding.fetch_constant);
-  }
-  for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
-    MarkTextureFetchConstant(mask, binding.fetch_constant);
-  }
-  return mask;
 }
 
 }  // namespace
@@ -2927,14 +2861,18 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   //   b2: Bool/loop constants
   //   b3: Fetch constants
   //   b4: Descriptor indices
-  const size_t kCBVSize = kCbvSizeBytes;
   constexpr size_t kBoolLoopConstantsSize = (8 + 32) * sizeof(uint32_t);
   const size_t kFetchConstantCount =
       xenos::kTextureFetchConstantCount * 6;  // 192 DWORDs = 768 bytes
 
+  const MetalShader::DrawConstantMetadata& vertex_draw_metadata =
+      metal_vertex_shader->GetDrawConstantMetadata();
+  const MetalShader::DrawConstantMetadata* pixel_draw_metadata =
+      metal_pixel_shader ? &metal_pixel_shader->GetDrawConstantMetadata()
+                         : nullptr;
   std::array<uint32_t, kStageCount> active_cbv_masks = {
-      ActiveCbvMaskForShader(metal_vertex_shader),
-      ActiveCbvMaskForShader(metal_pixel_shader)};
+      vertex_draw_metadata.active_cbv_mask,
+      pixel_draw_metadata ? pixel_draw_metadata->active_cbv_mask : 0};
   std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
       fetch_constant_dword_masks = {
           metal_vertex_shader
@@ -2944,9 +2882,13 @@ bool MetalCommandProcessor::PrepareDrawConstants(
               ? metal_pixel_shader->GetFetchConstantDwordMaskAfterTranslation()
               : DxbcShader::FetchConstantDwordMask()};
   MergeFetchConstantDwordMask(fetch_constant_dword_masks[kStageVertex],
-                              GetShaderFetchConstantDwordMask(vertex_shader));
-  MergeFetchConstantDwordMask(fetch_constant_dword_masks[kStagePixel],
-                              GetShaderFetchConstantDwordMask(pixel_shader));
+                              vertex_draw_metadata
+                                  .shader_fetch_constant_dword_mask);
+  if (pixel_draw_metadata) {
+    MergeFetchConstantDwordMask(
+        fetch_constant_dword_masks[kStagePixel],
+        pixel_draw_metadata->shader_fetch_constant_dword_mask);
+  }
   for (size_t stage = 0; stage < kStageCount; ++stage) {
     if ((active_cbv_masks[stage] & (uint32_t(1) << kCbvSlotFetch)) &&
         FetchConstantDwordMaskEmpty(fetch_constant_dword_masks[stage])) {
@@ -3328,36 +3270,12 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     }
   }
 
-  auto descriptor_indices_word_count = [&](MetalShader* shader) -> uint32_t {
-    uint32_t word_count = 1;
-    if (!shader) {
-      return word_count;
-    }
-    constexpr uint32_t kMaxDescriptorIndexWords = kCBVSize / sizeof(uint32_t);
-    const auto& tex_bindings = shader->GetTextureBindingsAfterTranslation();
-    for (const auto& binding : tex_bindings) {
-      assert_true(binding.bindless_descriptor_index < kMaxDescriptorIndexWords);
-      if (binding.bindless_descriptor_index < kMaxDescriptorIndexWords) {
-        word_count =
-            std::max(word_count, binding.bindless_descriptor_index + 1);
-      }
-    }
-    const auto& smp_bindings = shader->GetSamplerBindingsAfterTranslation();
-    for (const auto& binding : smp_bindings) {
-      assert_true(binding.bindless_descriptor_index < kMaxDescriptorIndexWords);
-      if (binding.bindless_descriptor_index < kMaxDescriptorIndexWords) {
-        word_count =
-            std::max(word_count, binding.bindless_descriptor_index + 1);
-      }
-    }
-    return word_count;
-  };
-
   auto build_descriptor_indices =
       [&](MetalShader* shader, std::vector<uint32_t>& words,
+          const MetalShader::DrawConstantMetadata* metadata,
           const std::vector<uint32_t>& texture_indices,
           const std::vector<uint32_t>& sampler_indices) {
-        words.assign(descriptor_indices_word_count(shader), 0);
+        words.assign(metadata ? metadata->descriptor_indices_word_count : 1, 0);
         if (!shader || !texture_cache_) {
           return;
         }
@@ -3398,6 +3316,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
     build_descriptor_indices(metal_vertex_shader,
                              scratch_descriptor_indices_vertex_,
+                             &vertex_draw_metadata,
                              next_texture_bindless_indices_vertex,
                              next_sampler_bindless_indices_vertex);
     const bool can_reuse_descriptor_indices =
@@ -3423,6 +3342,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
     build_descriptor_indices(metal_pixel_shader,
                              scratch_descriptor_indices_pixel_,
+                             pixel_draw_metadata,
                              next_texture_bindless_indices_pixel,
                              next_sampler_bindless_indices_pixel);
     const bool can_reuse_descriptor_indices =
