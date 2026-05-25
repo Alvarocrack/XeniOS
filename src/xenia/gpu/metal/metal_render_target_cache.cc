@@ -2435,15 +2435,18 @@ bool MetalRenderTargetCache::Update(
       ++telemetry_.update_transfer_lists;
       ++telemetry_.pending_draw_pass_transfer_lists;
       telemetry_.pending_draw_pass_transfer_count += transfers.size();
+      PendingDrawPassTransferPlan pending_plan_storage;
       DrawPassTransferRejectionReason draw_pass_rejection =
-          GetDrawPassTransferRejectionReason(i, accumulated_targets, transfers);
+          GetDrawPassTransferRejectionReason(
+              i, accumulated_targets, transfers,
+              &pending_plan_storage.transfer_rectangles);
       size_t rejection_index = static_cast<size_t>(draw_pass_rejection);
       if (rejection_index < telemetry_.pending_draw_pass_rejections.size()) {
         ++telemetry_.pending_draw_pass_rejections[rejection_index];
       }
       PendingDrawPassTransferPlan& pending_plan =
           pending_draw_pass_transfer_plans_[i];
-      pending_plan = PendingDrawPassTransferPlan();
+      pending_plan = std::move(pending_plan_storage);
       pending_plan.render_target = accumulated_targets[i];
       pending_plan.rejection_reason = draw_pass_rejection;
       if (draw_pass_rejection == DrawPassTransferRejectionReason::kNone) {
@@ -2455,7 +2458,8 @@ bool MetalRenderTargetCache::Update(
         pending_draw_pass_load_dontcare_mask_ = 0;
         pending_plan.full_overwrite =
             PendingDrawPassTransfersFullyOverwriteTarget(
-                i, accumulated_targets[i], transfers);
+                i, accumulated_targets[i], transfers,
+                &pending_plan.transfer_rectangles);
         if (pending_plan.full_overwrite) {
           ++telemetry_.pending_draw_pass_full_overwrite_lists;
           pending_draw_pass_full_overwrite_mask_ |= uint32_t(1) << i;
@@ -2527,7 +2531,8 @@ void MetalRenderTargetCache::ClearPendingDrawPassTransfers() {
 MetalRenderTargetCache::DrawPassTransferRejectionReason
 MetalRenderTargetCache::GetDrawPassTransferRejectionReason(
     uint32_t render_target_index, RenderTarget* const* render_targets,
-    const std::vector<Transfer>& transfers) const {
+    const std::vector<Transfer>& transfers,
+    std::vector<TransferRectanglePlan>* transfer_rectangles_out) const {
   if (!render_targets || transfers.empty() ||
       render_target_index > xenos::kMaxColorRenderTargets) {
     return DrawPassTransferRejectionReason::kInvalidTargetSlot;
@@ -2646,21 +2651,50 @@ MetalRenderTargetCache::GetDrawPassTransferRejectionReason(
       }
       return DrawPassTransferRejectionReason::kSourceActiveInDrawPass;
     }
+  }
 
-    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-    if (!transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
-                                dest_key.msaa_samples, dest_key.Is64bpp(),
-                                rectangles, nullptr)) {
-      return DrawPassTransferRejectionReason::kInvalidRectangles;
-    }
+  std::vector<TransferRectanglePlan> local_transfer_rectangles;
+  std::vector<TransferRectanglePlan>& transfer_rectangles =
+      transfer_rectangles_out ? *transfer_rectangles_out
+                              : local_transfer_rectangles;
+  if (!BuildTransferRectanglePlans(dest_key, transfers, nullptr, true,
+                                   transfer_rectangles)) {
+    return DrawPassTransferRejectionReason::kInvalidRectangles;
   }
 
   return DrawPassTransferRejectionReason::kNone;
 }
 
+bool MetalRenderTargetCache::BuildTransferRectanglePlans(
+    RenderTargetKey dest_key, const std::vector<Transfer>& transfers,
+    const Transfer::Rectangle* cutout, bool require_all_rectangles,
+    std::vector<TransferRectanglePlan>& transfer_rectangles_out) const {
+  transfer_rectangles_out.clear();
+  transfer_rectangles_out.reserve(transfers.size());
+  for (uint32_t transfer_index = 0; transfer_index < transfers.size();
+       ++transfer_index) {
+    const Transfer& transfer = transfers[transfer_index];
+    TransferRectanglePlan plan;
+    plan.transfer_index = transfer_index;
+    plan.rectangle_count = transfer.GetRectangles(
+        dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
+        dest_key.Is64bpp(), plan.rectangles.data(), cutout);
+    if (!plan.rectangle_count) {
+      if (require_all_rectangles) {
+        transfer_rectangles_out.clear();
+        return false;
+      }
+      continue;
+    }
+    transfer_rectangles_out.push_back(plan);
+  }
+  return true;
+}
+
 bool MetalRenderTargetCache::PendingDrawPassTransfersFullyOverwriteTarget(
     uint32_t render_target_index, RenderTarget* render_target,
-    const std::vector<Transfer>& transfers) const {
+    const std::vector<Transfer>& transfers,
+    const std::vector<TransferRectanglePlan>* transfer_rectangles) const {
   if (!render_target || transfers.empty() ||
       render_target_index > xenos::kMaxColorRenderTargets) {
     return false;
@@ -2692,12 +2726,20 @@ bool MetalRenderTargetCache::PendingDrawPassTransfersFullyOverwriteTarget(
            scaled_height == dest_height;
   };
 
-  for (const Transfer& transfer : transfers) {
-    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-    uint32_t rectangle_count = transfer.GetRectangles(
-        dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
-        dest_key.Is64bpp(), rectangles, nullptr);
-    if (rectangle_count != 1 || !is_full_target_rectangle(rectangles[0])) {
+  std::vector<TransferRectanglePlan> local_transfer_rectangles;
+  if (!transfer_rectangles) {
+    if (!BuildTransferRectanglePlans(dest_key, transfers, nullptr, true,
+                                     local_transfer_rectangles)) {
+      return false;
+    }
+    transfer_rectangles = &local_transfer_rectangles;
+  }
+  if (transfer_rectangles->size() != transfers.size()) {
+    return false;
+  }
+  for (const TransferRectanglePlan& transfer_plan : *transfer_rectangles) {
+    if (transfer_plan.rectangle_count != 1 ||
+        !is_full_target_rectangle(transfer_plan.rectangles[0])) {
       return false;
     }
   }
@@ -2799,6 +2841,16 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
     }
 
     RenderTargetKey dest_key = dest_metal_rt->key();
+    PendingDrawPassTransferPlan& pending_plan =
+        pending_draw_pass_transfer_plans_[i];
+    if (pending_plan.transfer_rectangles.size() !=
+        pending_draw_pass_transfers_[i].size()) {
+      if (!BuildTransferRectanglePlans(dest_key, pending_draw_pass_transfers_[i],
+                                       nullptr, true,
+                                       pending_plan.transfer_rectangles)) {
+        return false;
+      }
+    }
     bool dest_is_uint = false;
     uint32_t color_attachment_index = 0;
     MTL::PixelFormat dest_format = MTL::PixelFormatInvalid;
@@ -3022,7 +3074,7 @@ bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
       1 + xenos::kMaxColorRenderTargets,
       pending_draw_pass_render_targets_.data(),
       pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr, encoder,
-      pass_descriptor, mutations_out);
+      pass_descriptor, mutations_out, pending_draw_pass_transfer_plans_.data());
   if (success) {
     ++telemetry_.pending_draw_pass_encode_successes;
     ClearPendingDrawPassTransfers();
@@ -3040,7 +3092,8 @@ bool MetalRenderTargetCache::FlushPendingDrawPassTransfers() {
   bool success = PerformTransfersAndResolveClears(
       1 + xenos::kMaxColorRenderTargets,
       pending_draw_pass_render_targets_.data(),
-      pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr);
+      pending_draw_pass_transfers_.data(), nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, pending_draw_pass_transfer_plans_.data());
   if (!success) {
     ++telemetry_.pending_draw_pass_flush_failures;
     return false;
@@ -5565,7 +5618,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::CommandBuffer* command_buffer,
     MTL::RenderCommandEncoder* active_render_encoder,
     MTL::RenderPassDescriptor* active_render_pass_descriptor,
-    DrawPassTransferEncoderMutationMask* mutations_out) {
+    DrawPassTransferEncoderMutationMask* mutations_out,
+    const PendingDrawPassTransferPlan* prepared_draw_pass_transfer_plans) {
   ++telemetry_.perform_transfer_calls;
   if (mutations_out) {
     *mutations_out = kDrawPassTransferEncoderMutationNone;
@@ -5603,6 +5657,15 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
   }
   bool any_work = false;
   bool host_depth_store_needed = false;
+  std::array<std::vector<TransferRectanglePlan>,
+             1 + xenos::kMaxColorRenderTargets>
+      local_transfer_rectangle_plans;
+  std::array<const std::vector<TransferRectanglePlan>*,
+             1 + xenos::kMaxColorRenderTargets>
+      transfer_rectangle_plans = {};
+  if (render_target_count > transfer_rectangle_plans.size()) {
+    return false;
+  }
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
     if (!dest_rt) {
@@ -5616,21 +5679,37 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       continue;
     }
     RenderTargetKey dest_key = dest_rt->key();
-    bool transfers_have_rectangles = false;
-    for (const Transfer& transfer : transfers) {
-      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-      if (!transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
-                                  dest_key.msaa_samples, dest_key.Is64bpp(),
-                                  rectangles, resolve_clear_rectangle)) {
+    const std::vector<TransferRectanglePlan>* target_transfer_rectangles = nullptr;
+    if (prepared_draw_pass_transfer_plans) {
+      const PendingDrawPassTransferPlan& prepared_plan =
+          prepared_draw_pass_transfer_plans[i];
+      if (prepared_plan.render_target == dest_rt &&
+          prepared_plan.rejection_reason ==
+              DrawPassTransferRejectionReason::kNone &&
+          prepared_plan.transfer_rectangles.size() == transfers.size()) {
+        target_transfer_rectangles = &prepared_plan.transfer_rectangles;
+      }
+    }
+    if (!target_transfer_rectangles) {
+      std::vector<TransferRectanglePlan>& local_transfer_rectangles =
+          local_transfer_rectangle_plans[i];
+      if (!BuildTransferRectanglePlans(dest_key, transfers,
+                                       resolve_clear_rectangle, false,
+                                       local_transfer_rectangles)) {
         continue;
       }
-      transfers_have_rectangles = true;
+      target_transfer_rectangles = &local_transfer_rectangles;
+    }
+    transfer_rectangle_plans[i] = target_transfer_rectangles;
+    if (target_transfer_rectangles->empty()) {
+      continue;
+    }
+    for (const TransferRectanglePlan& transfer_plan :
+         *target_transfer_rectangles) {
+      const Transfer& transfer = transfers[transfer_plan.transfer_index];
       if (dest_key.is_depth && transfer.host_depth_source == dest_rt) {
         host_depth_store_needed = true;
       }
-    }
-    if (!transfers_have_rectangles) {
-      continue;
     }
     any_work = true;
   }
@@ -5689,7 +5768,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         continue;
       }
       const std::vector<Transfer>& depth_transfers = render_target_transfers[i];
-      for (const Transfer& transfer : depth_transfers) {
+      const std::vector<TransferRectanglePlan>* depth_transfer_rectangles =
+          transfer_rectangle_plans[i];
+      if (!depth_transfer_rectangles) {
+        continue;
+      }
+      for (const TransferRectanglePlan& transfer_plan :
+           *depth_transfer_rectangles) {
+        const Transfer& transfer = depth_transfers[transfer_plan.transfer_index];
         if (transfer.host_depth_source != dest_rt) {
           continue;
         }
@@ -5707,11 +5793,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
               uint32_t(dest_key.msaa_samples));
           continue;
         }
-        Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-        uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.pitch_tiles_at_32bpp,
-            dest_key.msaa_samples, false, rectangles, resolve_clear_rectangle);
-        if (!rectangle_count) {
+        if (!transfer_plan.rectangle_count) {
           continue;
         }
         HostDepthStoreRenderTargetConstant render_target_constant =
@@ -5738,14 +5820,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           depth_store_encoder->useResource(depth_texture,
                                            MTL::ResourceUsageRead);
         }
-        for (uint32_t rect_index = 0; rect_index < rectangle_count;
+        for (uint32_t rect_index = 0; rect_index < transfer_plan.rectangle_count;
              ++rect_index) {
           uint32_t group_count_x = 0;
           uint32_t group_count_y = 0;
           HostDepthStoreRectangleConstant rectangle_constant;
           GetHostDepthStoreRectangleInfo(
-              rectangles[rect_index], dest_key.msaa_samples, rectangle_constant,
-              group_count_x, group_count_y);
+              transfer_plan.rectangles[rect_index], dest_key.msaa_samples,
+              rectangle_constant, group_count_x, group_count_y);
           if (!group_count_x || !group_count_y) {
             continue;
           }
@@ -5775,7 +5857,10 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     }
 
     const std::vector<Transfer>& transfers = render_target_transfers[i];
-    if (transfers.empty() && !resolve_clear_needed) {
+    const std::vector<TransferRectanglePlan>* target_transfer_rectangles =
+        transfer_rectangle_plans[i];
+    if ((!target_transfer_rectangles || target_transfer_rectangles->empty()) &&
+        !resolve_clear_needed) {
       continue;
     }
 
@@ -5910,7 +5995,16 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       return true;
     };
 
-    std::vector<Transfer> filtered_transfers;
+    std::vector<uint32_t> all_transfer_plan_indices;
+    if (target_transfer_rectangles) {
+      all_transfer_plan_indices.reserve(target_transfer_rectangles->size());
+      for (uint32_t transfer_plan_index = 0;
+           transfer_plan_index < target_transfer_rectangles->size();
+           ++transfer_plan_index) {
+        all_transfer_plan_indices.push_back(transfer_plan_index);
+      }
+    }
+    std::vector<uint32_t> filtered_transfer_plan_indices;
     bool used_blit = false;
     MTL::BlitCommandEncoder* blit_encoder = nullptr;
     auto ensure_blit_encoder = [&]() -> MTL::BlitCommandEncoder* {
@@ -5928,8 +6022,12 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
 
     // Fast path: when source/dest share compatible EDRAM layout and format,
     // use a blit instead of shader-based transfers.
-    if (!use_active_render_encoder && !transfers.empty()) {
-      auto try_blit_transfer = [&](const Transfer& transfer) -> bool {
+    if (!use_active_render_encoder && target_transfer_rectangles &&
+        !target_transfer_rectangles->empty()) {
+      auto try_blit_transfer = [&](uint32_t transfer_plan_index) -> bool {
+        const TransferRectanglePlan& transfer_plan =
+            (*target_transfer_rectangles)[transfer_plan_index];
+        const Transfer& transfer = transfers[transfer_plan.transfer_index];
         auto* source_rt = static_cast<MetalRenderTarget*>(transfer.source);
         if (!source_rt || transfer.host_depth_source) {
           return false;
@@ -5972,12 +6070,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           return false;
         }
 
-        Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-        uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.GetPitchTiles(),
-            dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
-            resolve_clear_rectangle);
-        if (!rectangle_count) {
+        if (!transfer_plan.rectangle_count) {
           return false;
         }
 
@@ -5986,14 +6079,14 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           return false;
         }
 
-        for (uint32_t rect_index = 0; rect_index < rectangle_count;
+        for (uint32_t rect_index = 0; rect_index < transfer_plan.rectangle_count;
              ++rect_index) {
           uint32_t scaled_x = 0;
           uint32_t scaled_y = 0;
           uint32_t scaled_width = 0;
           uint32_t scaled_height = 0;
-          if (!get_scaled_rect(rectangles[rect_index], scaled_x, scaled_y,
-                               scaled_width, scaled_height)) {
+          if (!get_scaled_rect(transfer_plan.rectangles[rect_index], scaled_x,
+                               scaled_y, scaled_width, scaled_height)) {
             continue;
           }
           MTL::Origin origin = MTL::Origin::Make(scaled_x, scaled_y, 0);
@@ -6007,9 +6100,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         return true;
       };
 
-      for (const Transfer& transfer : transfers) {
-        if (!try_blit_transfer(transfer)) {
-          filtered_transfers.push_back(transfer);
+      for (uint32_t transfer_plan_index : all_transfer_plan_indices) {
+        if (!try_blit_transfer(transfer_plan_index)) {
+          filtered_transfer_plan_indices.push_back(transfer_plan_index);
         }
       }
     }
@@ -6019,10 +6112,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     }
 
     const bool disable_transfer_shaders = false;
-    const std::vector<Transfer>& transfers_for_shaders =
-        used_blit ? filtered_transfers : transfers;
-    if (!transfers_for_shaders.empty()) {
-    }
+    const std::vector<uint32_t>& transfer_plan_indices_for_shaders =
+        used_blit ? filtered_transfer_plan_indices : all_transfer_plan_indices;
 
     auto is_full_target_rectangle =
         [&](const Transfer::Rectangle& rect) -> bool {
@@ -6039,16 +6130,15 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     };
 
     auto transfers_fully_overwrite_target = [&]() -> bool {
-      if (transfers_for_shaders.empty()) {
+      if (transfer_plan_indices_for_shaders.empty() ||
+          !target_transfer_rectangles) {
         return false;
       }
-      for (const Transfer& transfer : transfers_for_shaders) {
-        Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-        uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.GetPitchTiles(),
-            dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
-            resolve_clear_rectangle);
-        if (rectangle_count != 1 || !is_full_target_rectangle(rectangles[0])) {
+      for (uint32_t transfer_plan_index : transfer_plan_indices_for_shaders) {
+        const TransferRectanglePlan& transfer_plan =
+            (*target_transfer_rectangles)[transfer_plan_index];
+        if (transfer_plan.rectangle_count != 1 ||
+            !is_full_target_rectangle(transfer_plan.rectangles[0])) {
           return false;
         }
       }
@@ -6165,7 +6255,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
     }
-    if (resolve_clear_via_load_action && transfers_for_shaders.empty()) {
+    if (resolve_clear_via_load_action &&
+        transfer_plan_indices_for_shaders.empty()) {
       resolve_clear_via_load_action = false;
     }
 
@@ -6173,7 +6264,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     // stencil surface before the per-bit stencil draws run. A load-action
     // clear is cheaper than a separate clear draw in that case.
     bool transfer_stencil_clear_via_load_action =
-        dest_is_depth && !transfers_for_shaders.empty() &&
+        dest_is_depth && !transfer_plan_indices_for_shaders.empty() &&
         transfers_fully_overwrite_target() && !resolve_clear_via_load_action;
     if (transfer_stencil_clear_via_load_action) {
       resolve_clear_depth = 0.0;
@@ -6249,25 +6340,29 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       return transfer_encoder;
     };
 
-    if (!transfers_for_shaders.empty() && disable_transfer_shaders) {
+    if (!transfer_plan_indices_for_shaders.empty() && disable_transfer_shaders) {
       static uint32_t transfer_shader_skip_log_count = 0;
       if (transfer_shader_skip_log_count < 8) {
         ++transfer_shader_skip_log_count;
         XELOGW(
             "MetalRenderTargetCache::PerformTransfersAndResolveClears: "
             "transfer shaders disabled; skipping {} transfers for RT {}",
-            transfers_for_shaders.size(), i);
+            transfer_plan_indices_for_shaders.size(), i);
       }
-    } else if (!transfers_for_shaders.empty()) {
+    } else if (!transfer_plan_indices_for_shaders.empty() &&
+               target_transfer_rectangles) {
       bool need_stencil_bit_draws = dest_is_depth;
       bool stencil_clear_needed =
           need_stencil_bit_draws && !transfer_stencil_clear_via_load_action;
 
       transfer_invocations_.clear();
-      transfer_invocations_.reserve(transfers_for_shaders.size() *
+      transfer_invocations_.reserve(transfer_plan_indices_for_shaders.size() *
                                     (need_stencil_bit_draws ? 2 : 1));
 
-      for (const Transfer& transfer : transfers_for_shaders) {
+      for (uint32_t transfer_plan_index : transfer_plan_indices_for_shaders) {
+        const TransferRectanglePlan& transfer_plan =
+            (*target_transfer_rectangles)[transfer_plan_index];
+        const Transfer& transfer = transfers[transfer_plan.transfer_index];
         if (transfer.source) {
           auto* source = static_cast<MetalRenderTarget*>(transfer.source);
           source->SetTemporarySortIndex(UINT32_MAX);
@@ -6288,7 +6383,10 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
 
       for (uint32_t pass = 0; pass <= uint32_t(need_stencil_bit_draws);
            ++pass) {
-        for (const Transfer& transfer : transfers_for_shaders) {
+        for (uint32_t transfer_plan_index : transfer_plan_indices_for_shaders) {
+          const TransferRectanglePlan& transfer_plan =
+              (*target_transfer_rectangles)[transfer_plan_index];
+          const Transfer& transfer = transfers[transfer_plan.transfer_index];
           if (!transfer.source) {
             continue;
           }
@@ -6310,7 +6408,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
               source_key, dest_key, host_depth_rt ? &host_depth_key : nullptr,
               host_depth_is_copy, pass != 0, transfer_use_sample_id_default);
 
-          transfer_invocations_.emplace_back(transfer, shader_key);
+          transfer_invocations_.emplace_back(transfer, shader_key,
+                                             &transfer_plan);
           if (pass) {
             transfer_invocations_.back().transfer.host_depth_source = nullptr;
           }
@@ -6354,24 +6453,24 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             encoder->setFragmentBytes(&constants, sizeof(constants), 0);
             mark_active_encoder_mutation(
                 kDrawPassTransferEncoderMutationFragmentSlot0);
-            for (const Transfer& transfer : transfers_for_shaders) {
-              Transfer::Rectangle
-                  rectangles[Transfer::kMaxRectanglesWithCutout];
-              uint32_t rectangle_count = transfer.GetRectangles(
-                  dest_key.base_tiles, dest_key.GetPitchTiles(),
-                  dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
-                  resolve_clear_rectangle);
-              for (uint32_t rect_index = 0; rect_index < rectangle_count;
+            for (uint32_t transfer_plan_index :
+                 transfer_plan_indices_for_shaders) {
+              const TransferRectanglePlan& transfer_plan =
+                  (*target_transfer_rectangles)[transfer_plan_index];
+              for (uint32_t rect_index = 0;
+                   rect_index < transfer_plan.rectangle_count;
                    ++rect_index) {
-                if (!set_rect_viewport(encoder, rectangles[rect_index])) {
+                if (!set_rect_viewport(encoder,
+                                       transfer_plan.rectangles[rect_index])) {
                   continue;
                 }
                 uint32_t scaled_x = 0;
                 uint32_t scaled_y = 0;
                 uint32_t scaled_width = 0;
                 uint32_t scaled_height = 0;
-                if (get_scaled_rect(rectangles[rect_index], scaled_x, scaled_y,
-                                    scaled_width, scaled_height)) {
+                if (get_scaled_rect(transfer_plan.rectangles[rect_index],
+                                    scaled_x, scaled_y, scaled_width,
+                                    scaled_height)) {
                 }
                 encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
                                         NS::UInteger(0), NS::UInteger(3));
@@ -6535,15 +6634,15 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
               Transfer::kMaxRectanglesWithCutout);
           for (size_t merged_index = invocation_index;
                merged_index < merged_invocation_end; ++merged_index) {
-            Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-            uint32_t rectangle_count =
-                transfer_invocations_[merged_index].transfer.GetRectangles(
-                    dest_key.base_tiles, dest_key.GetPitchTiles(),
-                    dest_key.msaa_samples, dest_key.Is64bpp(), rectangles,
-                    resolve_clear_rectangle);
-            for (uint32_t rect_index = 0; rect_index < rectangle_count;
-                 ++rect_index) {
-              merged_transfer_rectangles.push_back(rectangles[rect_index]);
+            const TransferRectanglePlan* rectangle_plan =
+                transfer_invocations_[merged_index].rectangle_plan;
+            if (!rectangle_plan) {
+              continue;
+            }
+            for (uint32_t rect_index = 0;
+                 rect_index < rectangle_plan->rectangle_count; ++rect_index) {
+              merged_transfer_rectangles.push_back(
+                  rectangle_plan->rectangles[rect_index]);
             }
           }
           invocation_index = merged_invocation_end;

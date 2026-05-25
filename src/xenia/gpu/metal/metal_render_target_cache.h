@@ -564,12 +564,23 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     };
   };
 
+  struct TransferRectanglePlan {
+    uint32_t transfer_index = 0;
+    std::array<Transfer::Rectangle, Transfer::kMaxRectanglesWithCutout>
+        rectangles = {};
+    uint32_t rectangle_count = 0;
+  };
+
   struct TransferInvocation {
     Transfer transfer;
     TransferShaderKey shader_key;
+    const TransferRectanglePlan* rectangle_plan = nullptr;
     TransferInvocation(const Transfer& transfer,
-                       const TransferShaderKey& shader_key)
-        : transfer(transfer), shader_key(shader_key) {}
+                       const TransferShaderKey& shader_key,
+                       const TransferRectanglePlan* rectangle_plan = nullptr)
+        : transfer(transfer),
+          shader_key(shader_key),
+          rectangle_plan(rectangle_plan) {}
     bool operator<(const TransferInvocation& other) const {
       if (shader_key != other.shader_key) {
         return shader_key < other.shader_key;
@@ -615,6 +626,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     DrawPassTransferRejectionReason rejection_reason =
         DrawPassTransferRejectionReason::kNoDestination;
     TransferAttachmentFormats attachment_formats = {};
+    std::vector<TransferRectanglePlan> transfer_rectangles;
     bool full_overwrite = false;
     bool preflighted = false;
     bool load_action_safe = false;
@@ -715,10 +727,18 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       TransferAttachmentFormats& attachment_formats_out) const;
   DrawPassTransferRejectionReason GetDrawPassTransferRejectionReason(
       uint32_t render_target_index, RenderTarget* const* render_targets,
-      const std::vector<Transfer>& transfers) const;
+      const std::vector<Transfer>& transfers,
+      std::vector<TransferRectanglePlan>* transfer_rectangles_out = nullptr)
+      const;
   bool PendingDrawPassTransfersFullyOverwriteTarget(
       uint32_t render_target_index, RenderTarget* render_target,
-      const std::vector<Transfer>& transfers) const;
+      const std::vector<Transfer>& transfers,
+      const std::vector<TransferRectanglePlan>* transfer_rectangles = nullptr)
+      const;
+  bool BuildTransferRectanglePlans(
+      RenderTargetKey dest_key, const std::vector<Transfer>& transfers,
+      const Transfer::Rectangle* cutout, bool require_all_rectangles,
+      std::vector<TransferRectanglePlan>& transfer_rectangles_out) const;
   bool EnsurePendingDrawPassTransfersPreflighted();
   bool PreflightPendingDrawPassTransfers(
       const TransferAttachmentFormats& attachment_formats);
@@ -788,7 +808,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       MTL::CommandBuffer* command_buffer = nullptr,
       MTL::RenderCommandEncoder* active_render_encoder = nullptr,
       MTL::RenderPassDescriptor* active_render_pass_descriptor = nullptr,
-      DrawPassTransferEncoderMutationMask* mutations_out = nullptr);
+      DrawPassTransferEncoderMutationMask* mutations_out = nullptr,
+      const PendingDrawPassTransferPlan* prepared_draw_pass_transfer_plans =
+          nullptr);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
