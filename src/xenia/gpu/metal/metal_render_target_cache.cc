@@ -3948,10 +3948,18 @@ bool MetalRenderTargetCache::IsRenderPassDescriptorCompatible(
     MTL::RenderPassDescriptor* pass_descriptor,
     uint32_t expected_sample_count,
     bool fallback_depth_attachment_required) const {
-  RenderPassCompatibilityReason reason =
-      GetRenderPassDescriptorCompatibilityReason(
-          pass_descriptor, expected_sample_count,
-          fallback_depth_attachment_required);
+  RenderPassCompatibilityReason reason;
+  if (pass_descriptor && pass_descriptor == cached_render_pass_descriptor_ &&
+      !render_pass_descriptor_dirty_ &&
+      cached_render_pass_descriptor_sample_count_ == expected_sample_count &&
+      cached_render_pass_descriptor_fallback_depth_required_ ==
+          fallback_depth_attachment_required) {
+    reason = RenderPassCompatibilityReason::kCompatible;
+  } else {
+    reason = GetRenderPassDescriptorCompatibilityReason(
+        pass_descriptor, expected_sample_count,
+        fallback_depth_attachment_required);
+  }
   ++telemetry_.render_pass_compatibility_checks;
   size_t reason_index = static_cast<size_t>(reason);
   if (reason_index < telemetry_.render_pass_compatibility_reasons.size()) {
