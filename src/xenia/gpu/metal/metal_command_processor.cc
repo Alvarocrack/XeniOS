@@ -686,6 +686,7 @@ MetalCommandProcessor::MetalCommandProcessor(
 }
 
 MetalCommandProcessor::~MetalCommandProcessor() {
+  EndSharedMemoryUploadBlitEncoder();
   // End any active render encoder before releasing
   // Note: Only call endEncoding if the encoder is still active
   // (not already ended by a committed command buffer)
@@ -1100,6 +1101,11 @@ void MetalCommandProcessor::FlushCommandBufferAndWait(uint64_t timeout_ns,
                                                       const char* context) {
   // Phase 1: commit the active command buffer and wait for it.
   if (current_command_buffer_) {
+    EndSharedMemoryUploadBlitEncoder();
+    if (texture_cache_ &&
+        !texture_cache_->FlushPendingUploadEncodersForCommandEncoderBoundary()) {
+      XELOGE("Metal: failed to flush texture upload encoder before wait");
+    }
     uint64_t wait_value = 0;
     if (wait_shared_event_) {
       wait_value = ++wait_shared_event_value_;
@@ -1180,6 +1186,7 @@ void MetalCommandProcessor::ShutdownContext() {
     UpdateSharedMemoryFenceForActiveRenderEncoder();
     current_render_encoder_->endEncoding();
   }
+  EndSharedMemoryUploadBlitEncoder();
 
   FlushCommandBufferAndWait(std::numeric_limits<uint64_t>::max(),
                             "ShutdownContext");
@@ -1457,6 +1464,11 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   // End any active render encoder
   EndRenderEncoder(RenderEncoderEndReason::kSwap);
+  EndSharedMemoryUploadBlitEncoder();
+  if (texture_cache_ &&
+      !texture_cache_->FlushPendingUploadEncodersForCommandEncoderBoundary()) {
+    XELOGE("Metal: failed to flush texture upload encoder before swap");
+  }
 
   // Submit and wait for command buffer
   if (current_command_buffer_) {
@@ -5729,8 +5741,44 @@ void MetalCommandProcessor::InvalidateRenderEncoderStateAfterDrawPassTransfers(
 }
 
 MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {
+  EndSharedMemoryUploadBlitEncoder();
   EndRenderEncoder(RenderEncoderEndReason::kRequestTransferCommandBuffer);
+  if (texture_cache_ &&
+      !texture_cache_->FlushPendingUploadEncodersForCommandEncoderBoundary()) {
+    return nullptr;
+  }
   return EnsureCommandBuffer();
+}
+
+MTL::BlitCommandEncoder*
+MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
+  if (shared_memory_upload_blit_encoder_) {
+    return shared_memory_upload_blit_encoder_;
+  }
+
+  MTL::CommandBuffer* command_buffer = RequestTransferCommandBuffer();
+  if (!command_buffer) {
+    return nullptr;
+  }
+
+  shared_memory_upload_blit_encoder_ = command_buffer->blitCommandEncoder();
+  if (!shared_memory_upload_blit_encoder_) {
+    XELOGE("Metal: failed to create shared-memory upload blit encoder");
+    return nullptr;
+  }
+  shared_memory_upload_blit_encoder_->retain();
+  shared_memory_upload_blit_encoder_->setLabel(
+      NS::String::string("XeniaSharedMemoryUpload", NS::UTF8StringEncoding));
+  return shared_memory_upload_blit_encoder_;
+}
+
+void MetalCommandProcessor::EndSharedMemoryUploadBlitEncoder() {
+  if (!shared_memory_upload_blit_encoder_) {
+    return;
+  }
+  shared_memory_upload_blit_encoder_->endEncoding();
+  shared_memory_upload_blit_encoder_->release();
+  shared_memory_upload_blit_encoder_ = nullptr;
 }
 
 MTL::CommandBuffer*
@@ -6070,6 +6118,11 @@ bool MetalCommandProcessor::BeginRenderEncoderForDraw(
   if (!EnsureCommandBuffer()) {
     return false;
   }
+  EndSharedMemoryUploadBlitEncoder();
+  if (texture_cache_ &&
+      !texture_cache_->FlushPendingUploadEncodersForCommandEncoderBoundary()) {
+    return false;
+  }
 
   if (!current_render_encoder_ && (!render_encoder_resource_usage_.empty() ||
                                    !render_encoder_heap_usage_.empty())) {
@@ -6116,6 +6169,7 @@ bool MetalCommandProcessor::BeginRenderEncoderForDraw(
   }
 
   if (!current_render_encoder_) {
+    EndSharedMemoryUploadBlitEncoder();
     // If some path cleared the encoder without going through EndRenderEncoder,
     // avoid leaking cached binding state into the new encoder.
     // Note: renderCommandEncoder() returns an autoreleased object, we must
@@ -6174,6 +6228,13 @@ bool MetalCommandProcessor::BeginRenderEncoderForDraw(
 
 void MetalCommandProcessor::EndCommandBuffer() {
   EndRenderEncoder(RenderEncoderEndReason::kCommandBufferEnd);
+  EndSharedMemoryUploadBlitEncoder();
+  if (texture_cache_ &&
+      !texture_cache_->FlushPendingUploadEncodersForCommandEncoderBoundary()) {
+    XELOGE(
+        "Metal: failed to flush texture upload encoder before command buffer "
+        "end");
+  }
 
   if (current_command_buffer_) {
     current_command_buffer_->commit();

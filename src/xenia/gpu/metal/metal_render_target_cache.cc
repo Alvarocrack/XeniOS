@@ -390,6 +390,15 @@ void SetEncoderLabel(MTL::CommandEncoder* encoder, const char* label) {
   encoder->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
 }
 
+void EndSharedMemoryUploadBlitEncoderForCommandBuffer(
+    MetalCommandProcessor& command_processor,
+    MTL::CommandBuffer* command_buffer) {
+  if (command_buffer &&
+      command_buffer == command_processor.GetCurrentCommandBuffer()) {
+    command_processor.EndSharedMemoryUploadBlitEncoder();
+  }
+}
+
 void PushEncoderDebugGroup(MTL::CommandEncoder* encoder,
                            const std::string& label) {
   if (!encoder || label.empty()) {
@@ -4231,6 +4240,8 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
       color_attachment->setLoadAction(MTL::LoadActionLoad);
       color_attachment->setStoreAction(MTL::StoreActionMultisampleResolve);
 
+      EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
+                                                       command_buffer);
       MTL::RenderCommandEncoder* render_encoder =
           command_buffer->renderCommandEncoder(resolve_desc);
       if (render_encoder) {
@@ -4243,6 +4254,8 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
   }
 
   // Create compute encoder
+  EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
+                                                   command_buffer);
   MTL::ComputeCommandEncoder* encoder = command_buffer->computeCommandEncoder();
   if (!encoder) {
     if (temp_texture) {
@@ -4353,6 +4366,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
     standalone = true;
   }
 
+  EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_, cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     XELOGE("MetalRenderTargetCache::DumpRenderTargets: no compute encoder");
@@ -4829,6 +4843,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     standalone = true;
   }
 
+  EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_, cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     if (standalone) {
@@ -5424,6 +5439,8 @@ bool MetalRenderTargetCache::Resolve(
               standalone = (cmd != nullptr);
             }
             if (cmd) {
+              EndSharedMemoryUploadBlitEncoderForCommandBuffer(
+                  command_processor_, cmd);
               MTL::ComputeCommandEncoder* encoder =
                   cmd->computeCommandEncoder();
               if (!encoder) {
@@ -5701,6 +5718,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             GetHostDepthStoreRenderTargetConstant(dest_key.pitch_tiles_at_32bpp,
                                                   msaa_2x_supported_);
         if (!depth_store_encoder) {
+          EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
+                                                           cmd);
           depth_store_encoder = cmd->computeCommandEncoder();
           if (!depth_store_encoder) {
             XELOGE(
@@ -5896,6 +5915,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::BlitCommandEncoder* blit_encoder = nullptr;
     auto ensure_blit_encoder = [&]() -> MTL::BlitCommandEncoder* {
       if (!blit_encoder) {
+        EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_,
+                                                         cmd);
         blit_encoder = cmd->blitCommandEncoder();
         if (blit_encoder) {
           blit_encoder->setLabel(NS::String::string(
@@ -6219,6 +6240,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           ca->setClearColor(resolve_clear_color);
         }
       }
+      EndSharedMemoryUploadBlitEncoderForCommandBuffer(command_processor_, cmd);
       transfer_encoder = cmd->renderCommandEncoder(rp);
       if (transfer_encoder) {
         transfer_encoder->setLabel(

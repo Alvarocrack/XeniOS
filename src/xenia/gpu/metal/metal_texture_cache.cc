@@ -626,6 +626,10 @@ bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
   bool success = true;
   if (cmd && !deferred_upload_copies_.empty()) {
     ++telemetry_.deferred_upload_flushes_with_blits;
+    if (command_processor_ &&
+        cmd == command_processor_->GetCurrentCommandBuffer()) {
+      command_processor_->EndSharedMemoryUploadBlitEncoder();
+    }
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       XELOGE("Metal texture upload: failed to create deferred blit encoder");
@@ -645,6 +649,13 @@ bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
   deferred_upload_copies_.clear();
   deferred_upload_command_buffer_ = nullptr;
   return success;
+}
+
+bool MetalTextureCache::FlushPendingUploadEncodersForCommandEncoderBoundary() {
+  if (!deferred_upload_compute_encoder_ && deferred_upload_copies_.empty()) {
+    return true;
+  }
+  return FlushDeferredUploadEncoderBatch();
 }
 
 bool MetalTextureCache::PrepareTextureDataLoadRanges(
@@ -727,6 +738,10 @@ MTL::ComputeCommandEncoder* MetalTextureCache::GetDeferredUploadComputeEncoder(
   }
   deferred_upload_command_buffer_ = command_buffer;
   if (!deferred_upload_compute_encoder_) {
+    if (command_processor_ &&
+        command_buffer == command_processor_->GetCurrentCommandBuffer()) {
+      command_processor_->EndSharedMemoryUploadBlitEncoder();
+    }
     deferred_upload_compute_encoder_ = command_buffer->computeCommandEncoder();
     if (deferred_upload_compute_encoder_) {
       ++telemetry_.deferred_upload_compute_encoder_creates;
@@ -1644,6 +1659,10 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     using_deferred_upload_encoder = encoder != nullptr;
   }
   if (!encoder) {
+    if (command_processor_ &&
+        cmd == command_processor_->GetCurrentCommandBuffer()) {
+      command_processor_->EndSharedMemoryUploadBlitEncoder();
+    }
     encoder = cmd->computeCommandEncoder();
   }
   if (!encoder) {
@@ -1843,6 +1862,10 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
           command_buffer_has_work = true;
         }
       } else {
+        if (command_processor_ &&
+            cmd == command_processor_->GetCurrentCommandBuffer()) {
+          command_processor_->EndSharedMemoryUploadBlitEncoder();
+        }
         MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
         if (!blit) {
           release_repack_staging_for_encoded_failure();
@@ -3711,6 +3734,10 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
       standalone = true;
     }
 
+    if (!standalone && command_processor_ &&
+        cmd == command_processor_->GetCurrentCommandBuffer()) {
+      command_processor_->EndSharedMemoryUploadBlitEncoder();
+    }
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       if (standalone) {

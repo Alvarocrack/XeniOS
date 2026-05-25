@@ -106,20 +106,13 @@ bool MetalSharedMemory::UploadRanges(
   const uint32_t page_size = 1u << page_size_log2();
   upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
 
-  MTL::CommandBuffer* command_buffer =
-      command_processor_.RequestTransferCommandBuffer();
-  if (!command_buffer) {
-    XELOGE("MetalSharedMemory::UploadRanges: failed to get command buffer");
-    return false;
-  }
-
-  MTL::BlitCommandEncoder* blit_encoder = command_buffer->blitCommandEncoder();
-  if (!blit_encoder) {
-    XELOGE("MetalSharedMemory::UploadRanges: failed to create blit encoder");
-    return false;
-  }
-  blit_encoder->setLabel(
-      NS::String::string("XeniaSharedMemoryUpload", NS::UTF8StringEncoding));
+  MTL::BlitCommandEncoder* blit_encoder = nullptr;
+  auto get_blit_encoder = [&]() -> MTL::BlitCommandEncoder* {
+    if (!blit_encoder) {
+      blit_encoder = command_processor_.GetSharedMemoryUploadBlitEncoder();
+    }
+    return blit_encoder;
+  };
 
   uint32_t merged_start = 0;
   uint32_t merged_end = 0;
@@ -132,6 +125,12 @@ bool MetalSharedMemory::UploadRanges(
     uint32_t offset = start;
     uint32_t remaining = end - start;
     while (remaining) {
+      MTL::BlitCommandEncoder* encoder = get_blit_encoder();
+      if (!encoder) {
+        XELOGE("MetalSharedMemory::UploadRanges: failed to get blit encoder");
+        return false;
+      }
+
       MTL::Buffer* upload_buffer = nullptr;
       size_t upload_offset = 0;
       uint64_t upload_gpu_address = 0;
@@ -154,7 +153,7 @@ bool MetalSharedMemory::UploadRanges(
       } else {
         std::memcpy(upload_mapping, xbox_data + offset, upload_size);
       }
-      blit_encoder->copyFromBuffer(
+      encoder->copyFromBuffer(
           upload_buffer, static_cast<NS::UInteger>(upload_offset), buffer_,
           static_cast<NS::UInteger>(offset),
           static_cast<NS::UInteger>(upload_size));
@@ -190,7 +189,7 @@ bool MetalSharedMemory::UploadRanges(
       }
     } else {
       if (!flush_merged_range(merged_start, merged_end)) {
-        blit_encoder->endEncoding();
+        command_processor_.EndSharedMemoryUploadBlitEncoder();
         return false;
       }
       merged_start = start;
@@ -200,12 +199,10 @@ bool MetalSharedMemory::UploadRanges(
 
   if (have_merged) {
     if (!flush_merged_range(merged_start, merged_end)) {
-      blit_encoder->endEncoding();
+      command_processor_.EndSharedMemoryUploadBlitEncoder();
       return false;
     }
   }
-
-  blit_encoder->endEncoding();
 
   XELOGD("MetalSharedMemory::UploadRanges: Staged {} ranges to Metal buffer",
          num_upload_ranges);

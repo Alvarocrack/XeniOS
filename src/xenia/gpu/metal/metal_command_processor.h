@@ -106,6 +106,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   // exists one is created. This is an encoder-lifetime break, not necessarily
   // a command-buffer submission break. Returns nullptr on failure.
   MTL::CommandBuffer* RequestTransferCommandBuffer();
+  MTL::BlitCommandEncoder* GetSharedMemoryUploadBlitEncoder();
+  void EndSharedMemoryUploadBlitEncoder();
 
   // Standalone (detached) transfer command-buffer helpers.
   // These create command buffers that are independent of the active submission
@@ -635,6 +637,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
+  MTL::BlitCommandEncoder* shared_memory_upload_blit_encoder_ = nullptr;
   MTL::RenderPassDescriptor* current_render_pass_descriptor_ = nullptr;
   NS::AutoreleasePool* command_buffer_autorelease_pool_ = nullptr;
 

@@ -174,6 +174,7 @@ class MetalTextureCache : public TextureCache {
   // without creating a separate upload command buffer or ending a render
   // encoder.
   bool CanUseCurrentCommandBufferForTextureUploads() const;
+  bool FlushPendingUploadEncodersForCommandEncoderBoundary();
 
   struct TelemetryStats {
     uint64_t request_textures_calls = 0;
