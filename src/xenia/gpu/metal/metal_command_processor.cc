@@ -3001,6 +3001,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   next_texture_bindless_indices_vertex.clear();
   next_texture_bindless_resources_vertex.clear();
   next_sampler_bindless_indices_vertex.clear();
+  scratch_descriptor_indices_vertex_.clear();
   if (sampler_count_vertex) {
     if (current_sampler_layout_uid_vertex_ != sampler_layout_uid_vertex) {
       current_sampler_layout_uid_vertex_ = sampler_layout_uid_vertex;
@@ -3080,6 +3081,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   next_texture_bindless_indices_pixel.clear();
   next_texture_bindless_resources_pixel.clear();
   next_sampler_bindless_indices_pixel.clear();
+  scratch_descriptor_indices_pixel_.clear();
   if (metal_pixel_shader) {
     const auto& texture_bindings_pixel =
         metal_pixel_shader->GetTextureBindingsAfterTranslation();
@@ -3314,10 +3316,10 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     }
   }
 
-  auto descriptor_indices_size = [&](MetalShader* shader) -> size_t {
+  auto descriptor_indices_word_count = [&](MetalShader* shader) -> uint32_t {
     uint32_t word_count = 1;
     if (!shader) {
-      return word_count * sizeof(uint32_t);
+      return word_count;
     }
     constexpr uint32_t kMaxDescriptorIndexWords = kCBVSize / sizeof(uint32_t);
     const auto& tex_bindings = shader->GetTextureBindingsAfterTranslation();
@@ -3336,78 +3338,97 @@ bool MetalCommandProcessor::PrepareDrawConstants(
             std::max(word_count, binding.bindless_descriptor_index + 1);
       }
     }
-    return word_count * sizeof(uint32_t);
+    return word_count;
   };
 
-  auto fill_descriptor_indices =
-      [&](MetalShader* shader, uint8_t* data, size_t data_size,
+  auto build_descriptor_indices =
+      [&](MetalShader* shader, std::vector<uint32_t>& words,
           const std::vector<uint32_t>& texture_indices,
           const std::vector<uint32_t>& sampler_indices) {
-        std::memset(data, 0, data_size);
+        words.assign(descriptor_indices_word_count(shader), 0);
         if (!shader || !texture_cache_) {
           return;
         }
-        auto* indices = reinterpret_cast<uint32_t*>(data);
-        const uint32_t word_count =
-            static_cast<uint32_t>(data_size / sizeof(uint32_t));
         const auto& tex_bindings = shader->GetTextureBindingsAfterTranslation();
         for (size_t i = 0;
              i < tex_bindings.size() && i < texture_indices.size(); ++i) {
           uint32_t d = tex_bindings[i].bindless_descriptor_index;
-          assert_true(d < word_count);
-          if (d >= word_count) {
+          assert_true(d < words.size());
+          if (d >= words.size()) {
             continue;
           }
-          indices[d] = texture_indices[i];
+          words[d] = texture_indices[i];
         }
         const auto& smp_bindings = shader->GetSamplerBindingsAfterTranslation();
         for (size_t i = 0;
              i < smp_bindings.size() && i < sampler_indices.size(); ++i) {
           uint32_t d = smp_bindings[i].bindless_descriptor_index;
-          assert_true(d < word_count);
-          if (d >= word_count) {
+          assert_true(d < words.size());
+          if (d >= words.size()) {
             continue;
           }
-          indices[d] = sampler_indices[i];
+          words[d] = sampler_indices[i];
         }
       };
 
+  auto upload_descriptor_indices =
+      [&](ConstantBufferBinding& binding, const std::vector<uint32_t>& words,
+          const char* name) -> bool {
+    const size_t descriptor_indices_bytes = words.size() * sizeof(uint32_t);
+    return upload_binding(binding, descriptor_indices_bytes, name,
+                          [&](uint8_t* data, size_t size) {
+                            std::memset(data, 0, size);
+                            std::memcpy(data, words.data(),
+                                        std::min(size, descriptor_indices_bytes));
+                          });
+  };
+
   if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
-    size_t descriptor_indices_bytes =
-        descriptor_indices_size(metal_vertex_shader);
-    if (!upload_binding(
-            cbuffer_binding_descriptor_indices_vertex_,
-            descriptor_indices_bytes, "vertex descriptor indices",
-            [&](uint8_t* data, size_t size) {
-              fill_descriptor_indices(metal_vertex_shader, data, size,
-                                      next_texture_bindless_indices_vertex,
-                                      next_sampler_bindless_indices_vertex);
-            })) {
-      return false;
+    build_descriptor_indices(metal_vertex_shader,
+                             scratch_descriptor_indices_vertex_,
+                             next_texture_bindless_indices_vertex,
+                             next_sampler_bindless_indices_vertex);
+    const bool can_reuse_descriptor_indices =
+        cbuffer_binding_descriptor_indices_vertex_.buffer &&
+        current_descriptor_indices_vertex_ == scratch_descriptor_indices_vertex_;
+    if (can_reuse_descriptor_indices) {
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
+    } else {
+      if (!upload_descriptor_indices(cbuffer_binding_descriptor_indices_vertex_,
+                                     scratch_descriptor_indices_vertex_,
+                                     "vertex descriptor indices")) {
+        return false;
+      }
+      count_constant_upload(
+          backend_telemetry_.constant_upload_descriptor_indices_vertex,
+          scratch_descriptor_indices_vertex_.size() * sizeof(uint32_t));
+      current_descriptor_indices_vertex_.swap(
+          scratch_descriptor_indices_vertex_);
     }
-    count_constant_upload(
-        backend_telemetry_.constant_upload_descriptor_indices_vertex,
-        descriptor_indices_bytes);
     descriptor_indices_vertex_written = true;
   }
 
   if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
-    size_t descriptor_indices_bytes =
-        descriptor_indices_size(metal_pixel_shader);
-    if (!upload_binding(cbuffer_binding_descriptor_indices_pixel_,
-                        descriptor_indices_bytes,
-                        "pixel descriptor indices", [&](uint8_t* data,
-                                                        size_t size) {
-                          fill_descriptor_indices(
-                              metal_pixel_shader, data, size,
-                              next_texture_bindless_indices_pixel,
-                              next_sampler_bindless_indices_pixel);
-                        })) {
-      return false;
+    build_descriptor_indices(metal_pixel_shader,
+                             scratch_descriptor_indices_pixel_,
+                             next_texture_bindless_indices_pixel,
+                             next_sampler_bindless_indices_pixel);
+    const bool can_reuse_descriptor_indices =
+        cbuffer_binding_descriptor_indices_pixel_.buffer &&
+        current_descriptor_indices_pixel_ == scratch_descriptor_indices_pixel_;
+    if (can_reuse_descriptor_indices) {
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
+    } else {
+      if (!upload_descriptor_indices(cbuffer_binding_descriptor_indices_pixel_,
+                                     scratch_descriptor_indices_pixel_,
+                                     "pixel descriptor indices")) {
+        return false;
+      }
+      count_constant_upload(
+          backend_telemetry_.constant_upload_descriptor_indices_pixel,
+          scratch_descriptor_indices_pixel_.size() * sizeof(uint32_t));
+      current_descriptor_indices_pixel_.swap(scratch_descriptor_indices_pixel_);
     }
-    count_constant_upload(
-        backend_telemetry_.constant_upload_descriptor_indices_pixel,
-        descriptor_indices_bytes);
     descriptor_indices_pixel_written = true;
   }
 
