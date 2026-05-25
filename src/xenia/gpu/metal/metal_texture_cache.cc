@@ -2801,12 +2801,20 @@ void MetalTextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
   uint32_t work_mask = GetUsedTextureRequestWorkMask(used_texture_mask);
   telemetry_.request_textures_work_mask_bits += xe::bit_count(work_mask);
+  const bool may_load_data = MayRequestTexturesLoadData(used_texture_mask);
   uint64_t load_calls_before = telemetry_.load_texture_calls;
 
-  UploadBatchScope upload_batch(*this);
-  TextureCache::RequestTextures(used_texture_mask);
-  upload_batch.End();
+  if (may_load_data) {
+    UploadBatchScope upload_batch(*this);
+    TextureCache::RequestTextures(used_texture_mask);
+    upload_batch.End();
+  } else {
+    TextureCache::RequestTextures(used_texture_mask);
+  }
   uint64_t load_calls_delta = telemetry_.load_texture_calls - load_calls_before;
+  if (!may_load_data) {
+    assert_zero(load_calls_delta);
+  }
   if (load_calls_delta) {
     ++telemetry_.request_textures_with_loads;
     telemetry_.request_textures_loaded_textures += load_calls_delta;
