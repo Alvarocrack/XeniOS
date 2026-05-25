@@ -811,14 +811,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_float_vertex_;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
-  // Fetch constants are one physical register file, but MSC root arguments are
-  // bound per stage.  Keep one full-buffer snapshot per stage so a write only
-  // churns stages whose current shader uses the changed fetch dwords.
-  std::array<ConstantBufferBinding, kStageCount> cbuffer_binding_fetch_stage_;
+  // Fetch constants are one physical register file.  Keep one full-buffer
+  // upload and bind that CBV into every stage that needs fetch constants.
+  ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
-  std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
-      fetch_constant_dirty_masks_ = {};
+  DxbcShader::FetchConstantDwordMask fetch_constant_dirty_mask_ = {};
 
   // Float constant usage bitmaps for the current shader pair.
   // Used to gate WriteRegister invalidation: only dirty the float CBV

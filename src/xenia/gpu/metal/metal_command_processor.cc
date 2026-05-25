@@ -3235,24 +3235,20 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                           kBoolLoopConstantsSize);
   }
 
-  std::array<bool, kStageCount> fetch_stage_needs_upload = {};
-  bool fetch_needs_upload = false;
+  bool fetch_binding_active = false;
   for (size_t stage = 0; stage < kStageCount; ++stage) {
     if (!(active_cbv_masks[stage] & (uint32_t(1) << kCbvSlotFetch))) {
       continue;
     }
-    ConstantBufferBinding& fetch_binding = cbuffer_binding_fetch_stage_[stage];
-    if (FetchConstantDwordMasksOverlap(fetch_constant_dirty_masks_[stage],
+    fetch_binding_active = true;
+    if (FetchConstantDwordMasksOverlap(fetch_constant_dirty_mask_,
                                        fetch_constant_dword_masks[stage])) {
-      fetch_binding.up_to_date = false;
+      cbuffer_binding_fetch_.up_to_date = false;
     }
-    fetch_stage_needs_upload[stage] = !fetch_binding.up_to_date;
-    fetch_needs_upload |= fetch_stage_needs_upload[stage];
   }
-  if (fetch_needs_upload) {
-    ConstantBufferBinding fetch_binding;
+  if (fetch_binding_active && !cbuffer_binding_fetch_.up_to_date) {
     const size_t fetch_size = kFetchConstantCount * sizeof(uint32_t);
-    if (!upload_binding(fetch_binding, fetch_size, "fetch",
+    if (!upload_binding(cbuffer_binding_fetch_, fetch_size, "fetch",
                         [&](uint8_t* data, size_t) {
                           std::memcpy(
                               data,
@@ -3262,12 +3258,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
       return false;
     }
     count_constant_upload(backend_telemetry_.constant_upload_fetch, fetch_size);
-    for (size_t stage = 0; stage < kStageCount; ++stage) {
-      if (fetch_stage_needs_upload[stage]) {
-        cbuffer_binding_fetch_stage_[stage] = fetch_binding;
-        fetch_constant_dirty_masks_[stage].fill(0);
-      }
-    }
+    fetch_constant_dirty_mask_.fill(0);
   }
 
   auto build_descriptor_indices =
@@ -3428,7 +3419,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                   uniforms_out.active_cbv_masks[kStageVertex] &
                       (uint32_t(1) << kCbvSlotBoolLoop));
   set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotFetch],
-                  cbuffer_binding_fetch_stage_[kStageVertex],
+                  cbuffer_binding_fetch_,
                   uniforms_out.active_cbv_masks[kStageVertex] &
                       (uint32_t(1) << kCbvSlotFetch));
   set_uniform_cbv(uniforms_out.cbvs[kStageVertex][kCbvSlotDescriptorIndices],
@@ -3448,7 +3439,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                   uniforms_out.active_cbv_masks[kStagePixel] &
                       (uint32_t(1) << kCbvSlotBoolLoop));
   set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotFetch],
-                  cbuffer_binding_fetch_stage_[kStagePixel],
+                  cbuffer_binding_fetch_,
                   uniforms_out.active_cbv_masks[kStagePixel] &
                       (uint32_t(1) << kCbvSlotFetch));
   set_uniform_cbv(uniforms_out.cbvs[kStagePixel][kCbvSlotDescriptorIndices],
@@ -4924,19 +4915,23 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   backend_telemetry_.register_write_fetch_dirty += changed;
   backend_telemetry_.register_write_fetch_dwords_copied += num_registers;
   if (changed) {
-    for (size_t stage = 0; stage < kStageCount; ++stage) {
-      MergeFetchConstantDwordMask(fetch_constant_dirty_masks_[stage],
-                                  changed_fetch_dword_mask);
-    }
+    MergeFetchConstantDwordMask(fetch_constant_dirty_mask_,
+                                changed_fetch_dword_mask);
+    bool current_fetch_binding_touched = false;
     if (FetchConstantDwordMasksOverlap(
             changed_fetch_dword_mask,
             current_fetch_constant_dword_masks_[kStageVertex])) {
       ++backend_telemetry_.register_write_fetch_dirty_vertex;
+      current_fetch_binding_touched = true;
     }
     if (FetchConstantDwordMasksOverlap(
             changed_fetch_dword_mask,
             current_fetch_constant_dword_masks_[kStagePixel])) {
       ++backend_telemetry_.register_write_fetch_dirty_pixel;
+      current_fetch_binding_touched = true;
+    }
+    if (current_fetch_binding_touched) {
+      cbuffer_binding_fetch_.up_to_date = false;
     }
   }
   if (texture_cache_ && changed_fetch_mask) {
@@ -5010,19 +5005,23 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
         index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     DxbcShader::FetchConstantDwordMask changed_fetch_dword_mask = {};
     MarkFetchConstantDword(changed_fetch_dword_mask, fetch_dword);
-    for (size_t stage = 0; stage < kStageCount; ++stage) {
-      MergeFetchConstantDwordMask(fetch_constant_dirty_masks_[stage],
-                                  changed_fetch_dword_mask);
-    }
+    MergeFetchConstantDwordMask(fetch_constant_dirty_mask_,
+                                changed_fetch_dword_mask);
+    bool current_fetch_binding_touched = false;
     if (FetchConstantDwordMasksOverlap(
             changed_fetch_dword_mask,
             current_fetch_constant_dword_masks_[kStageVertex])) {
       ++backend_telemetry_.register_write_fetch_dirty_vertex;
+      current_fetch_binding_touched = true;
     }
     if (FetchConstantDwordMasksOverlap(
             changed_fetch_dword_mask,
             current_fetch_constant_dword_masks_[kStagePixel])) {
       ++backend_telemetry_.register_write_fetch_dirty_pixel;
+      current_fetch_binding_touched = true;
+    }
+    if (current_fetch_binding_touched) {
+      cbuffer_binding_fetch_.up_to_date = false;
     }
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantWritten(
