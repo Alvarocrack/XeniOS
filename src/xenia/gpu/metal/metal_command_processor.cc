@@ -4708,6 +4708,9 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
   const uint32_t dword_end = dword_start + num_registers;
   const uint32_t first_constant = dword_start >> 2;
   const uint32_t last_constant = (dword_end - 1) >> 2;
+  constexpr uint32_t kLargeFloatConstantWriteDwords = 64;
+  const bool use_range_overlap_invalidation =
+      num_registers >= kLargeFloatConstantWriteDwords;
 
   auto bit_range_mask = [](uint32_t first_bit, uint32_t end_bit) {
     assert_true(first_bit < end_bit && end_bit <= 64);
@@ -4761,6 +4764,14 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
                                       &relative_constant_in_word)) {
             constants_in_word = xe::clear_lowest_bit(constants_in_word);
             used_constant_touched = true;
+            if (use_range_overlap_invalidation) {
+              // Large float-constant packets follow D3D12/Vulkan-style
+              // range-overlap invalidation. Small writes still do exact
+              // dword compares below to suppress redundant CBV churn.
+              ++dirty;
+              stage_dirty = true;
+              break;
+            }
             const uint32_t constant_index =
                 stage_first_constant + (map_word << 6) +
                 relative_constant_in_word;
