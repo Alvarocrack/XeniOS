@@ -666,6 +666,7 @@ MetalCommandProcessor::~MetalCommandProcessor() {
   }
   current_bindless_stage_root_valid_.fill(false);
   current_bindless_stage_root_serials_.fill(0);
+  current_bindless_active_cbv_masks_.fill(0);
   current_bindless_stable_resources_serial_ = 0;
   render_encoder_bindless_stage_root_resource_serials_.fill(0);
   render_encoder_bindless_stable_resources_serial_ = 0;
@@ -3494,7 +3495,7 @@ void MetalCommandProcessor::ApplyDrawDynamicState(
 MetalCommandProcessor::StageRootArgumentKey
 MetalCommandProcessor::BuildStageRootArgumentKey(
     const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
-    bool shared_memory_is_uav) const {
+    uint32_t active_cbv_mask, bool shared_memory_is_uav) const {
   StageRootArgumentKey key;
   constexpr uint64_t kDescriptorEntrySize = sizeof(IRDescriptorTableEntry);
   uint64_t view_heap_gpu = view_bindless_heap_->gpuAddress();
@@ -3526,7 +3527,8 @@ MetalCommandProcessor::BuildStageRootArgumentKey(
 
   for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
     const UniformBufferInfo::Cbv& uniform_cbv = uniform_cbvs[cbv];
-    if (uniform_cbv.active) {
+    const bool cbv_active = active_cbv_mask & (uint32_t(1) << cbv);
+    if (cbv_active) {
       key.pointers[kTopLevelABSlotCBVSystem + cbv] =
           uniform_cbv.gpu_address ? uniform_cbv.gpu_address
                                   : null_buffer_->gpuAddress();
@@ -3600,18 +3602,25 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       backend_telemetry_.bindless_stage_active_cbv_mask_or[stage] |=
           uniforms.active_cbv_masks[stage];
     }
+    const uint32_t active_cbv_mask = uniforms.active_cbv_masks[stage];
+    const uint32_t previous_active_cbv_mask =
+        current_bindless_active_cbv_masks_[stage];
     if (!stage_root_valid) {
       bindless_table_invalid = true;
     }
     for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
       const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
+      const uint32_t cbv_bit = uint32_t(1) << cbv;
+      const bool cbv_active = active_cbv_mask & cbv_bit;
+      const bool current_cbv_active = previous_active_cbv_mask & cbv_bit;
       const uint64_t cbv_gpu_address =
-          uniform_cbv.active
+          cbv_active
               ? (uniform_cbv.gpu_address ? uniform_cbv.gpu_address
                                           : null_buffer_->gpuAddress())
               : null_buffer_->gpuAddress();
-      const size_t cbv_size = uniform_cbv.active ? uniform_cbv.size : 0;
+      const size_t cbv_size = cbv_active ? uniform_cbv.size : 0;
       if (!stage_root_valid ||
+          current_cbv_active != cbv_active ||
           current_bindless_cbv_gpu_addresses_[stage][cbv] !=
               cbv_gpu_address ||
           current_bindless_cbv_sizes_[stage][cbv] != cbv_size) {
@@ -3670,6 +3679,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       }
       StageRootArgumentKey key =
           BuildStageRootArgumentKey(uniforms.cbvs[stage],
+                                    uniforms.active_cbv_masks[stage],
                                     shared_memory_is_uav);
       if (!AllocateStageRootArgument(
               stage, key, current_bindless_stage_root_arguments_[stage])) {
@@ -3678,14 +3688,18 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       current_bindless_stage_root_valid_[stage] = true;
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
         const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
+        const bool cbv_active =
+            uniforms.active_cbv_masks[stage] & (uint32_t(1) << cbv);
         current_bindless_cbv_gpu_addresses_[stage][cbv] =
-            uniform_cbv.active
+            cbv_active
                 ? (uniform_cbv.gpu_address ? uniform_cbv.gpu_address
                                             : null_buffer_->gpuAddress())
                 : null_buffer_->gpuAddress();
         current_bindless_cbv_sizes_[stage][cbv] =
-            uniform_cbv.active ? uniform_cbv.size : 0;
+            cbv_active ? uniform_cbv.size : 0;
       }
+      current_bindless_active_cbv_masks_[stage] =
+          uniforms.active_cbv_masks[stage];
       ++current_bindless_stage_root_serials_[stage];
       if (!current_bindless_stage_root_serials_[stage]) {
         current_bindless_stage_root_serials_[stage] = 1;
@@ -6173,6 +6187,7 @@ void MetalCommandProcessor::EndCommandBuffer() {
     submission_has_draws_ = false;
     current_bindless_stage_root_valid_.fill(false);
     current_bindless_stage_root_serials_.fill(0);
+    current_bindless_active_cbv_masks_.fill(0);
     current_bindless_stable_resources_serial_ = 0;
     render_encoder_bindless_stage_root_resource_serials_.fill(0);
     render_encoder_bindless_stable_resources_serial_ = 0;

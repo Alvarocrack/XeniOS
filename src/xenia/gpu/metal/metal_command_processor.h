@@ -797,11 +797,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   };
   // MSC root arguments are one small top-level argument buffer per shader
   // stage.  The current tuple is carried forward while the CBV addresses,
-  // sizes, shared-memory mode, and mesh/tessellation path stay unchanged;
-  // otherwise a fresh table is written from the bump-allocated upload pool.
+  // active mask, sizes, shared-memory mode, and mesh/tessellation path stay
+  // unchanged; otherwise a fresh table is written from the bump-allocated
+  // upload pool.
   StageRootArgumentKey BuildStageRootArgumentKey(
       const std::array<UniformBufferInfo::Cbv, kCbvSlotCount>& uniform_cbvs,
-      bool shared_memory_is_uav) const;
+      uint32_t active_cbv_mask, bool shared_memory_is_uav) const;
   void WriteStageRootArgumentTable(uint64_t* top_level_ptrs,
                                    const StageRootArgumentKey& key) const;
   bool AllocateStageRootArgument(size_t stage_index,
@@ -866,6 +867,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       current_bindless_cbv_gpu_addresses_ = {};
   std::array<std::array<size_t, kCbvSlotCount>, kStageCount>
       current_bindless_cbv_sizes_ = {};
+  std::array<uint32_t, kStageCount> current_bindless_active_cbv_masks_ = {};
   std::array<DxbcShader::FetchConstantDwordMask, kStageCount>
       current_fetch_constant_dword_masks_ = {};
   bool current_bindless_shared_memory_is_uav_ = false;
