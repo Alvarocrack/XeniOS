@@ -280,6 +280,9 @@ class MetalTextureCache : public TextureCache {
     uint32_t GetOrCreateBindlessSRVIndex(uint32_t host_swizzle,
                                          xenos::FetchOpDimension dimension,
                                          bool is_signed);
+    uint32_t GetOrCreateBindlessSRVIndexAndView(
+        uint32_t host_swizzle, xenos::FetchOpDimension dimension,
+        bool is_signed, MTL::Texture** view_out);
 
     // Persistent bindless SRV index for the default resolved view in the
     // view_bindless_heap_. Additional resolved view variants use persistent

@@ -3026,23 +3026,14 @@ uint32_t MetalTextureCache::GetBindlessSRVIndexForBinding(
   if (!metal_texture) {
     return return_null_index_for_dimension();
   }
-  uint32_t srv_index = metal_texture->GetOrCreateBindlessSRVIndex(
-      binding->host_swizzle, dimension, is_signed);
+  MTL::Texture* texture_for_encoder = nullptr;
+  uint32_t srv_index = metal_texture->GetOrCreateBindlessSRVIndexAndView(
+      binding->host_swizzle, dimension, is_signed,
+      texture_for_encoder_out ? &texture_for_encoder : nullptr);
   if (srv_index == UINT32_MAX) {
     return return_null_index_for_dimension();
   }
   if (texture_for_encoder_out) {
-    MTL::Texture* texture_for_encoder = nullptr;
-    const bool use_3d_as_2d =
-        binding->key.dimension == xenos::DataDimension::k3D &&
-        dimension == xenos::FetchOpDimension::k2D;
-    if (use_3d_as_2d) {
-      texture_for_encoder = metal_texture->GetOrCreate3DAs2DView(
-          binding->host_swizzle, dimension, is_signed);
-    } else {
-      texture_for_encoder = metal_texture->GetOrCreateView(
-          binding->host_swizzle, dimension, is_signed);
-    }
     *texture_for_encoder_out = texture_for_encoder
                                    ? texture_for_encoder
                                    : get_null_texture_for_dimension();
@@ -4177,6 +4168,83 @@ uint32_t MetalTextureCache::MetalTexture::GetOrCreateBindlessSRVIndex(
     return UINT32_MAX;
   }
   return GetOrCreateBindlessSRVIndexForResolvedView(view_key, view);
+}
+
+uint32_t MetalTextureCache::MetalTexture::GetOrCreateBindlessSRVIndexAndView(
+    uint32_t host_swizzle, xenos::FetchOpDimension dimension, bool is_signed,
+    MTL::Texture** view_out) {
+  if (view_out) {
+    *view_out = nullptr;
+  }
+  if (!metal_texture_) {
+    return UINT32_MAX;
+  }
+
+  MetalTexture* resolved_texture = this;
+  MTL::Texture* view = nullptr;
+  if (!is_3d_as_2d_wrapper_ && key().dimension == xenos::DataDimension::k3D &&
+      dimension == xenos::FetchOpDimension::k2D) {
+    view = GetOrCreate3DAs2DView(host_swizzle, dimension, is_signed);
+    if (!view || !texture_3d_as_2d_) {
+      return UINT32_MAX;
+    }
+    resolved_texture = texture_3d_as_2d_.get();
+  } else {
+    view = GetOrCreateView(host_swizzle, dimension, is_signed);
+    if (!view) {
+      return UINT32_MAX;
+    }
+  }
+
+  MTL::PixelFormat view_format = resolved_texture->GetViewPixelFormat(is_signed);
+  MTL::TextureType view_type = resolved_texture->GetViewType(dimension);
+  uint32_t srv_index = UINT32_MAX;
+  if (host_swizzle == xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA &&
+      view_format == resolved_texture->metal_texture_->pixelFormat() &&
+      resolved_texture->metal_texture_->textureType() == view_type) {
+    if (resolved_texture->bindless_srv_index_ == UINT32_MAX) {
+      texture_cache_.EnsureViewBindlessHeadroom(
+          kViewBindlessHeapPressureThreshold);
+      resolved_texture->bindless_srv_index_ =
+          texture_cache_.command_processor_->AllocateViewBindlessIndex();
+      if (resolved_texture->bindless_srv_index_ == UINT32_MAX) {
+        XELOGE("MetalTexture: failed to allocate default bindless SRV index");
+        return UINT32_MAX;
+      }
+      auto* entry = texture_cache_.command_processor_->GetViewBindlessHeapEntry(
+          resolved_texture->bindless_srv_index_);
+      if (!entry) {
+        texture_cache_.command_processor_->ReleaseViewBindlessIndex(
+            resolved_texture->bindless_srv_index_);
+        resolved_texture->bindless_srv_index_ = UINT32_MAX;
+        return UINT32_MAX;
+      }
+      IRDescriptorTableSetTexture(entry, resolved_texture->metal_texture_, 0.0f,
+                                  0);
+    }
+    srv_index = resolved_texture->bindless_srv_index_;
+  } else {
+    uint64_t view_key =
+        resolved_texture->GetViewKey(host_swizzle, dimension, is_signed,
+                                     view_format);
+    auto existing =
+        resolved_texture->swizzled_view_bindless_srv_indices_.find(view_key);
+    if (existing != resolved_texture->swizzled_view_bindless_srv_indices_.end()) {
+      srv_index = existing->second;
+    } else {
+      srv_index =
+          resolved_texture->GetOrCreateBindlessSRVIndexForResolvedView(view_key,
+                                                                       view);
+    }
+  }
+
+  if (srv_index == UINT32_MAX) {
+    return UINT32_MAX;
+  }
+  if (view_out) {
+    *view_out = view;
+  }
+  return srv_index;
 }
 
 MTL::Texture* MetalTextureCache::MetalTexture::GetOrCreate3DAs2DView(
