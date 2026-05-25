@@ -3809,7 +3809,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
           *this, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
     }
 
-    std::array<MTL::Texture*, 64> textures_for_encoder;
+    std::array<const MTL::Resource*, 64> textures_for_encoder;
     uint32_t textures_for_encoder_count = 0;
     auto track_texture_usage = [&](MTL::Texture* texture) {
       if (!texture) {
@@ -3840,9 +3840,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       track_texture_usages(current_texture_bindless_resources_pixel_);
     }
 
-    for (uint32_t i = 0; i < textures_for_encoder_count; ++i) {
-      UseRenderEncoderResource(textures_for_encoder[i], MTL::ResourceUsageRead);
-    }
+    UseRenderEncoderResources(textures_for_encoder.data(),
+                              textures_for_encoder_count,
+                              MTL::ResourceUsageRead);
     backend_telemetry_.bindless_resource_textures_tracked +=
         textures_for_encoder_count;
 
@@ -3865,7 +3865,7 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     root_resources_need_update |= stage_root_resources_need_update[stage];
   }
   if (root_resources_need_update) {
-    std::array<MTL::Buffer*, kStageCount> root_buffers_for_encoder;
+    std::array<const MTL::Resource*, kStageCount> root_buffers_for_encoder;
     uint32_t root_buffer_count = 0;
     auto track_root_buffer_usage = [&](MTL::Buffer* root_buffer) {
       if (!root_buffer) {
@@ -3890,11 +3890,9 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       }
       track_root_buffer_usage(allocation.buffer);
     }
-    for (uint32_t i = 0; i < root_buffer_count; ++i) {
-      UseRenderEncoderResource(root_buffers_for_encoder[i],
-                               MTL::ResourceUsageRead);
-    }
-    std::array<MTL::Buffer*, kStageCount * kCbvSlotCount>
+    UseRenderEncoderResources(root_buffers_for_encoder.data(),
+                              root_buffer_count, MTL::ResourceUsageRead);
+    std::array<const MTL::Resource*, kStageCount * kCbvSlotCount>
         uniform_buffers_for_encoder;
     uint32_t uniform_buffer_count = 0;
     auto track_uniform_buffer_usage = [&](MTL::Buffer* uniform_buffer) {
@@ -3924,10 +3922,8 @@ bool MetalCommandProcessor::PopulateBindlessTables(
         }
       }
     }
-    for (uint32_t i = 0; i < uniform_buffer_count; ++i) {
-      UseRenderEncoderResource(uniform_buffers_for_encoder[i],
-                               MTL::ResourceUsageRead);
-    }
+    UseRenderEncoderResources(uniform_buffers_for_encoder.data(),
+                              uniform_buffer_count, MTL::ResourceUsageRead);
     backend_telemetry_.bindless_resource_uniform_buffers_tracked +=
         uniform_buffer_count;
     for (size_t stage = 0; stage < kStageCount; ++stage) {
@@ -5950,6 +5946,52 @@ void MetalCommandProcessor::UseRenderEncoderResource(MTL::Resource* resource,
   render_encoder_resource_usage_.push_back({resource, usage_bits});
   current_render_encoder_->useResource(resource, usage);
   ++backend_telemetry_.render_encoder_use_resource_driver_calls;
+}
+
+void MetalCommandProcessor::UseRenderEncoderResources(
+    const MTL::Resource* const resources[], uint32_t count,
+    MTL::ResourceUsage usage) {
+  if (!current_render_encoder_ || !resources || !count) {
+    return;
+  }
+  constexpr size_t kResourceBatchSize = 128;
+  std::array<const MTL::Resource*, kResourceBatchSize> resource_batch;
+  uint32_t resource_batch_count = 0;
+  auto flush_batch = [&]() {
+    if (!resource_batch_count) {
+      return;
+    }
+    current_render_encoder_->useResources(resource_batch.data(),
+                                          resource_batch_count, usage);
+    ++backend_telemetry_.render_encoder_use_resource_driver_calls;
+    resource_batch_count = 0;
+  };
+  uint32_t usage_bits = static_cast<uint32_t>(usage);
+  for (uint32_t i = 0; i < count; ++i) {
+    const MTL::Resource* const_resource = resources[i];
+    if (!const_resource) {
+      continue;
+    }
+    ++backend_telemetry_.render_encoder_use_resource_calls;
+    MTL::Resource* resource = const_cast<MTL::Resource*>(const_resource);
+    auto it = render_encoder_resource_usage_map_.find(resource);
+    if (it != render_encoder_resource_usage_map_.end()) {
+      if ((it->second & usage_bits) == usage_bits) {
+        ++backend_telemetry_.render_encoder_use_resource_redundant;
+        continue;
+      }
+      it->second |= usage_bits;
+    } else {
+      UseRenderEncoderHeap(resource->heap());
+      render_encoder_resource_usage_map_.emplace(resource, usage_bits);
+      render_encoder_resource_usage_.push_back({resource, usage_bits});
+    }
+    resource_batch[resource_batch_count++] = const_resource;
+    if (resource_batch_count == resource_batch.size()) {
+      flush_batch();
+    }
+  }
+  flush_batch();
 }
 
 void MetalCommandProcessor::UseRenderEncoderHeap(MTL::Heap* heap) {

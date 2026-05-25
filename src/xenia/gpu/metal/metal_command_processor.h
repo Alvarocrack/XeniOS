@@ -542,6 +542,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ResetBackendTelemetry();
 
   void UseRenderEncoderAttachmentHeaps(MTL::RenderPassDescriptor* descriptor);
+  void UseRenderEncoderResources(const MTL::Resource* const resources[],
+                                 uint32_t count, MTL::ResourceUsage usage);
   void UseRenderEncoderHeap(MTL::Heap* heap);
   uint64_t GetBindlessDescriptorRetirementSubmission() const;
   void FreeViewBindlessIndexNow(uint32_t index);
