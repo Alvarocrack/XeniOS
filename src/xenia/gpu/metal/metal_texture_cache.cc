@@ -656,15 +656,13 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     return true;
   }
 
-  // Shared-memory uploads use a Metal blit encoder. Make sure no deferred
-  // texture upload encoder is still open before requesting residency.
-  if ((deferred_upload_compute_encoder_ || !deferred_upload_copies_.empty()) &&
-      !FlushDeferredUploadEncoderBatch()) {
-    return false;
-  }
-
   std::vector<SharedMemory::Range> ranges;
   ranges.reserve(texture_count * 2);
+  auto add_range_if_needed = [&](uint32_t start, uint32_t length) {
+    if (!shared_memory().IsRangeValid(start, length)) {
+      ranges.push_back({start, length});
+    }
+  };
   for (uint32_t i = 0; i < texture_count; ++i) {
     Texture* texture = textures[i];
     if (!texture) {
@@ -672,19 +670,27 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     }
     TextureKey texture_key = texture->key();
     if (base_outdated_mask & (UINT64_C(1) << i)) {
-      ranges.push_back(
-          {static_cast<uint32_t>(texture_key.base_page << 12),
-           xe::align(texture->GetGuestBaseSize(), UINT32_C(16))});
+      add_range_if_needed(
+          static_cast<uint32_t>(texture_key.base_page << 12),
+          xe::align(texture->GetGuestBaseSize(), UINT32_C(16)));
     }
     if (mips_outdated_mask & (UINT64_C(1) << i)) {
-      ranges.push_back(
-          {static_cast<uint32_t>(texture_key.mip_page << 12),
-           xe::align(texture->GetGuestMipsSize(), UINT32_C(16))});
+      add_range_if_needed(
+          static_cast<uint32_t>(texture_key.mip_page << 12),
+          xe::align(texture->GetGuestMipsSize(), UINT32_C(16)));
     }
   }
   if (ranges.empty()) {
     return true;
   }
+
+  // Shared-memory uploads use a Metal blit encoder. Make sure no deferred
+  // texture upload encoder is still open before requesting residency.
+  if ((deferred_upload_compute_encoder_ || !deferred_upload_copies_.empty()) &&
+      !FlushDeferredUploadEncoderBatch()) {
+    return false;
+  }
+
   return shared_memory().RequestRanges(ranges.data(),
                                        static_cast<uint32_t>(ranges.size()));
 }
