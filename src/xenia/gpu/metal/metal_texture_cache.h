@@ -138,6 +138,12 @@ class MetalTextureCache : public TextureCache {
 
   // TextureCache virtual method overrides
   void RequestTextures(uint32_t used_texture_mask) override;
+  bool PrepareTextureDataLoadRanges(Texture** textures,
+                                    uint32_t texture_count,
+                                    uint64_t base_outdated_mask,
+                                    uint64_t mips_outdated_mask) override;
+  bool RequestTextureDataRange(Texture& texture, TextureDataRangeSource source,
+                               uint32_t start, uint32_t length) override;
 
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;

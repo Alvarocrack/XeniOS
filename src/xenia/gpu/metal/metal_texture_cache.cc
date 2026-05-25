@@ -647,6 +647,68 @@ bool MetalTextureCache::FlushDeferredUploadEncoderBatch() {
   return success;
 }
 
+bool MetalTextureCache::PrepareTextureDataLoadRanges(
+    Texture** textures, uint32_t texture_count, uint64_t base_outdated_mask,
+    uint64_t mips_outdated_mask) {
+  assert_true(texture_count <= 64);
+  if (!textures || !texture_count ||
+      (!base_outdated_mask && !mips_outdated_mask)) {
+    return true;
+  }
+
+  // Shared-memory uploads use a Metal blit encoder. Make sure no deferred
+  // texture upload encoder is still open before requesting residency.
+  if ((deferred_upload_compute_encoder_ || !deferred_upload_copies_.empty()) &&
+      !FlushDeferredUploadEncoderBatch()) {
+    return false;
+  }
+
+  std::vector<SharedMemory::Range> ranges;
+  ranges.reserve(texture_count * 2);
+  for (uint32_t i = 0; i < texture_count; ++i) {
+    Texture* texture = textures[i];
+    if (!texture) {
+      continue;
+    }
+    TextureKey texture_key = texture->key();
+    if (base_outdated_mask & (UINT64_C(1) << i)) {
+      ranges.push_back(
+          {static_cast<uint32_t>(texture_key.base_page << 12),
+           xe::align(texture->GetGuestBaseSize(), UINT32_C(16))});
+    }
+    if (mips_outdated_mask & (UINT64_C(1) << i)) {
+      ranges.push_back(
+          {static_cast<uint32_t>(texture_key.mip_page << 12),
+           xe::align(texture->GetGuestMipsSize(), UINT32_C(16))});
+    }
+  }
+  if (ranges.empty()) {
+    return true;
+  }
+  return shared_memory().RequestRanges(ranges.data(),
+                                       static_cast<uint32_t>(ranges.size()));
+}
+
+bool MetalTextureCache::RequestTextureDataRange(
+    Texture& texture, TextureDataRangeSource source, uint32_t start,
+    uint32_t length) {
+  if (shared_memory().IsRangeValid(start, length)) {
+    return true;
+  }
+  static bool range_not_resident_logged = false;
+  if (!range_not_resident_logged) {
+    range_not_resident_logged = true;
+    XELOGE(
+        "Metal texture load range was not resident after preflight "
+        "(source={} start=0x{:08X} length={}); skipping texture load to avoid "
+        "opening a shared-memory blit encoder inside an active upload batch",
+        source == TextureDataRangeSource::kBase ? "base" : "mips", start,
+        length);
+  }
+  (void)texture;
+  return false;
+}
+
 MTL::ComputeCommandEncoder* MetalTextureCache::GetDeferredUploadComputeEncoder(
     MTL::CommandBuffer* command_buffer) {
   if (!deferred_upload_batch_depth_ || !command_buffer) {
