@@ -5941,7 +5941,6 @@ void MetalCommandProcessor::UseRenderEncoderResource(MTL::Resource* resource,
     ++backend_telemetry_.render_encoder_use_resource_driver_calls;
     return;
   }
-  UseRenderEncoderHeap(resource->heap());
   render_encoder_resource_usage_map_.emplace(resource, usage_bits);
   render_encoder_resource_usage_.push_back({resource, usage_bits});
   current_render_encoder_->useResource(resource, usage);
@@ -5982,7 +5981,6 @@ void MetalCommandProcessor::UseRenderEncoderResources(
       }
       it->second |= usage_bits;
     } else {
-      UseRenderEncoderHeap(resource->heap());
       render_encoder_resource_usage_map_.emplace(resource, usage_bits);
       render_encoder_resource_usage_.push_back({resource, usage_bits});
     }
