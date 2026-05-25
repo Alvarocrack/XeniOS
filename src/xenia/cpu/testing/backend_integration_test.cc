@@ -203,17 +203,46 @@ TEST_CASE("A64_STACKPOINT_SYNC_DEPTH_SELECTION", "[backend]") {
   stackpoints[2].guest_stack_ = 0x8000;
   stackpoints[3].guest_stack_ = 0x7000;
 
-  REQUIRE(FindStackpointSyncDepth(nullptr, 4, 0x8500) == 0);
-  REQUIRE(FindStackpointSyncDepth(stackpoints, 0, 0x8500) == 0);
+  REQUIRE(FindStackpointSyncDepth(nullptr, 4, 0x8500, 0x8123456C) == 0);
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 0, 0x8500, 0x8123456C) == 0);
 
   // Two skipped deeper frames: target stackpoint depth is the existing caller.
-  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0x8500) == 2);
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0x8500, 0x8123456C) == 2);
 
   // One skipped frame can be an early guest SP restore, so it must not repair.
-  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0x7500) == 0);
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0x7500, 0x8123456C) == 0);
 
   // Guest SP unwound past every recorded stackpoint: no safe repair target.
-  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0xB000) == 0);
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 4, 0xB000, 0x8123456C) == 0);
+}
+
+TEST_CASE("A64_STACKPOINT_SYNC_DEPTH_DISAMBIGUATES_EQUAL_GUEST_STACKS",
+          "[backend]") {
+  using xe::cpu::backend::a64::A64BackendStackpoint;
+  using xe::cpu::backend::a64::FindStackpointSyncDepth;
+
+  A64BackendStackpoint stackpoints[5] = {};
+  stackpoints[0].guest_stack_ = 0xA000;
+  stackpoints[0].guest_return_address_ = 0x80000100;
+  stackpoints[1].guest_stack_ = 0x9000;
+  stackpoints[1].guest_return_address_ = 0x80000200;
+  stackpoints[2].guest_stack_ = 0x9000;
+  stackpoints[2].guest_return_address_ = 0x80000300;
+  stackpoints[3].guest_stack_ = 0x8000;
+  stackpoints[3].guest_return_address_ = 0x80000400;
+  stackpoints[4].guest_stack_ = 0x7000;
+  stackpoints[4].guest_return_address_ = 0x80000500;
+
+  // The guest SP search stops at index 2. The return address identifies the
+  // frame being popped, so the sync target is its caller at depth 2.
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 5, 0x8800, 0x80000300) == 2);
+
+  // A match at the shallower equal-stack frame pops to its caller.
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 5, 0x8800, 0x80000200) == 1);
+
+  // If no return address in the equal-stack group matches, mirror x64 by
+  // choosing the shallowest equal-stack frame rather than the deepest one.
+  REQUIRE(FindStackpointSyncDepth(stackpoints, 5, 0x8800, 0x80000900) == 2);
 }
 
 static std::atomic<uint32_t> a64_pending_sync_builtin_count{0};
