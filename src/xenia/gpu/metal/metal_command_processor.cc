@@ -3649,10 +3649,16 @@ bool MetalCommandProcessor::PopulateBindlessTables(
     }
     for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
       const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
+      const uint64_t cbv_gpu_address =
+          uniform_cbv.active
+              ? (uniform_cbv.gpu_address ? uniform_cbv.gpu_address
+                                          : null_buffer_->gpuAddress())
+              : null_buffer_->gpuAddress();
+      const size_t cbv_size = uniform_cbv.active ? uniform_cbv.size : 0;
       if (!stage_root_valid ||
           current_bindless_cbv_gpu_addresses_[stage][cbv] !=
-              uniform_cbv.gpu_address ||
-          current_bindless_cbv_sizes_[stage][cbv] != uniform_cbv.size) {
+              cbv_gpu_address ||
+          current_bindless_cbv_sizes_[stage][cbv] != cbv_size) {
         stage_cbvs_match_local = false;
         bindless_cbv_mismatch = true;
         if (stage_root_valid &&
@@ -3715,10 +3721,14 @@ bool MetalCommandProcessor::PopulateBindlessTables(
       }
       current_bindless_stage_root_valid_[stage] = true;
       for (size_t cbv = 0; cbv < kCbvSlotCount; ++cbv) {
+        const UniformBufferInfo::Cbv& uniform_cbv = uniforms.cbvs[stage][cbv];
         current_bindless_cbv_gpu_addresses_[stage][cbv] =
-            uniforms.cbvs[stage][cbv].gpu_address;
+            uniform_cbv.active
+                ? (uniform_cbv.gpu_address ? uniform_cbv.gpu_address
+                                            : null_buffer_->gpuAddress())
+                : null_buffer_->gpuAddress();
         current_bindless_cbv_sizes_[stage][cbv] =
-            uniforms.cbvs[stage][cbv].size;
+            uniform_cbv.active ? uniform_cbv.size : 0;
       }
       ++current_bindless_stage_root_serials_[stage];
       if (!current_bindless_stage_root_serials_[stage]) {
