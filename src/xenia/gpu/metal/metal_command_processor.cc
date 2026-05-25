@@ -3413,12 +3413,12 @@ bool MetalCommandProcessor::PrepareDrawConstants(
 
   if (descriptor_indices_vertex_written) {
     current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
-    current_texture_bindless_indices_vertex_ =
-        next_texture_bindless_indices_vertex;
-    current_texture_bindless_resources_vertex_ =
-        next_texture_bindless_resources_vertex;
-    current_sampler_bindless_indices_vertex_ =
-        next_sampler_bindless_indices_vertex;
+    current_texture_bindless_indices_vertex_.swap(
+        next_texture_bindless_indices_vertex);
+    current_texture_bindless_resources_vertex_.swap(
+        next_texture_bindless_resources_vertex);
+    current_sampler_bindless_indices_vertex_.swap(
+        next_sampler_bindless_indices_vertex);
     if (texture_count_vertex) {
       current_texture_srv_keys_vertex_.resize(std::max(
           current_texture_srv_keys_vertex_.size(), texture_count_vertex));
@@ -3429,12 +3429,12 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   }
   if (descriptor_indices_pixel_written) {
     current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
-    current_texture_bindless_indices_pixel_ =
-        next_texture_bindless_indices_pixel;
-    current_texture_bindless_resources_pixel_ =
-        next_texture_bindless_resources_pixel;
-    current_sampler_bindless_indices_pixel_ =
-        next_sampler_bindless_indices_pixel;
+    current_texture_bindless_indices_pixel_.swap(
+        next_texture_bindless_indices_pixel);
+    current_texture_bindless_resources_pixel_.swap(
+        next_texture_bindless_resources_pixel);
+    current_sampler_bindless_indices_pixel_.swap(
+        next_sampler_bindless_indices_pixel);
     if (texture_bindings_pixel_ptr && !texture_bindings_pixel_ptr->empty()) {
       current_texture_srv_keys_pixel_.resize(
           std::max(current_texture_srv_keys_pixel_.size(),
