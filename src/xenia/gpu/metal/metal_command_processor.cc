@@ -68,6 +68,7 @@ namespace {
 constexpr size_t kMaxPendingSharedMemoryWrites = 16;
 constexpr size_t kMaxPendingSharedMemoryWriteCapacity = 64;
 constexpr size_t kMaxSharedMemoryWaitSegmentsPerPending = 64;
+constexpr uint32_t kMaxVertexFetchSharedMemoryRanges = 96;
 
 struct SharedMemoryRangeSegment {
   uint32_t start;
@@ -108,6 +109,68 @@ bool SharedMemoryRangeOverlapsSegment(
                     segment_end > range_segment.start);
       });
   return overlaps;
+}
+
+bool CollectVertexFetchSharedMemoryRanges(const RegisterFile& regs,
+                                          const Shader& vertex_shader,
+                                          SharedMemory::Range* ranges,
+                                          uint32_t max_ranges,
+                                          uint32_t* range_count,
+                                          bool strict_logging) {
+  *range_count = 0;
+  const Shader::ConstantRegisterMap& constant_map =
+      vertex_shader.constant_register_map();
+  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (xe::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      uint32_t vfetch_index = i * 32 + j;
+      xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(vfetch_index);
+      switch (vfetch.type) {
+        case xenos::FetchConstantType::kVertex:
+          break;
+        case xenos::FetchConstantType::kInvalidVertex:
+          if (::cvars::gpu_allow_invalid_fetch_constants) {
+            break;
+          }
+          if (strict_logging) {
+            XELOGW(
+                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" "
+                "type. Use --gpu_allow_invalid_fetch_constants to bypass.",
+                vfetch_index, vfetch.dword_0, vfetch.dword_1);
+          }
+          return false;
+        default:
+          if (strict_logging) {
+            XELOGW("Vertex fetch constant {} ({:08X} {:08X}) is invalid.",
+                   vfetch_index, vfetch.dword_0, vfetch.dword_1);
+          }
+          return false;
+      }
+      uint32_t buffer_offset = vfetch.address << 2;
+      uint32_t buffer_length = vfetch.size << 2;
+      if (buffer_offset > SharedMemory::kBufferSize ||
+          SharedMemory::kBufferSize - buffer_offset < buffer_length) {
+        if (strict_logging) {
+          XELOGW(
+              "Vertex fetch constant {} out of range (offset=0x{:08X} "
+              "size={})",
+              vfetch_index, buffer_offset, buffer_length);
+        }
+        return false;
+      }
+      if (*range_count >= max_ranges) {
+        if (strict_logging) {
+          XELOGW("Too many vertex fetch shared-memory ranges");
+        }
+        return false;
+      }
+      ranges[(*range_count)++] =
+          SharedMemory::Range{buffer_offset, buffer_length};
+    }
+  }
+  return true;
 }
 
 bool GetTextureSize(MTL::Texture* texture, uint32_t& width_out,
@@ -2544,53 +2607,22 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // This is particularly important for trace playback where memory is
   // written incrementally
   if (shared_memory_) {
-    const Shader::ConstantRegisterMap& constant_map_vertex =
-        vertex_shader->constant_register_map();
-    for (uint32_t i = 0;
-         i < xe::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
-      uint32_t vfetch_bits_remaining =
-          constant_map_vertex.vertex_fetch_bitmap[i];
-      uint32_t j;
-      while (xe::bit_scan_forward(vfetch_bits_remaining, &j)) {
-        vfetch_bits_remaining &= ~(uint32_t(1) << j);
-        uint32_t vfetch_index = i * 32 + j;
-        xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(vfetch_index);
-        switch (vfetch.type) {
-          case xenos::FetchConstantType::kVertex:
-            break;
-          case xenos::FetchConstantType::kInvalidVertex:
-            if (::cvars::gpu_allow_invalid_fetch_constants) {
-              break;
-            }
-            XELOGW(
-                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" "
-                "type. "
-                "Use --gpu_allow_invalid_fetch_constants to bypass.",
-                vfetch_index, vfetch.dword_0, vfetch.dword_1);
-            return false;
-          default:
-            XELOGW("Vertex fetch constant {} ({:08X} {:08X}) is invalid.",
-                   vfetch_index, vfetch.dword_0, vfetch.dword_1);
-            return false;
-        }
-        uint32_t buffer_offset = vfetch.address << 2;
-        uint32_t buffer_length = vfetch.size << 2;
-        if (buffer_offset > SharedMemory::kBufferSize ||
-            SharedMemory::kBufferSize - buffer_offset < buffer_length) {
-          XELOGW(
-              "Vertex fetch constant {} out of range (offset=0x{:08X} size={})",
-              vfetch_index, buffer_offset, buffer_length);
-          return false;
-        }
-        if (!RequestSharedMemoryRange(SharedMemoryRequestReason::kVertexFetch,
-                                      buffer_offset, buffer_length)) {
-          XELOGE(
-              "Failed to request vertex buffer at 0x{:08X} (size {}) in shared "
-              "memory",
-              buffer_offset, buffer_length);
-          return false;
-        }
-      }
+    std::array<SharedMemory::Range, kMaxVertexFetchSharedMemoryRanges>
+        vertex_fetch_ranges;
+    uint32_t vertex_fetch_range_count = 0;
+    if (!CollectVertexFetchSharedMemoryRanges(
+            regs, *vertex_shader, vertex_fetch_ranges.data(),
+            uint32_t(vertex_fetch_ranges.size()), &vertex_fetch_range_count,
+            true)) {
+      return false;
+    }
+    if (vertex_fetch_range_count &&
+        !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
+                                   vertex_fetch_ranges.data(),
+                                   vertex_fetch_range_count)) {
+      XELOGE("Failed to request {} vertex-fetch ranges in shared memory",
+             vertex_fetch_range_count);
+      return false;
     }
 
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
