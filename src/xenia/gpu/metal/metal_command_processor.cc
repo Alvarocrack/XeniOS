@@ -4703,8 +4703,6 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
   if (!num_registers) {
     return;
   }
-  uint64_t changed = 0;
-  uint64_t unchanged = 0;
   uint64_t dirty = 0;
   uint32_t* register_values = register_file_->values;
 
@@ -4713,9 +4711,6 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
   const uint32_t dword_end = dword_start + num_registers;
   const uint32_t first_constant = dword_start >> 2;
   const uint32_t last_constant = (dword_end - 1) >> 2;
-  constexpr uint32_t kLargeFloatConstantWriteDwords = 64;
-  const bool use_range_overlap_invalidation =
-      num_registers >= kLargeFloatConstantWriteDwords;
 
   auto bit_range_mask = [](uint32_t first_bit, uint32_t end_bit) {
     assert_true(first_bit < end_bit && end_bit <= 64);
@@ -4746,7 +4741,6 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
         }
 
         bool used_constant_touched = false;
-        bool stage_dirty = false;
         const uint32_t relative_first_constant =
             check_first_constant - stage_first_constant;
         const uint32_t relative_constant_end =
@@ -4764,49 +4758,8 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
           uint64_t constants_in_word =
               constant_map[map_word] & bit_range_mask(word_first_bit,
                                                       word_end_bit);
-          uint32_t relative_constant_in_word;
-          while (xe::bit_scan_forward(constants_in_word,
-                                      &relative_constant_in_word)) {
-            constants_in_word = xe::clear_lowest_bit(constants_in_word);
+          if (constants_in_word) {
             used_constant_touched = true;
-            if (use_range_overlap_invalidation) {
-              // Large float-constant packets follow D3D12/Vulkan-style
-              // range-overlap invalidation. Small writes still do exact
-              // dword compares below to suppress redundant CBV churn.
-              ++dirty;
-              stage_dirty = true;
-              break;
-            }
-            const uint32_t constant_index =
-                stage_first_constant + (map_word << 6) +
-                relative_constant_in_word;
-            const uint32_t constant_dword_start = constant_index << 2;
-            const uint32_t constant_dword_end = constant_dword_start + 4;
-            const uint32_t compare_dword_start =
-                std::max(dword_start, constant_dword_start);
-            const uint32_t compare_dword_end =
-                std::min(dword_end, constant_dword_end);
-            for (uint32_t dword = compare_dword_start;
-                 dword < compare_dword_end; ++dword) {
-              ++backend_telemetry_.register_write_float_dwords_compared;
-              const uint32_t value =
-                  xe::load_and_swap<uint32_t>(base + (dword - dword_start));
-              const uint32_t old_value =
-                  register_values[XE_GPU_REG_SHADER_CONSTANT_000_X + dword];
-              if (old_value == value) {
-                ++unchanged;
-                continue;
-              }
-              ++changed;
-              ++dirty;
-              stage_dirty = true;
-              break;
-            }
-            if (stage_dirty) {
-              break;
-            }
-          }
-          if (stage_dirty) {
             break;
           }
         }
@@ -4814,15 +4767,15 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
         if (!used_constant_touched) {
           ++unused_range_counter;
         }
-        if (stage_dirty) {
+        if (used_constant_touched) {
           binding_up_to_date = false;
           ++dirty_stage_counter;
+          ++dirty;
         }
       };
 
-  // Match D3D12's bulk-copy shape, but keep Metal's existing exact dirty
-  // suppression for used constants to avoid creating avoidable MSC root
-  // argument churn from redundant writes.
+  // Match D3D12/Vulkan write semantics: a register write that touches a live
+  // constant range dirties the binding even if the value is unchanged.
   check_stage_constants(cbuffer_binding_float_vertex_.up_to_date,
                         current_float_constant_map_vertex_, 0,
                         backend_telemetry_.register_write_float_dirty_vertex,
@@ -4842,8 +4795,6 @@ void MetalCommandProcessor::WriteShaderConstantsFromMem(uint32_t start_index,
                                  num_registers);
 
   backend_telemetry_.register_write_float_total += num_registers;
-  backend_telemetry_.register_write_float_changed += changed;
-  backend_telemetry_.register_write_float_unchanged += unchanged;
   backend_telemetry_.register_write_float_dirty += dirty;
   backend_telemetry_.register_write_float_dwords_copied += num_registers;
 }
@@ -4867,10 +4818,8 @@ void MetalCommandProcessor::WriteBoolLoopConstantsFromMem(
   backend_telemetry_.register_write_bool_loop_total += num_registers;
   backend_telemetry_.register_write_bool_loop_changed += changed;
   backend_telemetry_.register_write_bool_loop_unchanged += unchanged;
-  backend_telemetry_.register_write_bool_loop_dirty += changed;
-  if (changed) {
-    cbuffer_binding_bool_loop_.up_to_date = false;
-  }
+  backend_telemetry_.register_write_bool_loop_dirty += num_registers;
+  cbuffer_binding_bool_loop_.up_to_date = false;
 }
 
 void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
@@ -4881,8 +4830,8 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   }
   uint64_t changed = 0;
   uint64_t unchanged = 0;
-  uint32_t changed_fetch_mask = 0;
-  DxbcShader::FetchConstantDwordMask changed_fetch_dword_mask = {};
+  uint32_t written_fetch_mask = 0;
+  DxbcShader::FetchConstantDwordMask written_fetch_dword_mask = {};
   uint32_t* register_values = register_file_->values;
 
   const uint32_t dword_start =
@@ -4908,12 +4857,12 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
           register_values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + dword];
       if (old_value == value) {
         ++unchanged;
-        continue;
+      } else {
+        ++changed;
+        fetch_changed = true;
       }
-      ++changed;
-      fetch_changed = true;
-      changed_fetch_mask |= uint32_t(1) << fetch_index;
-      MarkFetchConstantDword(changed_fetch_dword_mask, dword);
+      written_fetch_mask |= uint32_t(1) << fetch_index;
+      MarkFetchConstantDword(written_fetch_dword_mask, dword);
     }
     if (fetch_changed) {
       ++backend_telemetry_.register_write_fetch_changed_slots;
@@ -4926,37 +4875,35 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   backend_telemetry_.register_write_fetch_total += num_registers;
   backend_telemetry_.register_write_fetch_changed += changed;
   backend_telemetry_.register_write_fetch_unchanged += unchanged;
-  backend_telemetry_.register_write_fetch_dirty += changed;
+  backend_telemetry_.register_write_fetch_dirty += num_registers;
   backend_telemetry_.register_write_fetch_dwords_copied += num_registers;
-  if (changed) {
-    MergeFetchConstantDwordMask(fetch_constant_dirty_mask_,
-                                changed_fetch_dword_mask);
-    bool current_fetch_binding_touched = false;
-    if (FetchConstantDwordMasksOverlap(
-            changed_fetch_dword_mask,
-            current_fetch_constant_dword_masks_[kStageVertex])) {
-      ++backend_telemetry_.register_write_fetch_dirty_vertex;
-      current_fetch_binding_touched = true;
-    }
-    if (FetchConstantDwordMasksOverlap(
-            changed_fetch_dword_mask,
-            current_fetch_constant_dword_masks_[kStagePixel])) {
-      ++backend_telemetry_.register_write_fetch_dirty_pixel;
-      current_fetch_binding_touched = true;
-    }
-    if (current_fetch_binding_touched) {
-      cbuffer_binding_fetch_.up_to_date = false;
-    }
+  MergeFetchConstantDwordMask(fetch_constant_dirty_mask_,
+                              written_fetch_dword_mask);
+  bool current_fetch_binding_touched = false;
+  if (FetchConstantDwordMasksOverlap(
+          written_fetch_dword_mask,
+          current_fetch_constant_dword_masks_[kStageVertex])) {
+    ++backend_telemetry_.register_write_fetch_dirty_vertex;
+    current_fetch_binding_touched = true;
   }
-  if (texture_cache_ && changed_fetch_mask) {
-    uint32_t mask = changed_fetch_mask;
+  if (FetchConstantDwordMasksOverlap(
+          written_fetch_dword_mask,
+          current_fetch_constant_dword_masks_[kStagePixel])) {
+    ++backend_telemetry_.register_write_fetch_dirty_pixel;
+    current_fetch_binding_touched = true;
+  }
+  if (current_fetch_binding_touched) {
+    cbuffer_binding_fetch_.up_to_date = false;
+  }
+  if (texture_cache_ && written_fetch_mask) {
+    uint32_t mask = written_fetch_mask;
     uint32_t fetch_index = 0;
     while (xe::bit_scan_forward(mask, &fetch_index)) {
       mask = xe::clear_lowest_bit(mask);
       texture_cache_->TextureFetchConstantWritten(fetch_index);
     }
     backend_telemetry_.texture_fetch_constant_invalidations +=
-        xe::bit_count(changed_fetch_mask);
+        xe::bit_count(written_fetch_mask);
   }
 }
 
@@ -4977,9 +4924,9 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     ++backend_telemetry_.register_write_float_total;
     if (!value_changed) {
       ++backend_telemetry_.register_write_float_unchanged;
-      return;
+    } else {
+      ++backend_telemetry_.register_write_float_changed;
     }
-    ++backend_telemetry_.register_write_float_changed;
     uint32_t float_constant_index =
         (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
     if (float_constant_index >= 256) {
@@ -5001,9 +4948,9 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     ++backend_telemetry_.register_write_bool_loop_total;
     if (!value_changed) {
       ++backend_telemetry_.register_write_bool_loop_unchanged;
-      return;
+    } else {
+      ++backend_telemetry_.register_write_bool_loop_changed;
     }
-    ++backend_telemetry_.register_write_bool_loop_changed;
     cbuffer_binding_bool_loop_.up_to_date = false;
     ++backend_telemetry_.register_write_bool_loop_dirty;
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
@@ -5011,9 +4958,9 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     ++backend_telemetry_.register_write_fetch_total;
     if (!value_changed) {
       ++backend_telemetry_.register_write_fetch_unchanged;
-      return;
+    } else {
+      ++backend_telemetry_.register_write_fetch_changed;
     }
-    ++backend_telemetry_.register_write_fetch_changed;
     ++backend_telemetry_.register_write_fetch_dirty;
     const uint32_t fetch_dword =
         index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
