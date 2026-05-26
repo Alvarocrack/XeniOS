@@ -165,14 +165,15 @@ DEFINE_bool(metal_direct_host_resolve, true,
             "Metal");
 DEFINE_bool(
     metal_tile_direct_host_resolve, true,
-    "Prototype: resolve eligible fast color copies from the active Metal "
+    "Prototype: resolve eligible fast/full color copies from the active Metal "
     "render pass with a tile shader before ending the render encoder",
     "Metal");
 DEFINE_bool(
     metal_tile_direct_host_resolve_dontcare_store, true,
     "Experimental: after a tile direct-host resolve, mark the source color "
-    "attachment store action DontCare. Unsafe without render-target liveness "
-    "proof; use only on traces where the source host RT does not escape.",
+    "attachment store action DontCare. This prototype defaults on for "
+    "telemetry, but still needs render-target liveness proof before it is "
+    "considered generally safe.",
     "Metal");
 DEFINE_bool(metal_use_heaps, true,
             "Use MTLHeap-backed texture allocations in Metal to reduce "
@@ -318,9 +319,49 @@ bool IsResolveDirectHostRTFullColorCandidate(
   return DirectHostResolveFullDestIndex(shader) < 5;
 }
 
+bool IsResolveDirectHostRTFullColorSourcePackable(
+    xenos::ColorRenderTargetFormat format) {
+  switch (format) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool IsResolveDirectHostRTCandidate(draw_util::ResolveCopyShaderIndex shader) {
   return IsResolveDirectHostRTFastCandidate(shader) ||
          IsResolveDirectHostRTFullColorCandidate(shader);
+}
+
+uint32_t DirectHostResolveFullDestBppLog2(
+    draw_util::ResolveCopyShaderIndex shader) {
+  switch (shader) {
+    case draw_util::ResolveCopyShaderIndex::kFull8bpp:
+      return 0;
+    case draw_util::ResolveCopyShaderIndex::kFull16bpp:
+      return 1;
+    case draw_util::ResolveCopyShaderIndex::kFull32bpp:
+      return 2;
+    case draw_util::ResolveCopyShaderIndex::kFull64bpp:
+      return 3;
+    case draw_util::ResolveCopyShaderIndex::kFull128bpp:
+      return 4;
+    default:
+      break;
+  }
+  assert_unhandled_case(shader);
+  return 2;
 }
 
 uint32_t DirectHostResolvePixelsPerThread(
@@ -4832,26 +4873,6 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   uint64_t covered_tiles = 0;
   std::vector<DirectHostResolveSource> sources;
   sources.reserve(rectangles.size());
-  auto is_direct_full_color_source_packable = [](xenos::ColorRenderTargetFormat
-                                                     format) {
-    switch (format) {
-      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
-      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-      case xenos::ColorRenderTargetFormat::k_16_16:
-      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
-      case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-      case xenos::ColorRenderTargetFormat::k_32_FLOAT:
-      case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
-        return true;
-      default:
-        return false;
-    }
-  };
-
   for (const ResolveCopyDumpRectangle& rect : rectangles) {
     if (!rect.rows || rect.row_last_end <= rect.row_first_start) {
       return reject();
@@ -4903,7 +4924,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
         return reject_format_mismatch();
       }
       if (copy_shader_is_full_color &&
-          !is_direct_full_color_source_packable(resolve_color_format)) {
+          !IsResolveDirectHostRTFullColorSourcePackable(resolve_color_format)) {
         return reject_format_mismatch();
       }
 
@@ -5154,6 +5175,31 @@ constant uint kXenosColorRTFormatRG16Float = 6u;
 constant uint kXenosColorRTFormatRGBA16Float = 7u;
 constant uint kXenosColorRTFormatRGB10A2AsRGB10A2 = 10u;
 constant uint kXenosColorRTFormatRGB10A2FloatAsRGBA16 = 12u;
+constant uint kXenosColorRTFormatRG32Float = 15u;
+constant uint kXenosFormat_1_5_5_5 = 3u;
+constant uint kXenosFormat_5_6_5 = 4u;
+constant uint kXenosFormat_6_5_5 = 5u;
+constant uint kXenosFormat_8_8_8_8 = 6u;
+constant uint kXenosFormat_2_10_10_10 = 7u;
+constant uint kXenosFormat_8_8 = 10u;
+constant uint kXenosFormat_8_8_8_8_A = 14u;
+constant uint kXenosFormat_4_4_4_4 = 15u;
+constant uint kXenosFormat_10_11_11 = 16u;
+constant uint kXenosFormat_11_11_10 = 17u;
+constant uint kXenosFormat_16_16_EDRAM = 13u;
+constant uint kXenosFormat_16_16_16_16_EDRAM = 21u;
+constant uint kXenosFormat_16 = 24u;
+constant uint kXenosFormat_16_16 = 25u;
+constant uint kXenosFormat_16_16_16_16 = 26u;
+constant uint kXenosFormat_16_16_FLOAT = 31u;
+constant uint kXenosFormat_16_16_16_16_FLOAT = 32u;
+constant uint kXenosFormat_32_32_32_32_FLOAT = 38u;
+constant uint kXenosFormat_8_8_8_8_AS_16_16_16_16 = 50u;
+constant uint kXenosFormat_2_10_10_10_AS_16_16_16_16 = 54u;
+constant uint kXenosFormat_10_11_11_AS_16_16_16_16 = 55u;
+constant uint kXenosFormat_11_11_10_AS_16_16_16_16 = 56u;
+constant uint kXenosCopySampleSelect01 = 4u;
+constant uint kXenosCopySampleSelect0123 = 6u;
 
 struct TileDirectHostResolveConstants {
   uint edram_info;
@@ -5179,7 +5225,15 @@ struct TileDirectHostResolveConstants {
   uint msaa_samples;
   uint is_64bpp;
   uint source_format;
-  uint padding;
+  uint is_full_color;
+  uint dest_format;
+  float dest_exp_bias_factor;
+  uint pixels_per_thread;
+  uint dest_bpp_log2;
+  uint padding0;
+  uint padding1;
+  uint padding2;
+  uint padding3;
 };
 
 struct TileResolveInfo {
@@ -5193,6 +5247,8 @@ struct TileResolveInfo {
   uint dest_endian_128;
   bool dest_is_array;
   uint dest_slice;
+  uint dest_format;
+  float dest_exp_bias_factor;
   bool dest_swap;
   uint dest_row_pitch_macro_tiles;
   uint dest_slice_pitch_3d_macro_tiles;
@@ -5220,6 +5276,8 @@ inline TileResolveInfo TileGetResolveInfo(
   info.dest_endian_128 = dest_info & ((1u << 3u) - 1u);
   info.dest_is_array = (dest_info & (1u << 3u)) != 0u;
   info.dest_slice = (dest_info >> 4u) & ((1u << 3u) - 1u);
+  info.dest_format = (dest_info >> 7u) & ((1u << 6u) - 1u);
+  info.dest_exp_bias_factor = c.dest_exp_bias_factor;
   info.dest_swap = (dest_info & (1u << 24u)) != 0u;
   info.dest_row_pitch_macro_tiles =
       dest_coordinate_info & ((1u << 10u) - 1u);
@@ -5244,6 +5302,21 @@ inline uint XeEndianSwap32(uint value, uint endian) {
   return value;
 }
 
+inline uint2 XeEndianSwap16(uint2 value, uint endian) {
+  if (endian == 1u) {
+    value = ((value & 0x00FF00FFu) << 8u) |
+            ((value & 0xFF00FF00u) >> 8u);
+  }
+  return value;
+}
+
+inline uint4 XeEndianSwap32(uint4 value, uint endian) {
+  return uint4(XeEndianSwap32(value.x, endian),
+               XeEndianSwap32(value.y, endian),
+               XeEndianSwap32(value.z, endian),
+               XeEndianSwap32(value.w, endian));
+}
+
 inline uint2 XeEndianSwap64(uint2 value, uint endian) {
   if (endian == 4u) {
     value = value.yx;
@@ -5251,6 +5324,22 @@ inline uint2 XeEndianSwap64(uint2 value, uint endian) {
   }
   return uint2(XeEndianSwap32(value.x, endian),
                XeEndianSwap32(value.y, endian));
+}
+
+inline uint4 XeEndianSwap64(uint4 value, uint endian) {
+  if (endian == 4u) {
+    value = value.yxwz;
+    endian = 2u;
+  }
+  return XeEndianSwap32(value, endian);
+}
+
+inline uint4 XeEndianSwap128(uint4 value, uint endian) {
+  if (endian == 5u) {
+    value = value.wzyx;
+    endian = 2u;
+  }
+  return XeEndianSwap64(value, endian);
 }
 
 inline uint XenosTextureTiledAddressCombine(uint outer_inner_bytes, uint bank,
@@ -5363,6 +5452,62 @@ inline uint TilePackUnorm(float value, float scale) {
   return uint(clamp(value, 0.0f, 1.0f) * scale + 0.5f);
 }
 
+inline uint TilePackR5G5B5A1UNorm(float4 f) {
+  uint4 n = uint4(clamp(f, 0.0f, 1.0f) *
+                  float4(31.0f, 31.0f, 31.0f, 1.0f) + 0.5f);
+  return n.r | (n.g << 5u) | (n.b << 10u) | (n.a << 15u);
+}
+
+inline uint TilePackR5G6B5UNorm(float3 f) {
+  uint3 n = uint3(clamp(f, 0.0f, 1.0f) *
+                  float3(31.0f, 63.0f, 31.0f) + 0.5f);
+  return n.r | (n.g << 5u) | (n.b << 11u);
+}
+
+inline uint TilePackR5G5B6UNorm(float3 f) {
+  uint3 n = uint3(clamp(f, 0.0f, 1.0f) *
+                  float3(31.0f, 31.0f, 63.0f) + 0.5f);
+  return n.r | (n.g << 5u) | (n.b << 10u);
+}
+
+inline uint TilePackR8G8B8A8UNorm(float4 f) {
+  uint4 n = uint4(clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+  return n.r | (n.g << 8u) | (n.b << 16u) | (n.a << 24u);
+}
+
+inline uint TilePackR10G10B10A2UNorm(float4 f) {
+  uint4 n = uint4(clamp(f, 0.0f, 1.0f) *
+                  float4(1023.0f, 1023.0f, 1023.0f, 3.0f) + 0.5f);
+  return n.r | (n.g << 10u) | (n.b << 20u) | (n.a << 30u);
+}
+
+inline uint TilePackR4G4B4A4UNorm(float4 f) {
+  uint4 n = uint4(clamp(f, 0.0f, 1.0f) * 15.0f + 0.5f);
+  return n.r | (n.g << 4u) | (n.b << 8u) | (n.a << 12u);
+}
+
+inline uint TilePackR11G11B10UNorm(float3 f) {
+  uint3 n = uint3(clamp(f, 0.0f, 1.0f) *
+                  float3(2047.0f, 2047.0f, 1023.0f) + 0.5f);
+  return n.r | (n.g << 11u) | (n.b << 22u);
+}
+
+inline uint TilePackR10G11B11UNorm(float3 f) {
+  uint3 n = uint3(clamp(f, 0.0f, 1.0f) *
+                  float3(1023.0f, 2047.0f, 2047.0f) + 0.5f);
+  return n.r | (n.g << 10u) | (n.b << 21u);
+}
+
+inline uint TilePackR16G16UNorm(float2 f) {
+  uint2 n = uint2(clamp(f, 0.0f, 1.0f) * 65535.0f + 0.5f);
+  return n.r | (n.g << 16u);
+}
+
+inline uint2 TilePackR16G16B16A16UNorm(float4 f) {
+  uint4 n = uint4(clamp(f, 0.0f, 1.0f) * 65535.0f + 0.5f);
+  return uint2(n.r | (n.g << 16u), n.b | (n.a << 16u));
+}
+
 inline uint TilePackSnorm16(float value) {
   float clamped = clamp(value, -1.0f, 1.0f);
   float bias = clamped >= 0.0f ? 0.5f : -0.5f;
@@ -5431,10 +5576,342 @@ inline uint2 TilePack64(float4 color, uint format) {
   }
 }
 
+inline float4 TileUnpackR8G8B8A8UNorm(uint packed) {
+  return float4((uint4(packed) >> uint4(0u, 8u, 16u, 24u)) & 255u) *
+         (1.0f / 255.0f);
+}
+
+inline float4 TileUnpackR10G10B10A2UNorm(uint packed) {
+  return float4((uint4(packed) >> uint4(0u, 10u, 20u, 30u)) &
+                uint4(1023u, 1023u, 1023u, 3u)) *
+         float4(1.0f / 1023.0f, 1.0f / 1023.0f, 1.0f / 1023.0f,
+                1.0f / 3.0f);
+}
+
+inline float TileUnpackR10Float(uint packed) {
+  uint f10 = packed & 0x3FFu;
+  if (f10 == 0u) {
+    return 0.0f;
+  }
+  uint mantissa = f10 & 0x7Fu;
+  uint exponent = f10 >> 7u;
+  if (exponent == 0u) {
+    uint mantissa_lzcnt = clz(mantissa) - 24u;
+    exponent = 1u - mantissa_lzcnt;
+    mantissa = (mantissa << mantissa_lzcnt) & 0x7Fu;
+  }
+  return as_type<float>(((exponent + 124u) << 23u) | (mantissa << 16u));
+}
+
+inline float4 TileUnpackR10G10B10A2Float(uint packed) {
+  return float4(TileUnpackR10Float(packed),
+                TileUnpackR10Float(packed >> 10u),
+                TileUnpackR10Float(packed >> 20u),
+                float((packed >> 30u) & 3u) * (1.0f / 3.0f));
+}
+
+inline float2 TileUnpackR16G16Edram(uint packed) {
+  int r = int(packed << 16u) >> 16;
+  int g = int(packed) >> 16;
+  return max(float2(-32.0f),
+             float2(float(r), float(g)) * (32.0f / 32767.0f));
+}
+
+inline float4 TileUnpackR16G16B16A16Edram(uint2 packed) {
+  int4 values = int2(packed).xxyy << int4(16, 0, 16, 0) >> 16;
+  return max(float4(-32.0f), float4(values) * (32.0f / 32767.0f));
+}
+
+inline float4 TileUnpack32(uint packed, uint format) {
+  switch (format) {
+    case kXenosColorRTFormatRGBA8:
+    case kXenosColorRTFormatRGBA8Gamma:
+      return TileUnpackR8G8B8A8UNorm(packed);
+    case kXenosColorRTFormatRGB10A2:
+    case kXenosColorRTFormatRGB10A2AsRGB10A2:
+      return TileUnpackR10G10B10A2UNorm(packed);
+    case kXenosColorRTFormatRGB10A2Float:
+    case kXenosColorRTFormatRGB10A2FloatAsRGBA16:
+      return TileUnpackR10G10B10A2Float(packed);
+    case kXenosColorRTFormatRG16:
+      return float4(TileUnpackR16G16Edram(packed), 0.0f, 0.0f);
+    case kXenosColorRTFormatRG16Float:
+      return float4(float2(as_type<half2>(packed)), 0.0f, 0.0f);
+    default:
+      return float4(as_type<float>(packed), 0.0f, 0.0f, 0.0f);
+  }
+}
+
+inline float4 TileUnpack64(uint2 packed, uint format) {
+  switch (format) {
+    case kXenosColorRTFormatRGBA16:
+      return TileUnpackR16G16B16A16Edram(packed);
+    case kXenosColorRTFormatRGBA16Float:
+      return float4(float2(as_type<half2>(packed.x)),
+                    float2(as_type<half2>(packed.y)));
+    default:
+      return float4(as_type<float2>(packed), 0.0f, 0.0f);
+  }
+}
+
+inline float4 TileRoundTripSourceColor(
+    constant TileDirectHostResolveConstants& c, float4 color) {
+  return c.is_64bpp != 0u ? TileUnpack64(TilePack64(color, c.source_format),
+                                         c.source_format)
+                          : TileUnpack32(TilePack32(color, c.source_format),
+                                         c.source_format);
+}
+
+inline uint2 TilePackFull16bpp4Pixels(float4 pixel_0, float4 pixel_1,
+                                      float4 pixel_2, float4 pixel_3,
+                                      uint format) {
+  uint2 packed;
+  switch (format) {
+    case kXenosFormat_1_5_5_5:
+      packed.x = TilePackR5G5B5A1UNorm(pixel_0) |
+                 (TilePackR5G5B5A1UNorm(pixel_1) << 16u);
+      packed.y = TilePackR5G5B5A1UNorm(pixel_2) |
+                 (TilePackR5G5B5A1UNorm(pixel_3) << 16u);
+      break;
+    case kXenosFormat_5_6_5:
+      packed.x = TilePackR5G6B5UNorm(pixel_0.rgb) |
+                 (TilePackR5G6B5UNorm(pixel_1.rgb) << 16u);
+      packed.y = TilePackR5G6B5UNorm(pixel_2.rgb) |
+                 (TilePackR5G6B5UNorm(pixel_3.rgb) << 16u);
+      break;
+    case kXenosFormat_6_5_5:
+      packed.x = TilePackR5G5B6UNorm(pixel_0.rgb) |
+                 (TilePackR5G5B6UNorm(pixel_1.rgb) << 16u);
+      packed.y = TilePackR5G5B6UNorm(pixel_2.rgb) |
+                 (TilePackR5G5B6UNorm(pixel_3.rgb) << 16u);
+      break;
+    case kXenosFormat_8_8:
+      packed.x = TilePackR8G8B8A8UNorm(
+          float4(pixel_0.rg, pixel_1.rg));
+      packed.y = TilePackR8G8B8A8UNorm(
+          float4(pixel_2.rg, pixel_3.rg));
+      break;
+    case kXenosFormat_4_4_4_4:
+      packed.x = TilePackR4G4B4A4UNorm(pixel_0) |
+                 (TilePackR4G4B4A4UNorm(pixel_1) << 16u);
+      packed.y = TilePackR4G4B4A4UNorm(pixel_2) |
+                 (TilePackR4G4B4A4UNorm(pixel_3) << 16u);
+      break;
+    case kXenosFormat_16:
+      packed = TilePackR16G16B16A16UNorm(
+          float4(pixel_0.r, pixel_1.r, pixel_2.r, pixel_3.r));
+      break;
+    default:
+      packed.x = as_type<uint>(half2(pixel_0.r, pixel_1.r));
+      packed.y = as_type<uint>(half2(pixel_2.r, pixel_3.r));
+      break;
+  }
+  return packed;
+}
+
+inline uint4 TilePackFull32bpp4Pixels(float4 pixel_0, float4 pixel_1,
+                                      float4 pixel_2, float4 pixel_3,
+                                      uint format) {
+  uint4 packed;
+  switch (format) {
+    case kXenosFormat_8_8_8_8:
+    case kXenosFormat_8_8_8_8_A:
+    case kXenosFormat_8_8_8_8_AS_16_16_16_16:
+      packed = uint4(TilePackR8G8B8A8UNorm(pixel_0),
+                     TilePackR8G8B8A8UNorm(pixel_1),
+                     TilePackR8G8B8A8UNorm(pixel_2),
+                     TilePackR8G8B8A8UNorm(pixel_3));
+      break;
+    case kXenosFormat_2_10_10_10:
+    case kXenosFormat_2_10_10_10_AS_16_16_16_16:
+      packed = uint4(TilePackR10G10B10A2UNorm(pixel_0),
+                     TilePackR10G10B10A2UNorm(pixel_1),
+                     TilePackR10G10B10A2UNorm(pixel_2),
+                     TilePackR10G10B10A2UNorm(pixel_3));
+      break;
+    case kXenosFormat_10_11_11:
+    case kXenosFormat_10_11_11_AS_16_16_16_16:
+      packed = uint4(TilePackR11G11B10UNorm(pixel_0.rgb),
+                     TilePackR11G11B10UNorm(pixel_1.rgb),
+                     TilePackR11G11B10UNorm(pixel_2.rgb),
+                     TilePackR11G11B10UNorm(pixel_3.rgb));
+      break;
+    case kXenosFormat_11_11_10:
+    case kXenosFormat_11_11_10_AS_16_16_16_16:
+      packed = uint4(TilePackR10G11B11UNorm(pixel_0.rgb),
+                     TilePackR10G11B11UNorm(pixel_1.rgb),
+                     TilePackR10G11B11UNorm(pixel_2.rgb),
+                     TilePackR10G11B11UNorm(pixel_3.rgb));
+      break;
+    case kXenosFormat_16_16_EDRAM:
+    case kXenosFormat_16_16:
+      packed = uint4(TilePackR16G16UNorm(pixel_0.rg),
+                     TilePackR16G16UNorm(pixel_1.rg),
+                     TilePackR16G16UNorm(pixel_2.rg),
+                     TilePackR16G16UNorm(pixel_3.rg));
+      break;
+    case kXenosFormat_16_16_FLOAT:
+      packed = uint4(as_type<uint>(half2(pixel_0.r, pixel_0.g)),
+                     as_type<uint>(half2(pixel_1.r, pixel_1.g)),
+                     as_type<uint>(half2(pixel_2.r, pixel_2.g)),
+                     as_type<uint>(half2(pixel_3.r, pixel_3.g)));
+      break;
+    default:
+      packed = as_type<uint4>(float4(pixel_0.r, pixel_1.r,
+                                     pixel_2.r, pixel_3.r));
+      break;
+  }
+  return packed;
+}
+
+struct TilePackFull64bppResult {
+  uint4 packed_01;
+  uint4 packed_23;
+};
+
+inline TilePackFull64bppResult TilePackFull64bpp4Pixels(
+    float4 pixel_0, float4 pixel_1, float4 pixel_2, float4 pixel_3,
+    uint format) {
+  TilePackFull64bppResult result;
+  switch (format) {
+    case kXenosFormat_16_16_16_16_EDRAM:
+    case kXenosFormat_16_16_16_16: {
+      uint2 packed_0 = TilePackR16G16B16A16UNorm(pixel_0);
+      uint2 packed_1 = TilePackR16G16B16A16UNorm(pixel_1);
+      uint2 packed_2 = TilePackR16G16B16A16UNorm(pixel_2);
+      uint2 packed_3 = TilePackR16G16B16A16UNorm(pixel_3);
+      result.packed_01 = uint4(packed_0, packed_1);
+      result.packed_23 = uint4(packed_2, packed_3);
+    } break;
+    case kXenosFormat_16_16_16_16_FLOAT:
+      result.packed_01 =
+          uint4(as_type<uint>(half2(pixel_0.r, pixel_0.g)),
+                as_type<uint>(half2(pixel_0.b, pixel_0.a)),
+                as_type<uint>(half2(pixel_1.r, pixel_1.g)),
+                as_type<uint>(half2(pixel_1.b, pixel_1.a)));
+      result.packed_23 =
+          uint4(as_type<uint>(half2(pixel_2.r, pixel_2.g)),
+                as_type<uint>(half2(pixel_2.b, pixel_2.a)),
+                as_type<uint>(half2(pixel_3.r, pixel_3.g)),
+                as_type<uint>(half2(pixel_3.b, pixel_3.a)));
+      break;
+    default:
+      result.packed_01 = as_type<uint4>(
+          float4(pixel_0.rg, pixel_1.rg));
+      result.packed_23 = as_type<uint4>(
+          float4(pixel_2.rg, pixel_3.rg));
+      break;
+  }
+  return result;
+}
+
+inline float4 TileApplyFullColorExpBiasAndSwap(TileResolveInfo info,
+                                               float4 color,
+                                               float exp_bias) {
+  if ((info.edram_format == kXenosColorRTFormatRGB10A2Float ||
+       info.edram_format == kXenosColorRTFormatRGB10A2FloatAsRGBA16) &&
+      info.dest_format != kXenosFormat_16_16_16_16_FLOAT &&
+      info.dest_format != kXenosFormat_32_32_32_32_FLOAT) {
+    color.xyz *= exp_bias;
+  } else {
+    color *= exp_bias;
+  }
+  if (info.dest_swap) {
+    color = color.bgra;
+  }
+  return color;
+}
+
+inline float TileSelectFull8Red(TileResolveInfo info,
+                                constant TileDirectHostResolveConstants& c,
+                                float4 color) {
+  if (!info.dest_swap) {
+    return color.r;
+  }
+  switch (c.source_format) {
+    case kXenosColorRTFormatRGBA8:
+    case kXenosColorRTFormatRGBA8Gamma:
+    case kXenosColorRTFormatRGB10A2:
+    case kXenosColorRTFormatRGB10A2Float:
+    case kXenosColorRTFormatRGB10A2AsRGB10A2:
+    case kXenosColorRTFormatRGB10A2FloatAsRGBA16:
+    case kXenosColorRTFormatRGBA16:
+    case kXenosColorRTFormatRGBA16Float:
+      return color.b;
+    case kXenosColorRTFormatRG32Float:
+      return color.g;
+    default:
+      return color.r;
+  }
+}
+
+struct TileFullLoadResult {
+  float4 color;
+  float exp_bias;
+  bool valid;
+};
+
 #define DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(ID)                             \
 struct ColorBlock##ID {                                                       \
   float4 color [[color(ID)]];                                                  \
 };                                                                            \
+inline TileFullLoadResult TileReadFullColorSample##ID(                        \
+    imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
+    constant TileDirectHostResolveConstants& c, ushort2 local_tid,            \
+    uint2 pixel_pos, uint sample_index) {                                      \
+  TileFullLoadResult result;                                                   \
+  uint2 source_sample = pixel_pos;                                             \
+  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
+    result.color = block.read(local_tid).color;                               \
+  } else if (c.msaa_samples == kXenosMsaaSamples2X) {                         \
+    uint sample_y = sample_index & 1u;                                        \
+    source_sample = uint2(pixel_pos.x, (pixel_pos.y << 1u) + sample_y);       \
+    uint sample_id = sample_y != 0u ? c.msaa_2x_sample_1                     \
+                                    : c.msaa_2x_sample_0;                    \
+    result.color = block.read(local_tid, ushort(sample_id),                   \
+                              imageblock_data_rate::sample).color;           \
+  } else {                                                                    \
+    uint2 sample_offset = TileSampleOffsetForIndex(sample_index);             \
+    source_sample = (pixel_pos << 1u) + sample_offset;                        \
+    uint sample_id = sample_offset.x | (sample_offset.y << 1u);              \
+    result.color = block.read(local_tid, ushort(sample_id),                   \
+                              imageblock_data_rate::sample).color;           \
+  }                                                                           \
+  result.color = TileRoundTripSourceColor(c, result.color);                  \
+  result.valid = TilePositionInResolveRect(c, source_sample);                 \
+  result.exp_bias = 1.0f;                                                     \
+  return result;                                                              \
+}                                                                             \
+inline TileFullLoadResult TileLoadFullRawColor##ID(                           \
+    imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
+    constant TileDirectHostResolveConstants& c, TileResolveInfo info,         \
+    ushort2 tid, uint2 pos, uint lane) {                                      \
+  ushort2 local_tid = ushort2(tid.x + ushort(lane), tid.y);                  \
+  uint2 pixel_pos = pos + uint2(lane, 0u);                                    \
+  uint first_sample = TileFirstSampleIndex(info.sample_select);               \
+  TileFullLoadResult result = TileReadFullColorSample##ID(                   \
+      block, c, local_tid, pixel_pos, first_sample);                         \
+  result.exp_bias = info.dest_exp_bias_factor;                               \
+  if (info.sample_select >= kXenosCopySampleSelect01) {                      \
+    result.exp_bias *= 0.5f;                                                  \
+    TileFullLoadResult sample = TileReadFullColorSample##ID(                 \
+        block, c, local_tid, pixel_pos, first_sample + 1u);                  \
+    result.color += sample.color;                                             \
+    result.valid = result.valid && sample.valid;                             \
+    if (info.sample_select >= kXenosCopySampleSelect0123) {                  \
+      result.exp_bias *= 0.5f;                                                \
+      sample = TileReadFullColorSample##ID(block, c, local_tid, pixel_pos,   \
+                                           first_sample + 2u);               \
+      result.color += sample.color;                                           \
+      result.valid = result.valid && sample.valid;                           \
+      sample = TileReadFullColorSample##ID(block, c, local_tid, pixel_pos,   \
+                                           first_sample + 3u);               \
+      result.color += sample.color;                                           \
+      result.valid = result.valid && sample.valid;                           \
+    }                                                                         \
+  }                                                                           \
+  return result;                                                              \
+}                                                                             \
 kernel void xenia_tile_direct_host_resolve_color##ID(                         \
     imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
     constant TileDirectHostResolveConstants& c [[buffer(0)]],                 \
@@ -5452,6 +5929,155 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
   uint2 pixel_index = pos - info.edram_offset_scaled;                         \
   if (pixel_index.x >= info.width_scaled ||                                   \
       pixel_index.y >= c.height_scaled) {                                     \
+    return;                                                                   \
+  }                                                                           \
+  if (c.is_full_color != 0u) {                                                \
+    if (c.pixels_per_thread == 0u ||                                          \
+        (pixel_index.x % c.pixels_per_thread) != 0u ||                       \
+        pixel_index.x + c.pixels_per_thread > info.width_scaled ||           \
+        pos.x + c.pixels_per_thread > c.source_width) {                      \
+      return;                                                                 \
+    }                                                                         \
+    if (c.dest_bpp_log2 == 0u) {                                              \
+      TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 0u);                                      \
+      TileFullLoadResult r1 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 1u);                                      \
+      TileFullLoadResult r2 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 2u);                                      \
+      TileFullLoadResult r3 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 3u);                                      \
+      bool valid = r0.valid && r1.valid && r2.valid && r3.valid;             \
+      float4 pixels_0123 = float4(                                           \
+          TileSelectFull8Red(info, c, r0.color) * r0.exp_bias,               \
+          TileSelectFull8Red(info, c, r1.color) * r1.exp_bias,               \
+          TileSelectFull8Red(info, c, r2.color) * r2.exp_bias,               \
+          TileSelectFull8Red(info, c, r3.color) * r3.exp_bias);              \
+      uint address = TileDestPixelAddress(info, pixel_index, 0u);            \
+      uint dest_index = address >> 2u;                                       \
+      if (c.pixels_per_thread == 4u) {                                       \
+        if (!valid) {                                                         \
+          return;                                                             \
+        }                                                                     \
+        dest[dest_index] = TilePackR8G8B8A8UNorm(pixels_0123);               \
+        return;                                                               \
+      }                                                                       \
+      if (c.pixels_per_thread != 8u) {                                       \
+        return;                                                               \
+      }                                                                       \
+      TileFullLoadResult r4 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 4u);                                      \
+      TileFullLoadResult r5 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 5u);                                      \
+      TileFullLoadResult r6 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 6u);                                      \
+      TileFullLoadResult r7 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 7u);                                      \
+      valid = valid && r4.valid && r5.valid && r6.valid && r7.valid;         \
+      if (!valid) {                                                           \
+        return;                                                               \
+      }                                                                       \
+      float4 pixels_4567 = float4(                                           \
+          TileSelectFull8Red(info, c, r4.color) * r4.exp_bias,               \
+          TileSelectFull8Red(info, c, r5.color) * r5.exp_bias,               \
+          TileSelectFull8Red(info, c, r6.color) * r6.exp_bias,               \
+          TileSelectFull8Red(info, c, r7.color) * r7.exp_bias);              \
+      dest[dest_index] = TilePackR8G8B8A8UNorm(pixels_0123);                 \
+      dest[dest_index + 1u] = TilePackR8G8B8A8UNorm(pixels_4567);            \
+      return;                                                                 \
+    }                                                                         \
+    if (c.dest_bpp_log2 == 4u) {                                              \
+      TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 0u);                                      \
+      TileFullLoadResult r1 = TileLoadFullRawColor##ID(                      \
+          block, c, info, tid, pos, 1u);                                      \
+      if (!r0.valid || !r1.valid) {                                           \
+        return;                                                               \
+      }                                                                       \
+      float4 pixel_0 = TileApplyFullColorExpBiasAndSwap(                    \
+          info, r0.color, r0.exp_bias);                                       \
+      float4 pixel_1 = TileApplyFullColorExpBiasAndSwap(                    \
+          info, r1.color, r1.exp_bias);                                       \
+      uint address = TileDestPixelAddress(info, pixel_index, 4u);            \
+      uint dest_index = address >> 2u;                                       \
+      uint4 packed = XeEndianSwap128(as_type<uint4>(pixel_0),                \
+                                     info.dest_endian_128);                  \
+      dest[dest_index] = packed.x;                                            \
+      dest[dest_index + 1u] = packed.y;                                      \
+      dest[dest_index + 2u] = packed.z;                                      \
+      dest[dest_index + 3u] = packed.w;                                      \
+      address = TileDestPixelAddress(info, pixel_index + uint2(1u, 0u),      \
+                                     4u);                                    \
+      dest_index = address >> 2u;                                            \
+      packed = XeEndianSwap128(as_type<uint4>(pixel_1),                     \
+                               info.dest_endian_128);                       \
+      dest[dest_index] = packed.x;                                            \
+      dest[dest_index + 1u] = packed.y;                                      \
+      dest[dest_index + 2u] = packed.z;                                      \
+      dest[dest_index + 3u] = packed.w;                                      \
+      return;                                                                 \
+    }                                                                         \
+    TileFullLoadResult r0 = TileLoadFullRawColor##ID(                        \
+        block, c, info, tid, pos, 0u);                                        \
+    TileFullLoadResult r1 = TileLoadFullRawColor##ID(                        \
+        block, c, info, tid, pos, 1u);                                        \
+    TileFullLoadResult r2 = TileLoadFullRawColor##ID(                        \
+        block, c, info, tid, pos, 2u);                                        \
+    TileFullLoadResult r3 = TileLoadFullRawColor##ID(                        \
+        block, c, info, tid, pos, 3u);                                        \
+    if (!r0.valid || !r1.valid || !r2.valid || !r3.valid) {                  \
+      return;                                                                 \
+    }                                                                         \
+    float4 pixel_0 = TileApplyFullColorExpBiasAndSwap(                      \
+        info, r0.color, r0.exp_bias);                                         \
+    float4 pixel_1 = TileApplyFullColorExpBiasAndSwap(                      \
+        info, r1.color, r1.exp_bias);                                         \
+    float4 pixel_2 = TileApplyFullColorExpBiasAndSwap(                      \
+        info, r2.color, r2.exp_bias);                                         \
+    float4 pixel_3 = TileApplyFullColorExpBiasAndSwap(                      \
+        info, r3.color, r3.exp_bias);                                         \
+    uint address = TileDestPixelAddress(info, pixel_index,                   \
+                                        c.dest_bpp_log2);                    \
+    uint dest_index = address >> 2u;                                         \
+    if (c.dest_bpp_log2 == 1u) {                                             \
+      uint2 packed = XeEndianSwap16(                                         \
+          TilePackFull16bpp4Pixels(pixel_0, pixel_1, pixel_2, pixel_3,       \
+                                   info.dest_format),                        \
+          info.dest_endian_128);                                             \
+      dest[dest_index] = packed.x;                                            \
+      dest[dest_index + 1u] = packed.y;                                      \
+      return;                                                                 \
+    }                                                                         \
+    if (c.dest_bpp_log2 == 2u) {                                             \
+      uint4 packed = XeEndianSwap32(                                         \
+          TilePackFull32bpp4Pixels(pixel_0, pixel_1, pixel_2, pixel_3,       \
+                                   info.dest_format),                        \
+          info.dest_endian_128);                                             \
+      dest[dest_index] = packed.x;                                            \
+      dest[dest_index + 1u] = packed.y;                                      \
+      dest[dest_index + 2u] = packed.z;                                      \
+      dest[dest_index + 3u] = packed.w;                                      \
+      return;                                                                 \
+    }                                                                         \
+    if (c.dest_bpp_log2 != 3u) {                                             \
+      return;                                                                 \
+    }                                                                         \
+    TilePackFull64bppResult packed_64 = TilePackFull64bpp4Pixels(           \
+        pixel_0, pixel_1, pixel_2, pixel_3, info.dest_format);               \
+    uint4 packed = XeEndianSwap64(packed_64.packed_01,                      \
+                                  info.dest_endian_128);                    \
+    dest[dest_index] = packed.x;                                              \
+    dest[dest_index + 1u] = packed.y;                                        \
+    dest[dest_index + 2u] = packed.z;                                        \
+    dest[dest_index + 3u] = packed.w;                                        \
+    address = TileDestPixelAddress(info, pixel_index + uint2(2u, 0u), 3u);   \
+    dest_index = address >> 2u;                                              \
+    packed = XeEndianSwap64(packed_64.packed_23,                            \
+                            info.dest_endian_128);                          \
+    dest[dest_index] = packed.x;                                              \
+    dest[dest_index + 1u] = packed.y;                                        \
+    dest[dest_index + 2u] = packed.z;                                        \
+    dest[dest_index + 3u] = packed.w;                                        \
     return;                                                                   \
   }                                                                           \
   uint selected_sample = TileFirstSampleIndex(info.sample_select);            \
@@ -5604,8 +6230,11 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 //   subset with one fully covered source rectangle, a single sample select, no
 //   gamma or exponent bias, no scaled resolve, a non-uint transfer view, and a
 //   source that is the current color attachment.
-// - tile_accept_full_color: technically possible but not implemented here yet.
-//   It needs the full resolve_host_color path ported to tile/imageblock code.
+// - tile_accept_full_color: implemented for the same one-rectangle,
+//   non-scaled, non-uint, active-color-attachment window as tile_accept_fast,
+//   using tile/imageblock loads plus the full color resolve destination packing
+//   path. It intentionally still rejects gamma, depth, copy_clear, uint
+//   transfer views, and scaled resolves.
 // - tile_reject_source_not_current_rt/multi_source_rect: not tile-local enough
 //   for this prototype. Multi-rect/alias cases need either the old compute path
 //   or a different per-rectangle strategy.
@@ -5625,8 +6254,8 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 //   eligible, but by execution time there was no active render encoder left.
 //   Fixing this is scheduling/lifetime work, not shader work.
 // - tile_execute_reject_full_color/depth/copy_clear/uint/format mirror the
-//   feasibility buckets above and are the main "not covered yet" cases seen in
-//   current traces.
+//   feasibility buckets above. full_color should now drain when the source is
+//   still active; remaining full_color rejects point at shader/pipeline bugs.
 //
 // Store elision:
 // - store_dontcare_eligible is only source-side eligibility: "if liveness later
@@ -5635,20 +6264,23 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 // - store_dontcare_skipped_disabled/attempt/applied explain why source-eligible
 //   cases did or did not call setColorStoreAction(DontCare). The call is
 //   mechanically easy, but semantically valid only when no later host-RT
-//   observer needs the attachment contents. Until RT liveness is proven,
-//   metal_tile_direct_host_resolve_dontcare_store is an opt-in trace
-//   experiment, not the default behavior.
+//   observer needs the attachment contents. The prototype currently defaults
+//   metal_tile_direct_host_resolve_dontcare_store on so traces expose the
+//   bandwidth upside, but this still needs real RT liveness proof before it is
+//   no longer experimental.
 //
 // Representative prototype telemetry:
 // - Fast subset covered: 360/360 in one sample, 478/480 in another; the missing
 //   fast cases were no-active-encoder timing, not shader capability.
-// - Not-yet-covered recurring buckets: full_color, depth, copy_clear, uint
-//   transfer view, format mismatch, and no_active scheduling.
+// - Not-yet-covered recurring buckets after the full_color expansion: depth,
+//   copy_clear, uint transfer view, format mismatch, scaled resolves, and
+//   no_active scheduling.
 bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     const ResolvePlan& resolve_plan,
     MTL::RenderCommandEncoder* active_render_encoder,
     MTL::RenderPassDescriptor* active_render_pass_descriptor,
-    uint32_t& written_address, uint32_t& written_length) {
+    uint32_t inactive_last_end_reason, uint32_t& written_address,
+    uint32_t& written_length) {
   written_address = 0;
   written_length = 0;
   if (!::cvars::metal_tile_direct_host_resolve ||
@@ -5672,7 +6304,15 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     return reject_with(direct_telemetry.tile_execute_reject_invalid);
   }
   if (!active_render_encoder || !active_render_pass_descriptor) {
-    return reject_with(direct_telemetry.tile_execute_reject_no_active);
+    ++direct_telemetry.tile_execute_reject_no_active;
+    if (inactive_last_end_reason >=
+        direct_telemetry.tile_execute_reject_no_active_last_end_reasons
+            .size()) {
+      inactive_last_end_reason = 0;
+    }
+    ++direct_telemetry.tile_execute_reject_no_active_last_end_reasons
+          [inactive_last_end_reason];
+    return reject();
   }
   if (resolve_plan.needs_resolve_clear) {
     return reject_with(direct_telemetry.tile_execute_reject_copy_clear);
@@ -5695,10 +6335,12 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   if (!group_count_x || !group_count_y) {
     return reject_with(direct_telemetry.tile_execute_reject_shader);
   }
-  if (!IsResolveDirectHostRTFastCandidate(copy_shader)) {
-    return reject_with(IsResolveDirectHostRTFullColorCandidate(copy_shader)
-                           ? direct_telemetry.tile_execute_reject_full_color
-                           : direct_telemetry.tile_execute_reject_shader);
+  const bool copy_shader_is_fast =
+      IsResolveDirectHostRTFastCandidate(copy_shader);
+  const bool copy_shader_is_full_color =
+      IsResolveDirectHostRTFullColorCandidate(copy_shader);
+  if (!copy_shader_is_fast && !copy_shader_is_full_color) {
+    return reject_with(direct_telemetry.tile_execute_reject_shader);
   }
 
   xenos::ColorRenderTargetFormat resolve_color_format =
@@ -5709,15 +6351,20 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   }
   xenos::CopySampleSelect sample_select =
       resolve_info.copy_dest_coordinate_info.copy_sample_select;
-  if (!xenos::IsSingleCopySampleSelected(sample_select)) {
-    return reject_with(direct_telemetry.tile_execute_reject_sample_select);
-  }
-  if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
-    return reject_with(direct_telemetry.tile_execute_reject_exp_bias);
-  }
-  if (!xenos::IsColorResolveFormatBitwiseEquivalent(
-          resolve_color_format,
-          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+  if (copy_shader_is_fast) {
+    if (!xenos::IsSingleCopySampleSelected(sample_select)) {
+      return reject_with(direct_telemetry.tile_execute_reject_sample_select);
+    }
+    if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
+      return reject_with(direct_telemetry.tile_execute_reject_exp_bias);
+    }
+    if (!xenos::IsColorResolveFormatBitwiseEquivalent(
+            resolve_color_format,
+            xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+      return reject_with(direct_telemetry.tile_execute_reject_format_mismatch);
+    }
+  } else if (!IsResolveDirectHostRTFullColorSourcePackable(
+                 resolve_color_format)) {
     return reject_with(direct_telemetry.tile_execute_reject_format_mismatch);
   }
 
@@ -5765,8 +6412,16 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   }
 
   uint32_t selected_sample = uint32_t(sample_select);
-  if (key.msaa_samples == xenos::MsaaSamples::k2X && selected_sample > 1) {
+  if (copy_shader_is_fast && key.msaa_samples == xenos::MsaaSamples::k2X &&
+      selected_sample > 1) {
     return reject_with(direct_telemetry.tile_execute_reject_sample_select);
+  }
+  const uint32_t pixels_per_thread = DirectHostResolvePixelsPerThread(
+      copy_shader, key.Is64bpp(), key.msaa_samples);
+  if (copy_shader_is_full_color &&
+      (!pixels_per_thread ||
+       (kTileDirectHostResolveTileWidth % pixels_per_thread) != 0u)) {
+    return reject_with(direct_telemetry.tile_execute_reject_shader);
   }
 
   uint32_t color_attachment_index = xenos::kMaxColorRenderTargets;
@@ -5836,9 +6491,17 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     uint32_t msaa_samples;
     uint32_t is_64bpp;
     uint32_t source_format;
-    uint32_t padding;
+    uint32_t is_full_color;
+    uint32_t dest_format;
+    float dest_exp_bias_factor;
+    uint32_t pixels_per_thread;
+    uint32_t dest_bpp_log2;
+    uint32_t padding0;
+    uint32_t padding1;
+    uint32_t padding2;
+    uint32_t padding3;
   };
-  static_assert_size(TileDirectHostResolveConstants, 24 * sizeof(uint32_t));
+  static_assert_size(TileDirectHostResolveConstants, 32 * sizeof(uint32_t));
 
   TileDirectHostResolveConstants constants = {};
   constants.edram_info = copy_constants.dest_relative.edram_info.packed;
@@ -5869,6 +6532,18 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   constants.msaa_samples = uint32_t(key.msaa_samples);
   constants.is_64bpp = key.Is64bpp() ? 1u : 0u;
   constants.source_format = uint32_t(key.GetColorFormat());
+  constants.is_full_color = copy_shader_is_full_color ? 1u : 0u;
+  constants.dest_format =
+      uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  const int32_t dest_exp_bias = resolve_info.copy_dest_info.copy_dest_exp_bias;
+  const uint32_t dest_exp_bias_bits =
+      uint32_t(int32_t(0x3F800000) + dest_exp_bias * int32_t(1 << 23));
+  std::memcpy(&constants.dest_exp_bias_factor, &dest_exp_bias_bits,
+              sizeof(constants.dest_exp_bias_factor));
+  constants.pixels_per_thread = pixels_per_thread;
+  constants.dest_bpp_log2 = copy_shader_is_full_color
+                                ? DirectHostResolveFullDestBppLog2(copy_shader)
+                                : (key.Is64bpp() ? 3u : 2u);
 
   ++telemetry_.resolve_execute_calls;
   command_processor_.SetSwapDestSwap(
@@ -5899,7 +6574,11 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   ++direct_telemetry.direct_host_success;
   ++direct_telemetry.tile_candidate_total;
   ++direct_telemetry.tile_accept;
-  ++direct_telemetry.tile_accept_fast;
+  if (copy_shader_is_full_color) {
+    ++direct_telemetry.tile_accept_full_color;
+  } else {
+    ++direct_telemetry.tile_accept_fast;
+  }
   ++direct_telemetry.store_dontcare_eligible;
   if (::cvars::metal_tile_direct_host_resolve_dontcare_store) {
     ++direct_telemetry.store_dontcare_attempt;

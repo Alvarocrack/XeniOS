@@ -4644,8 +4644,10 @@ bool MetalCommandProcessor::IssueCopy() {
 
   if (resolve_plan.needs_copy_export &&
       render_target_cache_->TryTileDirectHostResolveCopy(
-          resolve_plan, current_render_encoder_, current_render_pass_descriptor_,
-          written_address, written_length)) {
+          resolve_plan, current_render_encoder_,
+          current_render_pass_descriptor_,
+          last_active_render_encoder_end_reason_, written_address,
+          written_length)) {
     InvalidateRenderEncoderStateAfterDrawPassTransfers(
         MetalRenderTargetCache::kDrawPassTransferEncoderMutationPipeline);
     return true;
@@ -5607,6 +5609,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   std::string buffer_untracked_full_binds = format_buffer_stage_array(
       backend_telemetry_.render_encoder_buffer_untracked_full_binds);
   const auto& direct_host_stats = rt_stats.resolve_direct_host;
+  std::string tile_no_active_last_end_reasons;
+  for (size_t i = 0;
+       i <
+       direct_host_stats.tile_execute_reject_no_active_last_end_reasons.size();
+       ++i) {
+    uint64_t count =
+        direct_host_stats.tile_execute_reject_no_active_last_end_reasons[i];
+    if (!count) {
+      continue;
+    }
+    if (!tile_no_active_last_end_reasons.empty()) {
+      tile_no_active_last_end_reasons += ", ";
+    }
+    tile_no_active_last_end_reasons +=
+        fmt::format("{}={}", RenderEncoderEndReasonName(i), count);
+  }
+  if (tile_no_active_last_end_reasons.empty()) {
+    tile_no_active_last_end_reasons = "none";
+  }
 
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
@@ -5905,6 +5926,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       direct_host_stats.tile_execute_reject_pipeline,
       direct_host_stats.tile_execute_reject_dest_buffer);
   XELOGI(
+      "MetalTelemetry[{}]: resolve_direct_host tile_no_active_last_end "
+      "reasons={{ {} }}",
+      reason, tile_no_active_last_end_reasons);
+  XELOGI(
       "MetalTelemetry[{}]: texture requests={} nonzero={} work_bits={} "
       "with_loads/without_loads={}/{} loaded_textures={} loads={} base={} "
       "mips={} gpu_load attempt/success/fail={}/{}/{} "
@@ -5992,6 +6017,10 @@ void MetalCommandProcessor::EndRenderEncoder(RenderEncoderEndReason reason) {
     return;
   }
   ++backend_telemetry_.end_encoder_active;
+  last_active_render_encoder_end_reason_ =
+      reason_index < kRenderEncoderEndReasonCount
+          ? uint32_t(reason_index)
+          : uint32_t(RenderEncoderEndReason::kUnknown);
   UpdateSharedMemoryFenceForActiveRenderEncoder();
   current_render_encoder_->endEncoding();
   current_render_encoder_->release();

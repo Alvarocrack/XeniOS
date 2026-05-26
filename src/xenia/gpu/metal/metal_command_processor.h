@@ -719,6 +719,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
+  uint32_t last_active_render_encoder_end_reason_ =
+      static_cast<uint32_t>(RenderEncoderEndReason::kUnknown);
   MTL::BlitCommandEncoder* shared_memory_upload_blit_encoder_ = nullptr;
   MTL::RenderPassDescriptor* current_render_pass_descriptor_ = nullptr;
   NS::AutoreleasePool* command_buffer_autorelease_pool_ = nullptr;

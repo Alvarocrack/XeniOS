@@ -236,6 +236,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       uint64_t tile_execute_reject = 0;
       uint64_t tile_execute_reject_invalid = 0;
       uint64_t tile_execute_reject_no_active = 0;
+      static constexpr size_t kTileNoActiveLastEndReasonCount = 11;
+      std::array<uint64_t, kTileNoActiveLastEndReasonCount>
+          tile_execute_reject_no_active_last_end_reasons = {};
       uint64_t tile_execute_reject_scaled = 0;
       uint64_t tile_execute_reject_copy_clear = 0;
       uint64_t tile_execute_reject_depth = 0;
@@ -367,7 +370,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       const ResolvePlan& resolve_plan,
       MTL::RenderCommandEncoder* active_render_encoder,
       MTL::RenderPassDescriptor* active_render_pass_descriptor,
-      uint32_t& written_address, uint32_t& written_length);
+      uint32_t inactive_last_end_reason, uint32_t& written_address,
+      uint32_t& written_length);
 
  protected:
   // Virtual methods from RenderTargetCache
