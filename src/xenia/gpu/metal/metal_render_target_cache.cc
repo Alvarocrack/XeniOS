@@ -5729,7 +5729,8 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     // RequestTransferCommandBuffer ends any active render encoder and ensures
     // transfer work has a command buffer. It does not require a standalone
     // command-buffer submission if the current one can be reused.
-    cmd = command_processor_.RequestTransferCommandBuffer();
+    cmd = command_processor_.RequestTransferCommandBuffer(
+        MetalCommandProcessor::TransferRequestSource::kRenderTargetTransfer);
   } else {
     // An externally-provided command buffer still requires the render
     // encoder to be ended before transfer work can proceed.

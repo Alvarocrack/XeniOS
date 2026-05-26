@@ -101,11 +101,21 @@ class MetalCommandProcessor final : public CommandProcessor {
     return current_command_buffer_ != nullptr &&
            current_render_encoder_ == nullptr;
   }
+  enum class TransferRequestSource : uint32_t {
+    kUnknown,
+    kSharedMemoryUpload,
+    kGuestIndexCopy,
+    kRenderTargetTransfer,
+    kCount,
+  };
+  static constexpr size_t kTransferRequestSourceCount =
+      static_cast<size_t>(TransferRequestSource::kCount);
   // Returns a command buffer suitable for transfer (blit/compute) work.
   // If a render encoder is active it is ended first; if no command buffer
   // exists one is created. This is an encoder-lifetime break, not necessarily
   // a command-buffer submission break. Returns nullptr on failure.
-  MTL::CommandBuffer* RequestTransferCommandBuffer();
+  MTL::CommandBuffer* RequestTransferCommandBuffer(
+      TransferRequestSource source = TransferRequestSource::kUnknown);
   MTL::BlitCommandEncoder* GetSharedMemoryUploadBlitEncoder();
   void EndSharedMemoryUploadBlitEncoder();
 
@@ -463,6 +473,12 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t end_encoder_active = 0;
     uint64_t end_encoder_no_active = 0;
     std::array<uint64_t, kRenderEncoderEndReasonCount> end_reasons = {};
+    std::array<uint64_t, kTransferRequestSourceCount>
+        transfer_request_sources_total = {};
+    std::array<uint64_t, kTransferRequestSourceCount>
+        transfer_request_sources_active = {};
+    std::array<uint64_t, kTransferRequestSourceCount>
+        transfer_request_sources_no_active = {};
 
     uint64_t pending_transfer_encode_attempts = 0;
     uint64_t pending_transfer_encode_successes = 0;

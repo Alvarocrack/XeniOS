@@ -425,6 +425,21 @@ const char* RenderEncoderEndReasonName(size_t reason) {
   }
 }
 
+const char* TransferRequestSourceName(size_t source) {
+  switch (source) {
+    case 0:
+      return "unknown";
+    case 1:
+      return "shared_memory_upload";
+    case 2:
+      return "guest_index_copy";
+    case 3:
+      return "render_target_transfer";
+    default:
+      return "invalid";
+  }
+}
+
 const char* DrawPassTransferRejectionReasonName(size_t reason) {
   switch (reason) {
     case 0:
@@ -4056,7 +4071,8 @@ bool MetalCommandProcessor::PrepareGuestDMAIndexBufferForMemexport(
     return false;
   }
 
-  MTL::CommandBuffer* command_buffer = RequestTransferCommandBuffer();
+  MTL::CommandBuffer* command_buffer =
+      RequestTransferCommandBuffer(TransferRequestSource::kGuestIndexCopy);
   if (!command_buffer) {
     XELOGE("IssueDraw: failed to get command buffer for index copy");
     return false;
@@ -5142,6 +5158,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
     end_reasons = "none";
   }
 
+  std::string transfer_request_sources;
+  for (size_t i = 0;
+       i < backend_telemetry_.transfer_request_sources_total.size(); ++i) {
+    uint64_t total = backend_telemetry_.transfer_request_sources_total[i];
+    if (!total) {
+      continue;
+    }
+    if (!transfer_request_sources.empty()) {
+      transfer_request_sources += ", ";
+    }
+    transfer_request_sources += fmt::format(
+        "{}={}/{}/{}", TransferRequestSourceName(i), total,
+        backend_telemetry_.transfer_request_sources_active[i],
+        backend_telemetry_.transfer_request_sources_no_active[i]);
+  }
+  if (transfer_request_sources.empty()) {
+    transfer_request_sources = "none";
+  }
+
   std::string pending_rejections;
   for (size_t i = 0; i < rt_stats.pending_draw_pass_rejections.size(); ++i) {
     uint64_t count = rt_stats.pending_draw_pass_rejections[i];
@@ -5317,6 +5352,10 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.begin_encoder_creation_failures,
       backend_telemetry_.end_encoder_active,
       backend_telemetry_.end_encoder_no_active, end_reasons);
+  XELOGI(
+      "MetalTelemetry[{}]: transfer_request sources "
+      "total/active/no_active={{ {} }}",
+      reason, transfer_request_sources);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
       "dirty_marks={} dirty_reasons={{ {} }} compat_checks={} "
@@ -5652,7 +5691,17 @@ void MetalCommandProcessor::InvalidateRenderEncoderStateAfterDrawPassTransfers(
   }
 }
 
-MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer() {
+MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
+    TransferRequestSource source) {
+  const size_t source_index = static_cast<size_t>(source);
+  if (source_index < kTransferRequestSourceCount) {
+    ++backend_telemetry_.transfer_request_sources_total[source_index];
+    if (current_render_encoder_) {
+      ++backend_telemetry_.transfer_request_sources_active[source_index];
+    } else {
+      ++backend_telemetry_.transfer_request_sources_no_active[source_index];
+    }
+  }
   EndSharedMemoryUploadBlitEncoder();
   EndRenderEncoder(RenderEncoderEndReason::kRequestTransferCommandBuffer);
   if (texture_cache_ &&
@@ -5668,7 +5717,8 @@ MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
     return shared_memory_upload_blit_encoder_;
   }
 
-  MTL::CommandBuffer* command_buffer = RequestTransferCommandBuffer();
+  MTL::CommandBuffer* command_buffer =
+      RequestTransferCommandBuffer(TransferRequestSource::kSharedMemoryUpload);
   if (!command_buffer) {
     return nullptr;
   }
