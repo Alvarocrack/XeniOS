@@ -442,6 +442,13 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t constant_upload_descriptor_indices_vertex = 0;
     uint64_t constant_upload_descriptor_indices_pixel = 0;
     uint64_t constant_upload_bytes = 0;
+    // CBV payload content-reuse counters, indexed by CbvSlot.  A hit means
+    // the dirty bit fired but the freshly-packed payload was byte-identical
+    // to the previous upload, so the prior pool slice was reused and no new
+    // allocation happened.
+    std::array<uint64_t, kCbvSlotCount> cbv_payload_reuse_hit = {};
+    std::array<uint64_t, kCbvSlotCount> cbv_payload_reuse_miss = {};
+    uint64_t cbv_payload_reuse_bytes_saved = 0;
     uint64_t constant_dirty_float_layout_vertex = 0;
     uint64_t constant_dirty_float_layout_pixel = 0;
     uint64_t descriptor_dirty_vertex_sampler_layout = 0;
@@ -856,6 +863,13 @@ class MetalCommandProcessor final : public CommandProcessor {
     NS::UInteger offset = 0;
     uint64_t gpu_address = 0;
     size_t size = 0;
+    // Submission that originally allocated the pool slice this binding
+    // references.  The upload pool is a bump allocator; its lifetime tracking
+    // only fires on Request().  Reuse paths that keep a binding alive without
+    // re-Request() must therefore reject reuse when this differs from the
+    // current submission, or the slice can be Reclaim'd while the GPU still
+    // references it.
+    uint64_t upload_submission = 0;
     bool up_to_date = false;
   };
   struct StageRootArgumentKey {
@@ -866,6 +880,8 @@ class MetalCommandProcessor final : public CommandProcessor {
     MTL::Buffer* buffer = nullptr;
     NS::UInteger offset = 0;
     uint64_t gpu_address = 0;
+    // Same submission-pinning rationale as ConstantBufferBinding.
+    uint64_t upload_submission = 0;
     bool valid = false;
   };
   // MSC root arguments are one small top-level argument buffer per shader
@@ -890,6 +906,23 @@ class MetalCommandProcessor final : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
+
+  // Per-CBV payload caches.  We always honour the "register write dirties
+  // live constant range" semantic from metal_command_processor.cc (matches
+  // D3D12/Vulkan).  But after packing the new payload into scratch, if the
+  // bytes equal the previous upload we keep the previous pool slice instead
+  // of allocating a fresh one.  Mirrors the descriptor-indices
+  // current_/scratch_ pattern in PrepareDrawConstants.
+  std::vector<uint8_t> current_payload_system_;
+  std::vector<uint8_t> current_payload_float_vertex_;
+  std::vector<uint8_t> current_payload_float_pixel_;
+  std::vector<uint8_t> current_payload_bool_loop_;
+  std::vector<uint8_t> current_payload_fetch_;
+  std::vector<uint8_t> scratch_payload_system_;
+  std::vector<uint8_t> scratch_payload_float_vertex_;
+  std::vector<uint8_t> scratch_payload_float_pixel_;
+  std::vector<uint8_t> scratch_payload_bool_loop_;
+  std::vector<uint8_t> scratch_payload_fetch_;
   DxbcShader::FetchConstantDwordMask fetch_constant_dirty_mask_ = {};
 
   // Float constant usage bitmaps for the current shader pair.

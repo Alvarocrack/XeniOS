@@ -3226,6 +3226,7 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     binding.offset = static_cast<NS::UInteger>(offset);
     binding.gpu_address = gpu_address;
     binding.size = size;
+    binding.upload_submission = submission;
     binding.up_to_date = true;
     return true;
   };
@@ -3234,19 +3235,63 @@ bool MetalCommandProcessor::PrepareDrawConstants(
     backend_telemetry_.constant_upload_bytes += std::max(size, size_t(16));
   };
 
-  if (!cbuffer_binding_system_.up_to_date) {
-    if (!upload_binding(cbuffer_binding_system_,
-                        sizeof(DxbcShaderTranslator::SystemConstants), "system",
-                        [&](uint8_t* data, size_t) {
+  // Pack-then-compare wrapper around upload_binding.  Honours the existing
+  // "register write dirties live constant range" semantic (the caller still
+  // gates on binding.up_to_date == false), but if the freshly packed payload
+  // is byte-identical to the previous upload we reuse the prior pool slice
+  // instead of allocating a new one.  See the descriptor-indices precedent
+  // below for the same pattern applied to the descriptor-indices CBV.
+  const uint64_t current_submission =
+      submission_current_ ? submission_current_ : 1;
+  auto try_reuse_or_upload =
+      [&](ConstantBufferBinding& binding,
+          std::vector<uint8_t>& current_payload,
+          std::vector<uint8_t>& scratch_payload, size_t logical_size,
+          uint64_t& upload_counter, size_t slot_index, const char* name,
+          auto&& writer) -> bool {
+    const size_t aligned_size = std::max(logical_size, size_t(16));
+    scratch_payload.assign(aligned_size, 0);
+    writer(scratch_payload.data(), aligned_size);
+    // Reuse the prior slice only if it was allocated in this submission.
+    // Cross-submission reuse is unsafe: the bump allocator's lifetime tracking
+    // only fires on Request(), so a slice from an older submission can be
+    // Reclaim'd while the GPU is still consuming it via the kept binding.
+    if (binding.buffer &&
+        binding.upload_submission == current_submission &&
+        current_payload.size() == aligned_size &&
+        std::memcmp(current_payload.data(), scratch_payload.data(),
+                    aligned_size) == 0) {
+      binding.up_to_date = true;
+      ++backend_telemetry_.cbv_payload_reuse_hit[slot_index];
+      backend_telemetry_.cbv_payload_reuse_bytes_saved += aligned_size;
+      return true;
+    }
+    ++backend_telemetry_.cbv_payload_reuse_miss[slot_index];
+    if (!upload_binding(binding, logical_size, name,
+                        [&](uint8_t* data, size_t out_size) {
                           std::memcpy(
-                              data, &system_constants_,
-                              sizeof(DxbcShaderTranslator::SystemConstants));
+                              data, scratch_payload.data(),
+                              std::min(out_size, scratch_payload.size()));
                         })) {
       return false;
     }
-    count_constant_upload(
-        backend_telemetry_.constant_upload_system,
-        sizeof(DxbcShaderTranslator::SystemConstants));
+    count_constant_upload(upload_counter, logical_size);
+    current_payload.swap(scratch_payload);
+    return true;
+  };
+
+  if (!cbuffer_binding_system_.up_to_date) {
+    if (!try_reuse_or_upload(
+            cbuffer_binding_system_, current_payload_system_,
+            scratch_payload_system_,
+            sizeof(DxbcShaderTranslator::SystemConstants),
+            backend_telemetry_.constant_upload_system, kCbvSlotSystem,
+            "system", [&](uint8_t* data, size_t) {
+              std::memcpy(data, &system_constants_,
+                          sizeof(DxbcShaderTranslator::SystemConstants));
+            })) {
+      return false;
+    }
   }
 
   auto write_packed_float_constants =
@@ -3279,16 +3324,16 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   if (!cbuffer_binding_float_vertex_.up_to_date) {
     const size_t float_size =
         sizeof(float) * 4 * std::max(float_map_vertex.float_count, uint32_t(1));
-    if (!upload_binding(cbuffer_binding_float_vertex_, float_size, "vertex float",
-                        [&](uint8_t* data, size_t size) {
-                          write_packed_float_constants(
-                              data, size, &float_map_vertex,
-                              XE_GPU_REG_SHADER_CONSTANT_000_X);
-                        })) {
+    if (!try_reuse_or_upload(
+            cbuffer_binding_float_vertex_, current_payload_float_vertex_,
+            scratch_payload_float_vertex_, float_size,
+            backend_telemetry_.constant_upload_float_vertex, kCbvSlotFloat,
+            "vertex float", [&](uint8_t* data, size_t size) {
+              write_packed_float_constants(data, size, &float_map_vertex,
+                                            XE_GPU_REG_SHADER_CONSTANT_000_X);
+            })) {
       return false;
     }
-    count_constant_upload(backend_telemetry_.constant_upload_float_vertex,
-                          float_size);
   }
 
   if (!cbuffer_binding_float_pixel_.up_to_date) {
@@ -3298,30 +3343,30 @@ bool MetalCommandProcessor::PrepareDrawConstants(
         sizeof(float) * 4 *
         std::max(float_map_pixel ? float_map_pixel->float_count : uint32_t(0),
                  uint32_t(1));
-    if (!upload_binding(cbuffer_binding_float_pixel_, float_size, "pixel float",
-                        [&](uint8_t* data, size_t size) {
-                          write_packed_float_constants(
-                              data, size, float_map_pixel,
-                              XE_GPU_REG_SHADER_CONSTANT_256_X);
-                        })) {
-      return false;
-    }
-    count_constant_upload(backend_telemetry_.constant_upload_float_pixel,
-                          float_size);
-  }
-
-  if (!cbuffer_binding_bool_loop_.up_to_date) {
-    if (!upload_binding(
-            cbuffer_binding_bool_loop_, kBoolLoopConstantsSize, "bool loop",
-            [&](uint8_t* data, size_t) {
-              std::memcpy(data,
-                          &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
-                          kBoolLoopConstantsSize);
+    if (!try_reuse_or_upload(
+            cbuffer_binding_float_pixel_, current_payload_float_pixel_,
+            scratch_payload_float_pixel_, float_size,
+            backend_telemetry_.constant_upload_float_pixel, kCbvSlotFloat,
+            "pixel float", [&](uint8_t* data, size_t size) {
+              write_packed_float_constants(data, size, float_map_pixel,
+                                            XE_GPU_REG_SHADER_CONSTANT_256_X);
             })) {
       return false;
     }
-    count_constant_upload(backend_telemetry_.constant_upload_bool_loop,
-                          kBoolLoopConstantsSize);
+  }
+
+  if (!cbuffer_binding_bool_loop_.up_to_date) {
+    if (!try_reuse_or_upload(
+            cbuffer_binding_bool_loop_, current_payload_bool_loop_,
+            scratch_payload_bool_loop_, kBoolLoopConstantsSize,
+            backend_telemetry_.constant_upload_bool_loop, kCbvSlotBoolLoop,
+            "bool loop", [&](uint8_t* data, size_t) {
+              std::memcpy(
+                  data, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                  kBoolLoopConstantsSize);
+            })) {
+      return false;
+    }
   }
 
   bool fetch_binding_active = false;
@@ -3337,16 +3382,18 @@ bool MetalCommandProcessor::PrepareDrawConstants(
   }
   if (fetch_binding_active && !cbuffer_binding_fetch_.up_to_date) {
     const size_t fetch_size = kFetchConstantCount * sizeof(uint32_t);
-    if (!upload_binding(cbuffer_binding_fetch_, fetch_size, "fetch",
-                        [&](uint8_t* data, size_t) {
-                          std::memcpy(
-                              data,
-                              &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
-                              fetch_size);
-                        })) {
+    if (!try_reuse_or_upload(
+            cbuffer_binding_fetch_, current_payload_fetch_,
+            scratch_payload_fetch_, fetch_size,
+            backend_telemetry_.constant_upload_fetch, kCbvSlotFetch,
+            "fetch", [&](uint8_t* data, size_t) {
+              std::memcpy(
+                  data,
+                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                  fetch_size);
+            })) {
       return false;
     }
-    count_constant_upload(backend_telemetry_.constant_upload_fetch, fetch_size);
     fetch_constant_dirty_mask_.fill(0);
   }
 
@@ -3401,6 +3448,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                              next_sampler_bindless_indices_vertex);
     const bool can_reuse_descriptor_indices =
         cbuffer_binding_descriptor_indices_vertex_.buffer &&
+        cbuffer_binding_descriptor_indices_vertex_.upload_submission ==
+            current_submission &&
         current_descriptor_indices_vertex_ == scratch_descriptor_indices_vertex_;
     if (can_reuse_descriptor_indices) {
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
@@ -3427,6 +3476,8 @@ bool MetalCommandProcessor::PrepareDrawConstants(
                              next_sampler_bindless_indices_pixel);
     const bool can_reuse_descriptor_indices =
         cbuffer_binding_descriptor_indices_pixel_.buffer &&
+        cbuffer_binding_descriptor_indices_pixel_.upload_submission ==
+            current_submission &&
         current_descriptor_indices_pixel_ == scratch_descriptor_indices_pixel_;
     if (can_reuse_descriptor_indices) {
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
@@ -3666,6 +3717,7 @@ bool MetalCommandProcessor::AllocateStageRootArgument(
   allocation_out = {top_level_buffer,
                     static_cast<NS::UInteger>(top_level_offset),
                     top_level_gpu_address,
+                    submission,
                     true};
   return true;
 }
@@ -3678,6 +3730,20 @@ bool MetalCommandProcessor::PopulateBindlessTables(
   ++backend_telemetry_.bindless_populate_calls;
   constexpr size_t kStageVertex = 0;
   constexpr size_t kStagePixel = 1;
+
+  // Expire any cached top-level AB whose allocation no longer belongs to the
+  // current submission.  Same pool-lifetime invariant as the CBV bindings:
+  // the bump allocator only updates a page's last_submission_index_ on
+  // Request(), so an allocation cached across submissions can be Reclaim'd
+  // out from under us when the original allocating submission completes.
+  const uint64_t current_submission =
+      submission_current_ ? submission_current_ : 1;
+  for (size_t stage = 0; stage < kStageCount; ++stage) {
+    if (current_bindless_stage_root_arguments_[stage].upload_submission !=
+        current_submission) {
+      current_bindless_stage_root_valid_[stage] = false;
+    }
+  }
 
   std::array<bool, kStageCount> stage_cbvs_match = {};
   std::array<bool, kStageCount> stage_roots_need_update = {};
@@ -5105,6 +5171,41 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
 
   ++submission_current_;
 
+  // Submission rollover state resets.  The pool may have moved pages backing
+  // prior bindings onto the writable list during ProcessCompletedSubmissions
+  // above, so any binding flagged up_to_date from a previous submission could
+  // point at recyclable bytes.  Clear the dirty flags so the next draw
+  // re-uploads, and clear the per-CBV payload caches so try_reuse_or_upload's
+  // memcmp cannot resurrect a stale slice.  Also drop the float-constant
+  // bitmaps -- the next draw's PrepareDrawConstants repopulates them from the
+  // active shader.
+  //
+  // The pixel descriptor-indices binding is deliberately NOT invalidated
+  // here.  Bisect (2026-05-26) traced reproducible flashing in multiple games
+  // to exactly that line.  The asymmetry stems from `if (metal_pixel_shader)`
+  // wrapping the pixel-side populate-and-state-update block in
+  // PrepareDrawConstants while the vertex equivalent is unconditional; some
+  // downstream consumer (likely texture/sampler tracking via the current_*
+  // vectors) ends up reading inconsistent state when the upload path fires
+  // unforced.  The submission-index gate on the descriptor-indices reuse
+  // check still prevents stale-slice consumption when the pre-existing
+  // sampler/texture/layout-change detection drives the upload.
+  cbuffer_binding_system_.up_to_date = false;
+  cbuffer_binding_float_vertex_.up_to_date = false;
+  cbuffer_binding_float_pixel_.up_to_date = false;
+  cbuffer_binding_bool_loop_.up_to_date = false;
+  cbuffer_binding_fetch_.up_to_date = false;
+  cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+  std::memset(current_float_constant_map_vertex_, 0,
+              sizeof(current_float_constant_map_vertex_));
+  std::memset(current_float_constant_map_pixel_, 0,
+              sizeof(current_float_constant_map_pixel_));
+  current_payload_system_.clear();
+  current_payload_float_vertex_.clear();
+  current_payload_float_pixel_.clear();
+  current_payload_bool_loop_.clear();
+  current_payload_fetch_.clear();
+
   current_command_buffer_->setLabel(
       NS::String::string("XeniaCommandBuffer", NS::UTF8StringEncoding));
 
@@ -5613,6 +5714,22 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.descriptor_index_texture_lookups_pixel,
       backend_telemetry_.descriptor_index_sampler_lookups_vertex,
       backend_telemetry_.descriptor_index_sampler_lookups_pixel);
+  // Descriptor-indices CBV uses its own separate reuse path and never goes
+  // through try_reuse_or_upload, so its hit/miss counters here would always
+  // be zero -- omit them from the log to avoid misleading readers.
+  XELOGI(
+      "MetalTelemetry[{}]: cbv_payload_reuse "
+      "hit{{ system={} float={} bool_loop={} fetch={} }} "
+      "miss{{ system={} float={} bool_loop={} fetch={} }} bytes_saved={}",
+      reason, backend_telemetry_.cbv_payload_reuse_hit[kCbvSlotSystem],
+      backend_telemetry_.cbv_payload_reuse_hit[kCbvSlotFloat],
+      backend_telemetry_.cbv_payload_reuse_hit[kCbvSlotBoolLoop],
+      backend_telemetry_.cbv_payload_reuse_hit[kCbvSlotFetch],
+      backend_telemetry_.cbv_payload_reuse_miss[kCbvSlotSystem],
+      backend_telemetry_.cbv_payload_reuse_miss[kCbvSlotFloat],
+      backend_telemetry_.cbv_payload_reuse_miss[kCbvSlotBoolLoop],
+      backend_telemetry_.cbv_payload_reuse_miss[kCbvSlotFetch],
+      backend_telemetry_.cbv_payload_reuse_bytes_saved);
   XELOGI(
       "MetalTelemetry[{}]: register_writes float total/changed/unchanged/"
       "dirty={}/{}/{}/{} bool_loop total/changed/unchanged/dirty={}/{}/{}/{} "
@@ -6465,6 +6582,9 @@ void MetalCommandProcessor::EndCommandBuffer() {
     render_encoder_bindless_table_bind_mesh_path_ = false;
     render_encoder_bindless_table_bind_tessellation_ = false;
     current_bindless_stage_root_arguments_ = {};
+    current_bindless_cbv_gpu_addresses_ = {};
+    current_bindless_cbv_sizes_ = {};
+    current_bindless_shared_memory_is_uav_ = false;
     current_bindless_stable_resources_valid_ = false;
     current_bindless_stable_shared_memory_is_uav_ = false;
     current_bindless_stable_shared_memory_usage_bits_ = 0;
