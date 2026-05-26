@@ -699,12 +699,31 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
   // texture upload encoder is still open before requesting residency.
   if ((deferred_upload_compute_encoder_ || !deferred_upload_copies_.empty()) &&
       !FlushDeferredUploadEncoderBatch()) {
+    if (command_processor_) {
+      command_processor_->RecordSharedMemoryPlannerStop(
+          MetalCommandProcessor::SharedMemoryPlannerStopReason::
+              kTextureDeferredUploadFlush);
+    }
     return false;
   }
 
   // TODO (xenios-jp): Move this exact range preflight earlier in draw setup so
   // texture uploads stay ordered before the render encoder is opened instead
   // of ending an active encoder when outdated texture data is discovered late.
+  MetalCommandProcessor::SharedMemoryRequestReason reason =
+      MetalCommandProcessor::SharedMemoryRequestReason::kUnknown;
+  if (base_outdated_mask && mips_outdated_mask) {
+    reason = MetalCommandProcessor::SharedMemoryRequestReason::
+        kTextureBaseAndMips;
+  } else if (base_outdated_mask) {
+    reason = MetalCommandProcessor::SharedMemoryRequestReason::kTextureBase;
+  } else {
+    reason = MetalCommandProcessor::SharedMemoryRequestReason::kTextureMips;
+  }
+  if (command_processor_) {
+    return command_processor_->RequestSharedMemoryRanges(
+        reason, ranges.data(), static_cast<uint32_t>(ranges.size()));
+  }
   return shared_memory().RequestRanges(ranges.data(),
                                        static_cast<uint32_t>(ranges.size()));
 }

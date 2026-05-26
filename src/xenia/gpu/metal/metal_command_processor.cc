@@ -440,6 +440,54 @@ const char* TransferRequestSourceName(size_t source) {
   }
 }
 
+const char* SharedMemoryRequestReasonName(size_t reason) {
+  using Reason = MetalCommandProcessor::SharedMemoryRequestReason;
+  switch (static_cast<Reason>(reason)) {
+    case Reason::kUnknown:
+      return "unknown";
+    case Reason::kVertexFetch:
+      return "vertex_fetch";
+    case Reason::kMemexportStream:
+      return "memexport_stream";
+    case Reason::kGuestIndex:
+      return "guest_index";
+    case Reason::kShaderPrimitiveIndex:
+      return "shader_primitive_index";
+    case Reason::kIndexCopySource:
+      return "index_copy_source";
+    case Reason::kTextureBase:
+      return "texture_base";
+    case Reason::kTextureMips:
+      return "texture_mips";
+    case Reason::kTextureBaseAndMips:
+      return "texture_base_and_mips";
+    case Reason::kCount:
+      break;
+  }
+  return "invalid";
+}
+
+const char* SharedMemoryPlannerStopReasonName(size_t reason) {
+  using Reason = MetalCommandProcessor::SharedMemoryPlannerStopReason;
+  switch (static_cast<Reason>(reason)) {
+    case Reason::kAlreadyResident:
+      return "already_resident";
+    case Reason::kUploadBeforeRenderEncoder:
+      return "upload_before_render_encoder";
+    case Reason::kUploadInsideRenderEncoder:
+      return "upload_inside_render_encoder";
+    case Reason::kRequestFailed:
+      return "request_failed";
+    case Reason::kNoSharedMemory:
+      return "no_shared_memory";
+    case Reason::kTextureDeferredUploadFlush:
+      return "texture_deferred_upload_flush";
+    case Reason::kCount:
+      break;
+  }
+  return "invalid";
+}
+
 const char* DrawPassTransferRejectionReasonName(size_t reason) {
   switch (reason) {
     case 0:
@@ -2517,7 +2565,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
               vfetch_index, buffer_offset, buffer_length);
           return false;
         }
-        if (!shared_memory_->RequestRange(buffer_offset, buffer_length)) {
+        if (!RequestSharedMemoryRange(SharedMemoryRequestReason::kVertexFetch,
+                                      buffer_offset, buffer_length)) {
           XELOGE(
               "Failed to request vertex buffer at 0x{:08X} (size {}) in shared "
               "memory",
@@ -2529,8 +2578,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       uint32_t base_bytes = memexport_range.base_address_dwords << 2;
-      if (!shared_memory_->RequestRange(base_bytes,
-                                        memexport_range.size_bytes)) {
+      if (!RequestSharedMemoryRange(SharedMemoryRequestReason::kMemexportStream,
+                                    base_bytes, memexport_range.size_bytes)) {
         XELOGE(
             "Failed to request memexport stream at 0x{:08X} (size {}) in "
             "shared "
@@ -2542,7 +2591,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
     auto request_guest_index_range =
         [&](uint64_t index_base, uint32_t index_count,
-            xenos::IndexFormat index_format, const char* label) -> bool {
+            xenos::IndexFormat index_format, const char* label,
+            SharedMemoryRequestReason reason) -> bool {
       uint32_t index_stride = index_format == xenos::IndexFormat::kInt16
                                   ? sizeof(uint16_t)
                                   : sizeof(uint32_t);
@@ -2556,8 +2606,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             index_count);
         return false;
       }
-      if (!shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
-                                        static_cast<uint32_t>(index_length))) {
+      if (!RequestSharedMemoryRange(reason, static_cast<uint32_t>(index_base),
+                                    static_cast<uint32_t>(index_length))) {
         XELOGE(
             "Failed to request {} index buffer at 0x{:08X} (size {}) in "
             "shared memory",
@@ -2570,7 +2620,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         !request_guest_index_range(
             primitive_processing_result.guest_index_base,
             primitive_processing_result.host_draw_vertex_count,
-            primitive_processing_result.host_index_format, "guest DMA")) {
+            primitive_processing_result.host_index_format, "guest DMA",
+            SharedMemoryRequestReason::kGuestIndex)) {
       return false;
     }
     if (shader_primitive_index_load &&
@@ -2578,7 +2629,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             primitive_processing_result.guest_index_base,
             primitive_processing_result.guest_draw_vertex_count,
             regs.Get<reg::VGT_DRAW_INITIATOR>().index_size,
-            "shader primitive")) {
+            "shader primitive",
+            SharedMemoryRequestReason::kShaderPrimitiveIndex)) {
       return false;
     }
 
@@ -4062,8 +4114,9 @@ bool MetalCommandProcessor::PrepareGuestDMAIndexBufferForMemexport(
         static_cast<uint32_t>(source_copy_offset), copy_size);
     return false;
   }
-  if (!shared_memory_->RequestRange(static_cast<uint32_t>(source_copy_offset),
-                                    static_cast<uint32_t>(copy_size))) {
+  if (!RequestSharedMemoryRange(SharedMemoryRequestReason::kIndexCopySource,
+                                static_cast<uint32_t>(source_copy_offset),
+                                static_cast<uint32_t>(copy_size))) {
     XELOGE(
         "IssueDraw: failed to request guest DMA index copy range at 0x{:08X} "
         "(size {})",
@@ -5177,6 +5230,111 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
     transfer_request_sources = "none";
   }
 
+  auto format_shared_memory_request_triplets =
+      [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& total,
+         const std::array<uint64_t, kSharedMemoryRequestReasonCount>& active,
+         const std::array<uint64_t, kSharedMemoryRequestReasonCount>&
+             no_active) {
+        std::string formatted;
+        for (size_t i = 0; i < total.size(); ++i) {
+          if (!total[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}={}/{}/{}", SharedMemoryRequestReasonName(i),
+                          total[i], active[i], no_active[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  auto format_shared_memory_request_counts =
+      [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!values[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}={}", SharedMemoryRequestReasonName(i), values[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  auto format_shared_memory_request_page_counts =
+      [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& before,
+         const std::array<uint64_t, kSharedMemoryRequestReasonCount>& after) {
+        std::string formatted;
+        for (size_t i = 0; i < before.size(); ++i) {
+          if (!before[i] && !after[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted += fmt::format("{}={}/{}",
+                                   SharedMemoryRequestReasonName(i), before[i],
+                                   after[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  std::string shared_memory_request_calls =
+      format_shared_memory_request_triplets(
+          backend_telemetry_.shared_memory_request_calls_total,
+          backend_telemetry_.shared_memory_request_calls_active,
+          backend_telemetry_.shared_memory_request_calls_no_active);
+  std::string shared_memory_request_input_ranges =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_request_input_ranges);
+  std::string shared_memory_request_invalid_ranges =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_request_invalid_input_ranges);
+  std::string shared_memory_request_upload_calls =
+      format_shared_memory_request_triplets(
+          backend_telemetry_.shared_memory_request_upload_calls_total,
+          backend_telemetry_.shared_memory_request_upload_calls_active,
+          backend_telemetry_.shared_memory_request_upload_calls_no_active);
+  std::string shared_memory_request_upload_pages =
+      format_shared_memory_request_page_counts(
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_before_coalesce,
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_after_coalesce);
+  std::string shared_memory_request_upload_bytes =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_request_upload_bytes);
+  std::string shared_memory_request_failures =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_request_failures);
+  std::string shared_memory_planner_stop_reasons;
+  for (size_t i = 0;
+       i < backend_telemetry_.shared_memory_planner_stop_reasons.size(); ++i) {
+    uint64_t count = backend_telemetry_.shared_memory_planner_stop_reasons[i];
+    if (!count) {
+      continue;
+    }
+    if (!shared_memory_planner_stop_reasons.empty()) {
+      shared_memory_planner_stop_reasons += ", ";
+    }
+    shared_memory_planner_stop_reasons += fmt::format(
+        "{}={}", SharedMemoryPlannerStopReasonName(i), count);
+  }
+  if (shared_memory_planner_stop_reasons.empty()) {
+    shared_memory_planner_stop_reasons = "none";
+  }
+
   std::string pending_rejections;
   for (size_t i = 0; i < rt_stats.pending_draw_pass_rejections.size(); ++i) {
     uint64_t count = rt_stats.pending_draw_pass_rejections[i];
@@ -5356,6 +5514,18 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "MetalTelemetry[{}]: transfer_request sources "
       "total/active/no_active={{ {} }}",
       reason, transfer_request_sources);
+  XELOGI(
+      "MetalTelemetry[{}]: shared_memory requests "
+      "total/active/no_active={{ {} }} input_ranges={{ {} }} invalid={{ {} }} "
+      "failures={{ {} }}",
+      reason, shared_memory_request_calls, shared_memory_request_input_ranges,
+      shared_memory_request_invalid_ranges, shared_memory_request_failures);
+  XELOGI(
+      "MetalTelemetry[{}]: shared_memory uploads "
+      "calls total/active/no_active={{ {} }} pages before/after={{ {} }} "
+      "bytes={{ {} }} planner_stops={{ {} }}",
+      reason, shared_memory_request_upload_calls, shared_memory_request_upload_pages,
+      shared_memory_request_upload_bytes, shared_memory_planner_stop_reasons);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
       "dirty_marks={} dirty_reasons={{ {} }} compat_checks={} "
@@ -5688,6 +5858,88 @@ void MetalCommandProcessor::InvalidateRenderEncoderStateAfterDrawPassTransfers(
   }
   if (mutations & kTransferBufferMutations) {
     heap_binds_set_on_encoder_ = false;
+  }
+}
+
+bool MetalCommandProcessor::RequestSharedMemoryRange(
+    SharedMemoryRequestReason reason, uint32_t start, uint32_t length) {
+  SharedMemory::Range range = {start, length};
+  return RequestSharedMemoryRanges(reason, &range, 1);
+}
+
+bool MetalCommandProcessor::RequestSharedMemoryRanges(
+    SharedMemoryRequestReason reason, const SharedMemory::Range* ranges,
+    uint32_t range_count) {
+  const bool was_active = current_render_encoder_ != nullptr;
+  const size_t reason_index = static_cast<size_t>(reason);
+  const bool reason_valid = reason_index < kSharedMemoryRequestReasonCount;
+  if (reason_valid) {
+    ++backend_telemetry_.shared_memory_request_calls_total[reason_index];
+    if (was_active) {
+      ++backend_telemetry_.shared_memory_request_calls_active[reason_index];
+    } else {
+      ++backend_telemetry_.shared_memory_request_calls_no_active[reason_index];
+    }
+    backend_telemetry_.shared_memory_request_input_ranges[reason_index] +=
+        range_count;
+  }
+
+  if (!shared_memory_) {
+    RecordSharedMemoryPlannerStop(SharedMemoryPlannerStopReason::kNoSharedMemory);
+    if (reason_valid) {
+      ++backend_telemetry_.shared_memory_request_failures[reason_index];
+    }
+    return false;
+  }
+
+  SharedMemory::RequestRangeStats stats;
+  const bool success = shared_memory_->RequestRanges(ranges, range_count, &stats);
+  if (reason_valid) {
+    backend_telemetry_.shared_memory_request_invalid_input_ranges[reason_index] +=
+        stats.invalid_input_ranges;
+    backend_telemetry_
+        .shared_memory_request_upload_page_ranges_before_coalesce[reason_index] +=
+        stats.upload_page_ranges_before_coalesce;
+    backend_telemetry_
+        .shared_memory_request_upload_page_ranges_after_coalesce[reason_index] +=
+        stats.upload_page_ranges_after_coalesce;
+    backend_telemetry_.shared_memory_request_upload_bytes[reason_index] +=
+        stats.upload_bytes;
+    if (stats.upload_bytes) {
+      ++backend_telemetry_.shared_memory_request_upload_calls_total[reason_index];
+      if (was_active) {
+        ++backend_telemetry_
+              .shared_memory_request_upload_calls_active[reason_index];
+      } else {
+        ++backend_telemetry_
+              .shared_memory_request_upload_calls_no_active[reason_index];
+      }
+    }
+    if (!success) {
+      ++backend_telemetry_.shared_memory_request_failures[reason_index];
+    }
+  }
+
+  if (!success) {
+    RecordSharedMemoryPlannerStop(SharedMemoryPlannerStopReason::kRequestFailed);
+  } else if (!stats.upload_bytes) {
+    RecordSharedMemoryPlannerStop(SharedMemoryPlannerStopReason::kAlreadyResident);
+  } else if (was_active) {
+    RecordSharedMemoryPlannerStop(
+        SharedMemoryPlannerStopReason::kUploadInsideRenderEncoder);
+  } else {
+    RecordSharedMemoryPlannerStop(
+        SharedMemoryPlannerStopReason::kUploadBeforeRenderEncoder);
+  }
+
+  return success;
+}
+
+void MetalCommandProcessor::RecordSharedMemoryPlannerStop(
+    SharedMemoryPlannerStopReason reason) {
+  const size_t reason_index = static_cast<size_t>(reason);
+  if (reason_index < kSharedMemoryPlannerStopReasonCount) {
+    ++backend_telemetry_.shared_memory_planner_stop_reasons[reason_index];
   }
 }
 

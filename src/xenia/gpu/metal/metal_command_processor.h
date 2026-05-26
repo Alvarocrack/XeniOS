@@ -110,12 +110,43 @@ class MetalCommandProcessor final : public CommandProcessor {
   };
   static constexpr size_t kTransferRequestSourceCount =
       static_cast<size_t>(TransferRequestSource::kCount);
+  enum class SharedMemoryRequestReason : uint32_t {
+    kUnknown,
+    kVertexFetch,
+    kMemexportStream,
+    kGuestIndex,
+    kShaderPrimitiveIndex,
+    kIndexCopySource,
+    kTextureBase,
+    kTextureMips,
+    kTextureBaseAndMips,
+    kCount,
+  };
+  static constexpr size_t kSharedMemoryRequestReasonCount =
+      static_cast<size_t>(SharedMemoryRequestReason::kCount);
+  enum class SharedMemoryPlannerStopReason : uint32_t {
+    kAlreadyResident,
+    kUploadBeforeRenderEncoder,
+    kUploadInsideRenderEncoder,
+    kRequestFailed,
+    kNoSharedMemory,
+    kTextureDeferredUploadFlush,
+    kCount,
+  };
+  static constexpr size_t kSharedMemoryPlannerStopReasonCount =
+      static_cast<size_t>(SharedMemoryPlannerStopReason::kCount);
   // Returns a command buffer suitable for transfer (blit/compute) work.
   // If a render encoder is active it is ended first; if no command buffer
   // exists one is created. This is an encoder-lifetime break, not necessarily
   // a command-buffer submission break. Returns nullptr on failure.
   MTL::CommandBuffer* RequestTransferCommandBuffer(
       TransferRequestSource source = TransferRequestSource::kUnknown);
+  bool RequestSharedMemoryRange(SharedMemoryRequestReason reason,
+                                uint32_t start, uint32_t length);
+  bool RequestSharedMemoryRanges(SharedMemoryRequestReason reason,
+                                 const SharedMemory::Range* ranges,
+                                 uint32_t range_count);
+  void RecordSharedMemoryPlannerStop(SharedMemoryPlannerStopReason reason);
   MTL::BlitCommandEncoder* GetSharedMemoryUploadBlitEncoder();
   void EndSharedMemoryUploadBlitEncoder();
 
@@ -479,6 +510,32 @@ class MetalCommandProcessor final : public CommandProcessor {
         transfer_request_sources_active = {};
     std::array<uint64_t, kTransferRequestSourceCount>
         transfer_request_sources_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_calls_total = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_calls_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_calls_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_input_ranges = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_invalid_input_ranges = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_calls_total = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_calls_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_calls_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_before_coalesce = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_after_coalesce = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_bytes = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_failures = {};
+    std::array<uint64_t, kSharedMemoryPlannerStopReasonCount>
+        shared_memory_planner_stop_reasons = {};
 
     uint64_t pending_transfer_encode_attempts = 0;
     uint64_t pending_transfer_encode_successes = 0;
