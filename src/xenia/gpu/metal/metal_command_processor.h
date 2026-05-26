@@ -408,6 +408,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     kRenderTargetUpdateDescriptorDirty,
     kPipelineDescriptorIncompatible,
     kTextureUploadBeforeDrawPass,
+    kSharedMemoryUploadBeforeDrawPass,
     kResolveNeedsBoundary,
     kBeginRenderEncoderDescriptorChanged,
     kCount,
@@ -415,6 +416,24 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   static constexpr size_t kRenderEncoderEndReasonCount =
       static_cast<size_t>(RenderEncoderEndReason::kCount);
+
+  enum class VertexFetchWarmerStopReason : uint32_t {
+    kNoSharedMemory,
+    kActiveEncoderNoInvalidRanges,
+    kActiveSharedMemoryWrite,
+    kMemexport,
+    kUnsupportedPacket,
+    kShaderLoad,
+    kMemoryOrWaitPacket,
+    kMaxDraws,
+    kMaxRanges,
+    kRingEnd,
+    kRequestFailed,
+    kCount,
+  };
+
+  static constexpr size_t kVertexFetchWarmerStopReasonCount =
+      static_cast<size_t>(VertexFetchWarmerStopReason::kCount);
 
   struct BackendTelemetryStats {
     static constexpr size_t kBindlessTelemetryStageCount = 2;
@@ -545,6 +564,13 @@ class MetalCommandProcessor final : public CommandProcessor {
         shared_memory_request_failures = {};
     std::array<uint64_t, kSharedMemoryPlannerStopReasonCount>
         shared_memory_planner_stop_reasons = {};
+    uint64_t vertex_fetch_warmer_attempts = 0;
+    uint64_t vertex_fetch_warmer_used = 0;
+    uint64_t vertex_fetch_warmer_skipped = 0;
+    uint64_t vertex_fetch_warmer_draws = 0;
+    uint64_t vertex_fetch_warmer_ranges = 0;
+    std::array<uint64_t, kVertexFetchWarmerStopReasonCount>
+        vertex_fetch_warmer_stop_reasons = {};
 
     uint64_t pending_transfer_encode_attempts = 0;
     uint64_t pending_transfer_encode_successes = 0;
@@ -624,6 +650,13 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ProcessCompletedSubmissions();
   void MaybeDumpBackendTelemetry(const char* reason, bool force = false);
   void ResetBackendTelemetry();
+  bool AnySharedMemoryRangeInvalid(const SharedMemory::Range* ranges,
+                                   uint32_t range_count) const;
+  bool HasActiveSharedMemoryWritePending() const;
+  void RecordVertexFetchWarmerStop(VertexFetchWarmerStopReason reason);
+  void WarmVertexFetchSharedMemoryBeforeRenderPass(
+      const Shader& vertex_shader, const SharedMemory::Range* current_ranges,
+      uint32_t current_range_count, bool current_draw_memexport_used);
 
   void UseRenderEncoderAttachmentHeaps(MTL::RenderPassDescriptor* descriptor);
   void UseRenderEncoderResources(const MTL::Resource* const resources[],
