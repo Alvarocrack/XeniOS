@@ -1637,6 +1637,23 @@ void MetalCommandProcessor::MarkSharedMemoryComputeWritePending(
                                false);
 }
 
+void MetalCommandProcessor::MarkSharedMemoryRenderWritePending(
+    uint32_t address, uint32_t length, MTL::RenderStages stages) {
+  if (!length) {
+    return;
+  }
+  if (current_render_encoder_ && NS::UInteger(stages)) {
+    active_render_encoder_shared_memory_write_stages_ = MTL::RenderStages(
+        NS::UInteger(active_render_encoder_shared_memory_write_stages_) |
+        NS::UInteger(stages));
+    MarkSharedMemoryWritePending(address, length, stages, true, false);
+    return;
+  }
+  XELOGE("MetalCommandProcessor: shared-memory render write cannot be fenced");
+  MarkSharedMemoryWritePending(address, length, MTL::RenderStages(0), false,
+                               false);
+}
+
 bool MetalCommandProcessor::PrepareSharedMemoryComputeReadDependency(
     const SharedMemoryRange* ranges, uint32_t range_count,
     bool consumer_can_join_current_submission,
@@ -4622,6 +4639,18 @@ bool MetalCommandProcessor::IssueCopy() {
     return false;
   }
 
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
+
+  if (resolve_plan.needs_copy_export &&
+      render_target_cache_->TryTileDirectHostResolveCopy(
+          resolve_plan, current_render_encoder_, current_render_pass_descriptor_,
+          written_address, written_length)) {
+    InvalidateRenderEncoderStateAfterDrawPassTransfers(
+        MetalRenderTargetCache::kDrawPassTransferEncoderMutationPipeline);
+    return true;
+  }
+
   MTL::CommandBuffer* copy_command_buffer = nullptr;
   if (resolve_plan.needs_render_encoder_end) {
     // End only the render encoder here. The resolve/transfer work may still
@@ -4633,9 +4662,6 @@ bool MetalCommandProcessor::IssueCopy() {
       return false;
     }
   }
-
-  uint32_t written_address = 0;
-  uint32_t written_length = 0;
 
   if (!render_target_cache_->Resolve(*memory_, written_address, written_length,
                                      copy_command_buffer, &resolve_plan)) {
@@ -5580,6 +5606,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       format_buffer_stage_array(backend_telemetry_.render_encoder_buffer_null_binds);
   std::string buffer_untracked_full_binds = format_buffer_stage_array(
       backend_telemetry_.render_encoder_buffer_untracked_full_binds);
+  const auto& direct_host_stats = rt_stats.resolve_direct_host;
 
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
@@ -5825,6 +5852,58 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       rt_stats.perform_transfer_resolve_clear_calls,
       rt_stats.perform_transfer_no_work_calls,
       rt_stats.perform_transfer_work_calls);
+  XELOGI(
+      "MetalTelemetry[{}]: resolve_direct_host attempt/success={}/{} "
+      "reject gamma/exp_bias/format/sample/depth_no_fast={}/{}/{}/{}/{} "
+      "tile total/accept={}/{} accept fast/full={}/{} "
+      "tile_reject current/multi/depth/copy_clear/uint={}/{}/{}/{}/{} "
+      "tile_execute attempt/success/reject={}/{}/{} "
+      "store_dontcare eligible/skipped_disabled/attempt/applied={}/{}/{}/{}",
+      reason, direct_host_stats.direct_host_attempt,
+      direct_host_stats.direct_host_success,
+      direct_host_stats.direct_host_reject_gamma,
+      direct_host_stats.direct_host_reject_exp_bias,
+      direct_host_stats.direct_host_reject_format_mismatch,
+      direct_host_stats.direct_host_reject_sample_select,
+      direct_host_stats.direct_host_reject_depth_no_fast,
+      direct_host_stats.tile_candidate_total, direct_host_stats.tile_accept,
+      direct_host_stats.tile_accept_fast,
+      direct_host_stats.tile_accept_full_color,
+      direct_host_stats.tile_reject_source_not_current_rt,
+      direct_host_stats.tile_reject_multi_source_rect,
+      direct_host_stats.tile_reject_depth,
+      direct_host_stats.tile_reject_copy_clear,
+      direct_host_stats.tile_reject_uint_transfer_view,
+      direct_host_stats.tile_execute_attempt,
+      direct_host_stats.tile_execute_success,
+      direct_host_stats.tile_execute_reject,
+      direct_host_stats.store_dontcare_eligible,
+      direct_host_stats.store_dontcare_skipped_disabled,
+      direct_host_stats.store_dontcare_attempt,
+      direct_host_stats.store_dontcare_applied);
+  XELOGI(
+      "MetalTelemetry[{}]: resolve_direct_host tile_execute_reject_detail "
+      "invalid/no_active/scaled/copy_clear/depth/shader/full_color/gamma/"
+      "sample/exp_bias/format={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} "
+      "multi/current/uint/texture/attachment/pipeline/dest={}/{}/{}/{}/{}/{}/{}",
+      reason, direct_host_stats.tile_execute_reject_invalid,
+      direct_host_stats.tile_execute_reject_no_active,
+      direct_host_stats.tile_execute_reject_scaled,
+      direct_host_stats.tile_execute_reject_copy_clear,
+      direct_host_stats.tile_execute_reject_depth,
+      direct_host_stats.tile_execute_reject_shader,
+      direct_host_stats.tile_execute_reject_full_color,
+      direct_host_stats.tile_execute_reject_gamma,
+      direct_host_stats.tile_execute_reject_sample_select,
+      direct_host_stats.tile_execute_reject_exp_bias,
+      direct_host_stats.tile_execute_reject_format_mismatch,
+      direct_host_stats.tile_execute_reject_multi_source_rect,
+      direct_host_stats.tile_execute_reject_source_not_current_rt,
+      direct_host_stats.tile_execute_reject_uint_transfer_view,
+      direct_host_stats.tile_execute_reject_texture,
+      direct_host_stats.tile_execute_reject_attachment,
+      direct_host_stats.tile_execute_reject_pipeline,
+      direct_host_stats.tile_execute_reject_dest_buffer);
   XELOGI(
       "MetalTelemetry[{}]: texture requests={} nonzero={} work_bits={} "
       "with_loads/without_loads={}/{} loaded_textures={} loads={} base={} "

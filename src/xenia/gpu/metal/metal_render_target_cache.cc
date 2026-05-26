@@ -163,6 +163,17 @@ DEFINE_bool(metal_direct_host_resolve, true,
             "Resolve eligible fast color/depth copies directly from Metal host "
             "render targets to shared/scaled resolve memory",
             "Metal");
+DEFINE_bool(
+    metal_tile_direct_host_resolve, true,
+    "Prototype: resolve eligible fast color copies from the active Metal "
+    "render pass with a tile shader before ending the render encoder",
+    "Metal");
+DEFINE_bool(
+    metal_tile_direct_host_resolve_dontcare_store, true,
+    "Experimental: after a tile direct-host resolve, mark the source color "
+    "attachment store action DontCare. Unsafe without render-target liveness "
+    "proof; use only on traces where the source host RT does not escape.",
+    "Metal");
 DEFINE_bool(metal_use_heaps, true,
             "Use MTLHeap-backed texture allocations in Metal to reduce "
             "allocation overhead and fragmentation.",
@@ -196,6 +207,8 @@ uint32_t EstimateRenderTargetBytesPerPixel(bool is_64bpp) {
   return is_64bpp ? 8u : 4u;
 }
 
+constexpr NS::UInteger kTileDirectHostResolveTileWidth = 16;
+constexpr NS::UInteger kTileDirectHostResolveTileHeight = 16;
 
 MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
     MTL::Device* device, const void* metallib_data, size_t metallib_size,
@@ -896,9 +909,19 @@ void MetalRenderTargetCache::Shutdown(bool from_destructor) {
     }
   }
   transfer_clear_pipelines_.clear();
+  for (auto& it : tile_direct_host_resolve_pipelines_) {
+    if (it.second) {
+      it.second->release();
+    }
+  }
+  tile_direct_host_resolve_pipelines_.clear();
   if (transfer_library_) {
     transfer_library_->release();
     transfer_library_ = nullptr;
+  }
+  if (tile_direct_host_resolve_library_) {
+    tile_direct_host_resolve_library_->release();
+    tile_direct_host_resolve_library_ = nullptr;
   }
   if (edram_load_library_) {
     edram_load_library_->release();
@@ -3692,6 +3715,12 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
   cached_render_pass_descriptor_fallback_depth_required_ =
       fallback_depth_attachment_required;
   render_pass_descriptor_dirty_ = false;
+  if (::cvars::metal_tile_direct_host_resolve) {
+    cached_render_pass_descriptor_->setTileWidth(
+        kTileDirectHostResolveTileWidth);
+    cached_render_pass_descriptor_->setTileHeight(
+        kTileDirectHostResolveTileHeight);
+  }
 
   bool has_any_render_target = false;
   bool has_any_color_target = false;
@@ -4622,10 +4651,73 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     const draw_util::ResolveCopyShaderConstants& copy_constants,
     draw_util::ResolveCopyShaderIndex copy_shader, uint32_t dump_base,
     uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
-    MTL::CommandBuffer* command_buffer, uint32_t& written_address,
-    uint32_t& written_length) {
+    bool resolve_has_clear, MTL::CommandBuffer* command_buffer,
+    uint32_t& written_address, uint32_t& written_length) {
+
+  TelemetryStats::ResolveDirectHostTelemetry& direct_telemetry =
+      telemetry_.resolve_direct_host;
+  ++direct_telemetry.direct_host_attempt;
 
   auto reject = []() { return false; };
+  auto reject_gamma = [&]() {
+    ++direct_telemetry.direct_host_reject_gamma;
+    return false;
+  };
+  auto reject_exp_bias = [&]() {
+    ++direct_telemetry.direct_host_reject_exp_bias;
+    return false;
+  };
+  auto reject_format_mismatch = [&]() {
+    ++direct_telemetry.direct_host_reject_format_mismatch;
+    return false;
+  };
+  auto reject_sample_select = [&]() {
+    ++direct_telemetry.direct_host_reject_sample_select;
+    return false;
+  };
+  auto reject_depth_no_fast = [&]() {
+    ++direct_telemetry.direct_host_reject_depth_no_fast;
+    return false;
+  };
+  bool tile_candidate_pending = false;
+  bool tile_candidate_recorded = false;
+  auto record_tile_reject = [&](uint64_t& counter) {
+    if (tile_candidate_recorded) {
+      return;
+    }
+    ++direct_telemetry.tile_candidate_total;
+    ++counter;
+    tile_candidate_recorded = true;
+    tile_candidate_pending = false;
+  };
+  auto record_tile_accept = [&](bool full_color) {
+    if (tile_candidate_recorded) {
+      return;
+    }
+    ++direct_telemetry.tile_candidate_total;
+    ++direct_telemetry.tile_accept;
+    if (full_color) {
+      ++direct_telemetry.tile_accept_full_color;
+    } else {
+      ++direct_telemetry.tile_accept_fast;
+    }
+    // This is source-side eligibility for a later liveness check. No store action
+    // is changed by this telemetry-only path.
+    ++direct_telemetry.store_dontcare_eligible;
+    tile_candidate_recorded = true;
+    tile_candidate_pending = false;
+  };
+  auto is_current_color_render_target = [&](MetalRenderTarget* rt) {
+    if (!rt) {
+      return false;
+    }
+    for (MetalRenderTarget* current_color_target : current_color_targets_) {
+      if (current_color_target == rt) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   if (GetPath() != Path::kHostRenderTargets) {
     return reject();
@@ -4635,6 +4727,13 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
       IsResolveDirectHostRTFastCandidate(copy_shader);
   const bool copy_shader_is_full_color =
       !resolve_is_depth && IsResolveDirectHostRTFullColorCandidate(copy_shader);
+  if (resolve_has_clear) {
+    record_tile_reject(direct_telemetry.tile_reject_copy_clear);
+  } else if (resolve_is_depth) {
+    record_tile_reject(direct_telemetry.tile_reject_depth);
+  } else {
+    tile_candidate_pending = true;
+  }
 
   xenos::ColorRenderTargetFormat resolve_color_format =
       xenos::ColorRenderTargetFormat::k_8_8_8_8;
@@ -4643,10 +4742,10 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   if (resolve_is_depth) {
     if (!xenos::IsSingleCopySampleSelected(
             resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-      return reject();
+      return reject_sample_select();
     }
     if (!copy_shader_is_fast) {
-      return reject();
+      return reject_depth_no_fast();
     }
     resolve_depth_format =
         xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format);
@@ -4658,35 +4757,35 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
       // TODO(xenios-jp): Support direct host gamma resolves only once the
       // shader can mirror the dump path's linear RGBA16Unorm host storage to
       // guest PWL-gamma RGBA8 conversion.
-      return reject();
+      return reject_gamma();
     }
     if (copy_shader_is_fast) {
       if (!xenos::IsSingleCopySampleSelected(
               resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-        return reject();
+        return reject_sample_select();
       }
       if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
-        return reject();
+        return reject_exp_bias();
       }
       if (!xenos::IsColorResolveFormatBitwiseEquivalent(
               resolve_color_format,
               xenos::ColorFormat(
                   resolve_info.copy_dest_info.copy_dest_format))) {
-        return reject();
+        return reject_format_mismatch();
       }
     } else if (!copy_shader_is_full_color) {
       if (!xenos::IsSingleCopySampleSelected(
               resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
-        return reject();
+        return reject_sample_select();
       }
       if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
-        return reject();
+        return reject_exp_bias();
       }
       if (!xenos::IsColorResolveFormatBitwiseEquivalent(
               resolve_color_format,
               xenos::ColorFormat(
                   resolve_info.copy_dest_info.copy_dest_format))) {
-        return reject();
+        return reject_format_mismatch();
       }
       return reject();
     }
@@ -4725,6 +4824,9 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
                                  dump_pitch, rectangles);
   if (rectangles.empty()) {
     return reject();
+  }
+  if (tile_candidate_pending && rectangles.size() != 1) {
+    record_tile_reject(direct_telemetry.tile_reject_multi_source_rect);
   }
 
   uint64_t covered_tiles = 0;
@@ -4781,7 +4883,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     if (resolve_is_depth) {
       if (key.GetDepthFormat() != resolve_depth_format ||
           key.msaa_samples != resolve_info.depth_edram_info.msaa_samples) {
-        return reject();
+        return reject_format_mismatch();
       }
       texture = rt->texture();
       expected_format = GetDepthPixelFormat(key.GetDepthFormat());
@@ -4798,16 +4900,24 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     } else {
       if (key.GetColorFormat() != resolve_color_format ||
           key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
-        return reject();
+        return reject_format_mismatch();
       }
       if (copy_shader_is_full_color &&
           !is_direct_full_color_source_packable(resolve_color_format)) {
-        return reject();
+        return reject_format_mismatch();
       }
 
       MTL::PixelFormat ownership_transfer_format =
           GetColorOwnershipTransferPixelFormat(key.GetColorFormat(),
                                                &source_is_uint);
+      if (tile_candidate_pending) {
+        if (!is_current_color_render_target(rt)) {
+          record_tile_reject(
+              direct_telemetry.tile_reject_source_not_current_rt);
+        } else if (source_is_uint) {
+          record_tile_reject(direct_telemetry.tile_reject_uint_transfer_view);
+        }
+      }
       texture = source_is_uint
                     ? ((key.msaa_samples != xenos::MsaaSamples::k1X &&
                         rt->msaa_texture())
@@ -4830,7 +4940,7 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
       return reject();
     }
     if (texture->pixelFormat() != expected_format) {
-      return reject();
+      return reject_format_mismatch();
     }
     if (!pipeline) {
       return reject();
@@ -4870,7 +4980,13 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   const uint64_t required_tiles =
       uint64_t(dump_row_length_used) * uint64_t(dump_rows);
   if (covered_tiles != required_tiles) {
+    if (tile_candidate_pending) {
+      record_tile_reject(direct_telemetry.tile_reject_multi_source_rect);
+    }
     return reject();
+  }
+  if (tile_candidate_pending) {
+    record_tile_accept(copy_shader_is_full_color);
   }
 
   auto* texture_cache = command_processor_.texture_cache();
@@ -5012,7 +5128,788 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     texture_cache->MarkRangeAsResolved(written_address, written_length);
   }
 
+  ++direct_telemetry.direct_host_success;
+  return true;
+}
 
+MTL::Library* MetalRenderTargetCache::GetOrCreateTileDirectHostResolveLibrary() {
+  if (tile_direct_host_resolve_library_) {
+    return tile_direct_host_resolve_library_;
+  }
+
+  static const char kTileDirectHostResolveSource[] = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint kXenosMsaaSamples1X = 0u;
+constant uint kXenosMsaaSamples2X = 1u;
+constant uint kEdramTileCount = 2048u;
+constant uint kXenosColorRTFormatRGBA8 = 0u;
+constant uint kXenosColorRTFormatRGBA8Gamma = 1u;
+constant uint kXenosColorRTFormatRGB10A2 = 2u;
+constant uint kXenosColorRTFormatRGB10A2Float = 3u;
+constant uint kXenosColorRTFormatRG16 = 4u;
+constant uint kXenosColorRTFormatRGBA16 = 5u;
+constant uint kXenosColorRTFormatRG16Float = 6u;
+constant uint kXenosColorRTFormatRGBA16Float = 7u;
+constant uint kXenosColorRTFormatRGB10A2AsRGB10A2 = 10u;
+constant uint kXenosColorRTFormatRGB10A2FloatAsRGBA16 = 12u;
+
+struct TileDirectHostResolveConstants {
+  uint edram_info;
+  uint coordinate_info;
+  uint dest_info;
+  uint dest_coordinate_info;
+  uint dest_base;
+  uint dump_base;
+  uint dump_pitch_tiles;
+  uint dump_row_length_used;
+  uint dump_rows;
+  uint rect_row_first;
+  uint rect_rows;
+  uint rect_row_first_start;
+  uint rect_row_last_end;
+  uint source_base_tiles;
+  uint source_pitch_tiles;
+  uint source_width;
+  uint source_height;
+  uint height_scaled;
+  uint msaa_2x_sample_0;
+  uint msaa_2x_sample_1;
+  uint msaa_samples;
+  uint is_64bpp;
+  uint source_format;
+  uint padding;
+};
+
+struct TileResolveInfo {
+  uint edram_pitch_tiles;
+  uint edram_msaa_samples;
+  uint edram_base_tiles;
+  uint edram_format;
+  uint edram_format_ints_log2;
+  uint2 edram_offset_scaled;
+  uint width_scaled;
+  uint dest_endian_128;
+  bool dest_is_array;
+  uint dest_slice;
+  bool dest_swap;
+  uint dest_row_pitch_macro_tiles;
+  uint dest_slice_pitch_3d_macro_tiles;
+  uint2 dest_xy_offset_scaled;
+  uint sample_select;
+  uint dest_base;
+};
+
+inline TileResolveInfo TileGetResolveInfo(
+    constant TileDirectHostResolveConstants& c) {
+  TileResolveInfo info;
+  uint edram_info = c.edram_info;
+  uint coordinate_info = c.coordinate_info;
+  uint dest_info = c.dest_info;
+  uint dest_coordinate_info = c.dest_coordinate_info;
+  info.edram_pitch_tiles = edram_info & ((1u << 10u) - 1u);
+  info.edram_msaa_samples = (edram_info >> 10u) & ((1u << 2u) - 1u);
+  info.edram_base_tiles = (edram_info >> 13u) & ((1u << 11u) - 1u);
+  info.edram_format = (edram_info >> 24u) & ((1u << 4u) - 1u);
+  info.edram_format_ints_log2 = (edram_info >> 28u) & 1u;
+  info.edram_offset_scaled =
+      (((uint2(coordinate_info) >> uint2(0u, 4u)) &
+        ((uint2(1u) << uint2(4u, 1u)) - 1u)) << 3u);
+  info.width_scaled = ((coordinate_info >> 5u) & ((1u << 11u) - 1u)) << 3u;
+  info.dest_endian_128 = dest_info & ((1u << 3u) - 1u);
+  info.dest_is_array = (dest_info & (1u << 3u)) != 0u;
+  info.dest_slice = (dest_info >> 4u) & ((1u << 3u) - 1u);
+  info.dest_swap = (dest_info & (1u << 24u)) != 0u;
+  info.dest_row_pitch_macro_tiles =
+      dest_coordinate_info & ((1u << 10u) - 1u);
+  info.dest_slice_pitch_3d_macro_tiles =
+      ((dest_coordinate_info >> 10u) & ((1u << 10u) - 1u)) << 1u;
+  info.dest_xy_offset_scaled =
+      (((uint2(dest_coordinate_info) >> uint2(20u, 24u)) &
+        ((1u << 4u) - 1u)) << 3u);
+  info.sample_select = (dest_coordinate_info >> 28u) & ((1u << 3u) - 1u);
+  info.dest_base = c.dest_base;
+  return info;
+}
+
+inline uint XeEndianSwap32(uint value, uint endian) {
+  if (endian == 1u || endian == 2u) {
+    value = ((value & 0x00FF00FFu) << 8u) |
+            ((value & 0xFF00FF00u) >> 8u);
+  }
+  if (endian == 2u || endian == 3u) {
+    value = (value << 16u) | (value >> 16u);
+  }
+  return value;
+}
+
+inline uint2 XeEndianSwap64(uint2 value, uint endian) {
+  if (endian == 4u) {
+    value = value.yx;
+    endian = 2u;
+  }
+  return uint2(XeEndianSwap32(value.x, endian),
+               XeEndianSwap32(value.y, endian));
+}
+
+inline uint XenosTextureTiledAddressCombine(uint outer_inner_bytes, uint bank,
+                                            uint pipe, uint y_lsb) {
+  return (y_lsb << 4u) | (pipe << 6u) | (bank << 11u) |
+         (outer_inner_bytes & 0xFu) |
+         (((outer_inner_bytes >> 4u) & 0x1u) << 5u) |
+         (((outer_inner_bytes >> 5u) & 0x7u) << 8u) |
+         ((outer_inner_bytes >> 8u) << 12u);
+}
+
+inline uint XenosTextureTiledAddress2D(uint2 p, uint pitch_macro_tiles,
+                                       uint bytes_per_block_log2) {
+  uint outer_blocks =
+      (((p.y >> 5u) * pitch_macro_tiles + (p.x >> 5u)) << 6u);
+  uint inner_blocks = (((p.y >> 1u) & 0x7u) << 3u) | (p.x & 0x7u);
+  uint outer_inner_bytes = (outer_blocks | inner_blocks)
+                           << bytes_per_block_log2;
+  uint bank = (p.y >> 4u) & 0x1u;
+  uint pipe = ((p.x >> 3u) & 0x3u) ^ (((p.y >> 3u) & 0x1u) << 1u);
+  return XenosTextureTiledAddressCombine(outer_inner_bytes, bank, pipe,
+                                         p.y & 1u);
+}
+
+inline uint XenosTextureTiledAddress3D(uint3 p, uint pitch_macro_tiles,
+                                       uint height_macro_tiles,
+                                       uint bytes_per_block_log2) {
+  uint outer_blocks =
+      (((((p.z >> 2u) * height_macro_tiles + (p.y >> 4u)) *
+         pitch_macro_tiles) +
+        (p.x >> 5u)) << 7u);
+  uint inner_blocks =
+      ((p.z & 0x3u) << 5u) | (((p.y >> 1u) & 0x3u) << 3u) |
+      (p.x & 0x7u);
+  uint outer_inner_bytes = (outer_blocks | inner_blocks)
+                           << bytes_per_block_log2;
+  uint bank = ((p.y >> 3u) ^ (p.z >> 2u)) & 0x1u;
+  uint pipe = ((p.x >> 3u) & 0x3u) ^ (bank << 1u);
+  return XenosTextureTiledAddressCombine(outer_inner_bytes, bank, pipe,
+                                         p.y & 1u);
+}
+
+inline uint TileDestPixelAddress(TileResolveInfo info, uint2 pixel_index,
+                                 uint bytes_per_block_log2) {
+  uint2 host_position = pixel_index + info.dest_xy_offset_scaled;
+  uint address;
+  if (info.dest_is_array) {
+    address = XenosTextureTiledAddress3D(
+        uint3(host_position, info.dest_slice), info.dest_row_pitch_macro_tiles,
+        info.dest_slice_pitch_3d_macro_tiles, bytes_per_block_log2);
+  } else {
+    address = XenosTextureTiledAddress2D(host_position,
+                                         info.dest_row_pitch_macro_tiles,
+                                         bytes_per_block_log2);
+  }
+  return address + info.dest_base;
+}
+
+inline uint TileFirstSampleIndex(uint sample_select) {
+  if (sample_select <= 3u) {
+    return sample_select;
+  }
+  if (sample_select == 5u) {
+    return 2u;
+  }
+  return 0u;
+}
+
+inline uint2 TileSampleOffsetForIndex(uint sample_index) {
+  return (uint2(sample_index) >> uint2(1u, 0u)) & 1u;
+}
+
+inline bool TilePositionInResolveRect(
+    constant TileDirectHostResolveConstants& c, uint2 source_sample) {
+  if (c.source_pitch_tiles == 0u || c.dump_pitch_tiles == 0u ||
+      c.dump_row_length_used == 0u || c.dump_rows == 0u || c.rect_rows == 0u) {
+    return false;
+  }
+  uint tile_size_x = c.is_64bpp != 0u ? 40u : 80u;
+  uint tile_size_y = 16u;
+  uint source_tile_x = source_sample.x / tile_size_x;
+  uint source_tile_y = source_sample.y / tile_size_y;
+  uint source_tile =
+      (c.source_base_tiles + source_tile_y * c.source_pitch_tiles +
+       source_tile_x) &
+      (kEdramTileCount - 1u);
+  uint local_tile = source_tile >= c.dump_base
+                        ? source_tile - c.dump_base
+                        : source_tile + kEdramTileCount - c.dump_base;
+  uint dump_tile_y = local_tile / c.dump_pitch_tiles;
+  uint dump_tile_x = local_tile - dump_tile_y * c.dump_pitch_tiles;
+  if (dump_tile_y < c.rect_row_first ||
+      dump_tile_y >= c.rect_row_first + c.rect_rows) {
+    return false;
+  }
+  uint row_start = 0u;
+  uint row_end = c.dump_row_length_used;
+  if (c.rect_rows == 1u) {
+    row_start = c.rect_row_first_start;
+    row_end = c.rect_row_last_end;
+  } else if (dump_tile_y == c.rect_row_first) {
+    row_start = c.rect_row_first_start;
+  } else if (dump_tile_y == c.rect_row_first + c.rect_rows - 1u) {
+    row_end = c.rect_row_last_end;
+  }
+  return dump_tile_x >= row_start && dump_tile_x < row_end;
+}
+
+inline uint TilePackUnorm(float value, float scale) {
+  return uint(clamp(value, 0.0f, 1.0f) * scale + 0.5f);
+}
+
+inline uint TilePackSnorm16(float value) {
+  float clamped = clamp(value, -1.0f, 1.0f);
+  float bias = clamped >= 0.0f ? 0.5f : -0.5f;
+  return uint(int(clamped * 32767.0f + bias)) & 0xFFFFu;
+}
+
+inline uint TilePreClampedFloat32To7e3(float value) {
+  uint f32 = as_type<uint>(value);
+  uint biased_f32;
+  if (f32 < 0x3E800000u) {
+    uint f32_exp = f32 >> 23u;
+    uint shift = min(125u - f32_exp, 24u);
+    uint mantissa = (f32 & 0x7FFFFFu) | 0x800000u;
+    biased_f32 = mantissa >> shift;
+  } else {
+    biased_f32 = f32 + 0xC2000000u;
+  }
+  uint round_bit = (biased_f32 >> 16u) & 1u;
+  uint f10 = biased_f32 + 0x7FFFu + round_bit;
+  return (f10 >> 16u) & 0x3FFu;
+}
+
+inline uint TileFloat32To7e3(float value) {
+  return TilePreClampedFloat32To7e3(clamp(value, 0.0f, 31.875f));
+}
+
+inline uint TilePack32(float4 color, uint format) {
+  switch (format) {
+    case kXenosColorRTFormatRGBA8:
+    case kXenosColorRTFormatRGBA8Gamma:
+      return TilePackUnorm(color.r, 255.0f) |
+             (TilePackUnorm(color.g, 255.0f) << 8u) |
+             (TilePackUnorm(color.b, 255.0f) << 16u) |
+             (TilePackUnorm(color.a, 255.0f) << 24u);
+    case kXenosColorRTFormatRGB10A2:
+    case kXenosColorRTFormatRGB10A2AsRGB10A2:
+      return TilePackUnorm(color.r, 1023.0f) |
+             (TilePackUnorm(color.g, 1023.0f) << 10u) |
+             (TilePackUnorm(color.b, 1023.0f) << 20u) |
+             (TilePackUnorm(color.a, 3.0f) << 30u);
+    case kXenosColorRTFormatRGB10A2Float:
+    case kXenosColorRTFormatRGB10A2FloatAsRGBA16:
+      return TileFloat32To7e3(color.r) |
+             (TileFloat32To7e3(color.g) << 10u) |
+             (TileFloat32To7e3(color.b) << 20u) |
+             (TilePackUnorm(color.a, 3.0f) << 30u);
+    case kXenosColorRTFormatRG16:
+      return TilePackSnorm16(color.r) | (TilePackSnorm16(color.g) << 16u);
+    case kXenosColorRTFormatRG16Float:
+      return as_type<uint>(half2(color.rg));
+    default:
+      return as_type<uint>(color.r);
+  }
+}
+
+inline uint2 TilePack64(float4 color, uint format) {
+  switch (format) {
+    case kXenosColorRTFormatRGBA16:
+      return uint2(TilePackSnorm16(color.r) | (TilePackSnorm16(color.g) << 16u),
+                   TilePackSnorm16(color.b) | (TilePackSnorm16(color.a) << 16u));
+    case kXenosColorRTFormatRGBA16Float:
+      return uint2(as_type<uint>(half2(color.rg)),
+                   as_type<uint>(half2(color.ba)));
+    default:
+      return as_type<uint2>(color.rg);
+  }
+}
+
+#define DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(ID)                             \
+struct ColorBlock##ID {                                                       \
+  float4 color [[color(ID)]];                                                  \
+};                                                                            \
+kernel void xenia_tile_direct_host_resolve_color##ID(                         \
+    imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
+    constant TileDirectHostResolveConstants& c [[buffer(0)]],                 \
+    device uint* dest [[buffer(1)]],                                           \
+    ushort2 tid [[thread_position_in_threadgroup]],                           \
+    uint2 pos [[thread_position_in_grid]]) {                                  \
+  if (pos.x >= c.source_width || pos.y >= c.source_height) {                  \
+    return;                                                                   \
+  }                                                                           \
+  TileResolveInfo info = TileGetResolveInfo(c);                               \
+  if (pos.x < info.edram_offset_scaled.x ||                                  \
+      pos.y < info.edram_offset_scaled.y) {                                   \
+    return;                                                                   \
+  }                                                                           \
+  uint2 pixel_index = pos - info.edram_offset_scaled;                         \
+  if (pixel_index.x >= info.width_scaled ||                                   \
+      pixel_index.y >= c.height_scaled) {                                     \
+    return;                                                                   \
+  }                                                                           \
+  uint selected_sample = TileFirstSampleIndex(info.sample_select);            \
+  uint2 source_sample = pos;                                                   \
+  float4 color;                                                               \
+  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
+    color = block.read(tid).color;                                            \
+  } else if (c.msaa_samples == kXenosMsaaSamples2X) {                         \
+    uint sample_y = selected_sample & 1u;                                     \
+    source_sample = uint2(pos.x, (pos.y << 1u) + sample_y);                  \
+    uint sample_id = sample_y != 0u ? c.msaa_2x_sample_1                     \
+                                    : c.msaa_2x_sample_0;                    \
+    color = block.read(tid, ushort(sample_id),                                \
+                       imageblock_data_rate::sample).color;                  \
+  } else {                                                                    \
+    uint2 sample_offset = TileSampleOffsetForIndex(selected_sample);          \
+    source_sample = (pos << 1u) + sample_offset;                              \
+    uint sample_id = sample_offset.x | (sample_offset.y << 1u);              \
+    color = block.read(tid, ushort(sample_id),                                \
+                       imageblock_data_rate::sample).color;                  \
+  }                                                                           \
+  if (!TilePositionInResolveRect(c, source_sample)) {                         \
+    return;                                                                   \
+  }                                                                           \
+  if (info.dest_swap) {                                                       \
+    color = color.bgra;                                                       \
+  }                                                                           \
+  uint address = TileDestPixelAddress(info, pixel_index,                      \
+                                      c.is_64bpp != 0u ? 3u : 2u);           \
+  uint dest_index = address >> 2u;                                            \
+  if (c.is_64bpp != 0u) {                                                     \
+    uint2 packed = XeEndianSwap64(TilePack64(color, c.source_format),         \
+                                  info.dest_endian_128);                     \
+    dest[dest_index] = packed.x;                                               \
+    dest[dest_index + 1u] = packed.y;                                         \
+  } else {                                                                    \
+    dest[dest_index] =                                                        \
+        XeEndianSwap32(TilePack32(color, c.source_format),                    \
+                       info.dest_endian_128);                                 \
+  }                                                                           \
+}
+
+DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(0)
+DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(1)
+DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(2)
+DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(3)
+#undef DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR
+)METAL";
+
+  NS::Error* error = nullptr;
+  MTL::CompileOptions* compile_options = MTL::CompileOptions::alloc()->init();
+  compile_options->setFastMathEnabled(true);
+  compile_options->setLanguageVersion(MTL::LanguageVersion2_4);
+  auto source_str = NS::String::string(kTileDirectHostResolveSource,
+                                       NS::UTF8StringEncoding);
+  tile_direct_host_resolve_library_ =
+      device_->newLibrary(source_str, compile_options, &error);
+  compile_options->release();
+  if (!tile_direct_host_resolve_library_) {
+    XELOGE(
+        "MetalRenderTargetCache: failed to compile tile direct host resolve "
+        "library: {}",
+        error && error->localizedDescription()
+            ? error->localizedDescription()->utf8String()
+            : "unknown error");
+  }
+  return tile_direct_host_resolve_library_;
+}
+
+MTL::RenderPipelineState*
+MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
+    uint32_t color_attachment_index, uint32_t sample_count,
+    const TransferColorAttachmentFormats& color_attachment_formats) {
+  if (color_attachment_index >= xenos::kMaxColorRenderTargets) {
+    return nullptr;
+  }
+  TileDirectHostResolvePipelineKey key = {};
+  key.color_attachment_index = color_attachment_index;
+  key.sample_count = sample_count ? sample_count : 1;
+  key.color_attachment_formats = color_attachment_formats;
+  auto it = tile_direct_host_resolve_pipelines_.find(key);
+  if (it != tile_direct_host_resolve_pipelines_.end()) {
+    return it->second;
+  }
+
+  MTL::Library* library = GetOrCreateTileDirectHostResolveLibrary();
+  if (!library) {
+    return nullptr;
+  }
+  std::string function_name =
+      fmt::format("xenia_tile_direct_host_resolve_color{}",
+                  color_attachment_index);
+  NS::String* function_name_ns =
+      NS::String::string(function_name.c_str(), NS::UTF8StringEncoding);
+  MTL::Function* tile_function = library->newFunction(function_name_ns);
+  if (!tile_function) {
+    XELOGE(
+        "MetalRenderTargetCache: missing tile direct host resolve function {}",
+        function_name);
+    return nullptr;
+  }
+
+  MTL::TileRenderPipelineDescriptor* desc =
+      MTL::TileRenderPipelineDescriptor::alloc()->init();
+  desc->setTileFunction(tile_function);
+  desc->setRasterSampleCount(key.sample_count);
+  desc->setThreadgroupSizeMatchesTileSize(true);
+  desc->setMaxTotalThreadsPerThreadgroup(
+      kTileDirectHostResolveTileWidth * kTileDirectHostResolveTileHeight);
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    desc->colorAttachments()->object(i)->setPixelFormat(
+        key.color_attachment_formats[i]);
+  }
+
+  NS::Error* error = nullptr;
+  MTL::RenderPipelineState* pipeline = device_->newRenderPipelineState(
+      desc, MTL::PipelineOptionNone,
+      static_cast<MTL::AutoreleasedRenderPipelineReflection*>(nullptr), &error);
+  desc->release();
+  tile_function->release();
+  if (!pipeline) {
+    XELOGE(
+        "MetalRenderTargetCache: failed to create tile direct host resolve "
+        "pipeline: {}",
+        error && error->localizedDescription()
+            ? error->localizedDescription()->utf8String()
+            : "unknown error");
+    return nullptr;
+  }
+
+  tile_direct_host_resolve_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+// TODO(xenios-jp): Keep the tile direct-host resolve telemetry tied to the
+// semantic buckets, not just to Metal implementation failures.
+//
+// Existing direct-host counters:
+// - direct_host_attempt/success: copy exports covered by the current
+//   host-texture-to-guest-memory direct resolve path.
+// - direct_host_reject_gamma/exp_bias/format_mismatch/sample_select/
+//   depth_no_fast: semantic cases where the existing direct-host path does not
+//   promise byte-identical Xenos output.
+//
+// Tile-path eligibility counters:
+// - tile_candidate_total/accept: direct-host-safe copies that are also
+//   source-side candidates for doing the export before the active render pass
+//   stores the attachment.
+// - tile_accept_fast: currently implemented. This is the fast bitwise color
+//   subset with one fully covered source rectangle, a single sample select, no
+//   gamma or exponent bias, no scaled resolve, a non-uint transfer view, and a
+//   source that is the current color attachment.
+// - tile_accept_full_color: technically possible but not implemented here yet.
+//   It needs the full resolve_host_color path ported to tile/imageblock code.
+// - tile_reject_source_not_current_rt/multi_source_rect: not tile-local enough
+//   for this prototype. Multi-rect/alias cases need either the old compute path
+//   or a different per-rectangle strategy.
+// - tile_reject_depth: possible only with a separate depth/stencil tile path
+//   that preserves Xenos depth rounding/layout rules; not a color-path tweak.
+// - tile_reject_copy_clear: should become a deferred EDRAM ownership/clear
+//   transaction. It is not just a copy shader variant because the clear is a
+//   later visibility rule.
+// - tile_reject_uint_transfer_view: technically possible only if the tile
+//   shader gets a uint/packed path that exactly matches the transfer view. Keep
+//   rejected until that representation is proven.
+//
+// Tile execution counters:
+// - tile_execute_attempt/success/reject measure the live in-pass replacement
+//   of "end render encoder -> compute direct-host resolve".
+// - tile_execute_reject_no_active means telemetry says the copy was source-side
+//   eligible, but by execution time there was no active render encoder left.
+//   Fixing this is scheduling/lifetime work, not shader work.
+// - tile_execute_reject_full_color/depth/copy_clear/uint/format mirror the
+//   feasibility buckets above and are the main "not covered yet" cases seen in
+//   current traces.
+//
+// Store elision:
+// - store_dontcare_eligible is only source-side eligibility: "if liveness later
+//   proves this host RT does not escape, the tile path could discard the color
+//   attachment store".
+// - store_dontcare_skipped_disabled/attempt/applied explain why source-eligible
+//   cases did or did not call setColorStoreAction(DontCare). The call is
+//   mechanically easy, but semantically valid only when no later host-RT
+//   observer needs the attachment contents. Until RT liveness is proven,
+//   metal_tile_direct_host_resolve_dontcare_store is an opt-in trace
+//   experiment, not the default behavior.
+//
+// Representative prototype telemetry:
+// - Fast subset covered: 360/360 in one sample, 478/480 in another; the missing
+//   fast cases were no-active-encoder timing, not shader capability.
+// - Not-yet-covered recurring buckets: full_color, depth, copy_clear, uint
+//   transfer view, format mismatch, and no_active scheduling.
+bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
+    const ResolvePlan& resolve_plan,
+    MTL::RenderCommandEncoder* active_render_encoder,
+    MTL::RenderPassDescriptor* active_render_pass_descriptor,
+    uint32_t& written_address, uint32_t& written_length) {
+  written_address = 0;
+  written_length = 0;
+  if (!::cvars::metal_tile_direct_host_resolve ||
+      !::cvars::metal_direct_host_resolve) {
+    return false;
+  }
+  TelemetryStats::ResolveDirectHostTelemetry& direct_telemetry =
+      telemetry_.resolve_direct_host;
+  ++direct_telemetry.tile_execute_attempt;
+  auto reject = [&]() {
+    ++direct_telemetry.tile_execute_reject;
+    return false;
+  };
+  auto reject_with = [&](uint64_t& counter) {
+    ++counter;
+    return reject();
+  };
+
+  if (GetPath() != Path::kHostRenderTargets || !resolve_plan.valid ||
+      resolve_plan.noop || !resolve_plan.needs_copy_export) {
+    return reject_with(direct_telemetry.tile_execute_reject_invalid);
+  }
+  if (!active_render_encoder || !active_render_pass_descriptor) {
+    return reject_with(direct_telemetry.tile_execute_reject_no_active);
+  }
+  if (resolve_plan.needs_resolve_clear) {
+    return reject_with(direct_telemetry.tile_execute_reject_copy_clear);
+  }
+  if (IsDrawResolutionScaled()) {
+    return reject_with(direct_telemetry.tile_execute_reject_scaled);
+  }
+
+  const draw_util::ResolveInfo& resolve_info = resolve_plan.resolve_info;
+  if (resolve_info.IsCopyingDepth()) {
+    return reject_with(direct_telemetry.tile_execute_reject_depth);
+  }
+
+  draw_util::ResolveCopyShaderConstants copy_constants;
+  uint32_t group_count_x = 0, group_count_y = 0;
+  draw_util::ResolveCopyShaderIndex copy_shader =
+      resolve_info.GetCopyShader(draw_resolution_scale_x(),
+                                 draw_resolution_scale_y(), copy_constants,
+                                 group_count_x, group_count_y);
+  if (!group_count_x || !group_count_y) {
+    return reject_with(direct_telemetry.tile_execute_reject_shader);
+  }
+  if (!IsResolveDirectHostRTFastCandidate(copy_shader)) {
+    return reject_with(IsResolveDirectHostRTFullColorCandidate(copy_shader)
+                           ? direct_telemetry.tile_execute_reject_full_color
+                           : direct_telemetry.tile_execute_reject_shader);
+  }
+
+  xenos::ColorRenderTargetFormat resolve_color_format =
+      xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format);
+  if (resolve_color_format ==
+      xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+    return reject_with(direct_telemetry.tile_execute_reject_gamma);
+  }
+  xenos::CopySampleSelect sample_select =
+      resolve_info.copy_dest_coordinate_info.copy_sample_select;
+  if (!xenos::IsSingleCopySampleSelected(sample_select)) {
+    return reject_with(direct_telemetry.tile_execute_reject_sample_select);
+  }
+  if (resolve_info.copy_dest_info.copy_dest_exp_bias) {
+    return reject_with(direct_telemetry.tile_execute_reject_exp_bias);
+  }
+  if (!xenos::IsColorResolveFormatBitwiseEquivalent(
+          resolve_color_format,
+          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+    return reject_with(direct_telemetry.tile_execute_reject_format_mismatch);
+  }
+
+  uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows,
+                                    dump_pitch);
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
+                                 dump_pitch, rectangles);
+  if (rectangles.size() != 1) {
+    return reject_with(direct_telemetry.tile_execute_reject_multi_source_rect);
+  }
+  const ResolveCopyDumpRectangle& rect = rectangles[0];
+  if (!rect.rows || rect.row_last_end <= rect.row_first_start) {
+    return reject_with(direct_telemetry.tile_execute_reject_multi_source_rect);
+  }
+  uint64_t covered_tiles = 0;
+  if (rect.rows == 1) {
+    covered_tiles = rect.row_last_end - rect.row_first_start;
+  } else {
+    covered_tiles = dump_row_length_used - rect.row_first_start;
+    covered_tiles += uint64_t(rect.rows - 2) * dump_row_length_used;
+    covered_tiles += rect.row_last_end;
+  }
+  uint64_t required_tiles = uint64_t(dump_row_length_used) * dump_rows;
+  if (covered_tiles != required_tiles) {
+    return reject_with(direct_telemetry.tile_execute_reject_multi_source_rect);
+  }
+
+  auto* rt = static_cast<MetalRenderTarget*>(rect.render_target);
+  if (!rt) {
+    return reject_with(
+        direct_telemetry.tile_execute_reject_source_not_current_rt);
+  }
+  RenderTargetKey key = rt->key();
+  if (key.is_depth || key.GetColorFormat() != resolve_color_format ||
+      key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
+    return reject_with(direct_telemetry.tile_execute_reject_format_mismatch);
+  }
+
+  bool source_is_uint = false;
+  GetColorOwnershipTransferPixelFormat(key.GetColorFormat(), &source_is_uint);
+  if (source_is_uint) {
+    return reject_with(direct_telemetry.tile_execute_reject_uint_transfer_view);
+  }
+
+  uint32_t selected_sample = uint32_t(sample_select);
+  if (key.msaa_samples == xenos::MsaaSamples::k2X && selected_sample > 1) {
+    return reject_with(direct_telemetry.tile_execute_reject_sample_select);
+  }
+
+  uint32_t color_attachment_index = xenos::kMaxColorRenderTargets;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (current_color_targets_[i] == rt) {
+      color_attachment_index = i;
+      break;
+    }
+  }
+  if (color_attachment_index >= xenos::kMaxColorRenderTargets) {
+    return reject_with(
+        direct_telemetry.tile_execute_reject_source_not_current_rt);
+  }
+
+  MTL::Texture* source_texture = rt->draw_texture();
+  if (!source_texture ||
+      source_texture->pixelFormat() !=
+          GetColorDrawPixelFormat(key.GetColorFormat())) {
+    return reject_with(direct_telemetry.tile_execute_reject_texture);
+  }
+  MTL::RenderPassColorAttachmentDescriptor* color_attachment =
+      active_render_pass_descriptor->colorAttachments()->object(
+          color_attachment_index);
+  if (!color_attachment || color_attachment->texture() != source_texture) {
+    return reject_with(direct_telemetry.tile_execute_reject_attachment);
+  }
+
+  TransferAttachmentFormats attachment_formats;
+  if (!GetActiveTransferAttachmentFormats(active_render_pass_descriptor,
+                                          attachment_formats)) {
+    return reject_with(direct_telemetry.tile_execute_reject_attachment);
+  }
+  MTL::RenderPipelineState* pipeline = GetOrCreateTileDirectHostResolvePipeline(
+      color_attachment_index, uint32_t(source_texture->sampleCount()),
+      attachment_formats.color_attachment_formats);
+  if (!pipeline) {
+    return reject_with(direct_telemetry.tile_execute_reject_pipeline);
+  }
+
+  auto* shared = command_processor_.shared_memory();
+  MTL::Buffer* destination_buffer = shared ? shared->GetBuffer() : nullptr;
+  if (!destination_buffer) {
+    return reject_with(direct_telemetry.tile_execute_reject_dest_buffer);
+  }
+
+  struct TileDirectHostResolveConstants {
+    uint32_t edram_info;
+    uint32_t coordinate_info;
+    uint32_t dest_info;
+    uint32_t dest_coordinate_info;
+    uint32_t dest_base;
+    uint32_t dump_base;
+    uint32_t dump_pitch_tiles;
+    uint32_t dump_row_length_used;
+    uint32_t dump_rows;
+    uint32_t rect_row_first;
+    uint32_t rect_rows;
+    uint32_t rect_row_first_start;
+    uint32_t rect_row_last_end;
+    uint32_t source_base_tiles;
+    uint32_t source_pitch_tiles;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t height_scaled;
+    uint32_t msaa_2x_sample_0;
+    uint32_t msaa_2x_sample_1;
+    uint32_t msaa_samples;
+    uint32_t is_64bpp;
+    uint32_t source_format;
+    uint32_t padding;
+  };
+  static_assert_size(TileDirectHostResolveConstants, 24 * sizeof(uint32_t));
+
+  TileDirectHostResolveConstants constants = {};
+  constants.edram_info = copy_constants.dest_relative.edram_info.packed;
+  constants.coordinate_info =
+      copy_constants.dest_relative.coordinate_info.packed;
+  constants.dest_info = copy_constants.dest_relative.dest_info.value;
+  constants.dest_coordinate_info =
+      copy_constants.dest_relative.dest_coordinate_info.packed;
+  constants.dest_base = copy_constants.dest_base;
+  constants.dump_base = dump_base;
+  constants.dump_pitch_tiles = dump_pitch;
+  constants.dump_row_length_used = dump_row_length_used;
+  constants.dump_rows = dump_rows;
+  constants.rect_row_first = rect.row_first;
+  constants.rect_rows = rect.rows;
+  constants.rect_row_first_start = rect.row_first_start;
+  constants.rect_row_last_end = rect.row_last_end;
+  constants.source_base_tiles = key.base_tiles;
+  constants.source_pitch_tiles = key.GetPitchTiles();
+  constants.source_width = uint32_t(source_texture->width());
+  constants.source_height = uint32_t(source_texture->height());
+  constants.height_scaled =
+      resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  constants.msaa_2x_sample_0 =
+      draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_);
+  constants.msaa_2x_sample_1 =
+      draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_);
+  constants.msaa_samples = uint32_t(key.msaa_samples);
+  constants.is_64bpp = key.Is64bpp() ? 1u : 0u;
+  constants.source_format = uint32_t(key.GetColorFormat());
+
+  ++telemetry_.resolve_execute_calls;
+  command_processor_.SetSwapDestSwap(
+      resolve_info.copy_dest_base, resolve_info.copy_dest_info.copy_dest_swap);
+
+  PushEncoderDebugGroup(
+      active_render_encoder,
+      fmt::format("{} color{} dest=shared_memory",
+                  kDirectHostResolveEncoderLabel, color_attachment_index));
+  active_render_encoder->setRenderPipelineState(pipeline);
+  active_render_encoder->setTileBytes(&constants, sizeof(constants), 0);
+  active_render_encoder->setTileBuffer(destination_buffer, 0, 1);
+  active_render_encoder->useResource(destination_buffer, MTL::ResourceUsageWrite,
+                                     MTL::RenderStageTile);
+  active_render_encoder->dispatchThreadsPerTile(MTL::Size::Make(
+      kTileDirectHostResolveTileWidth, kTileDirectHostResolveTileHeight, 1));
+  active_render_encoder->popDebugGroup();
+
+  written_address = resolve_info.copy_dest_extent_start;
+  written_length = resolve_info.copy_dest_extent_length;
+  command_processor_.MarkSharedMemoryRenderWritePending(
+      written_address, written_length, MTL::RenderStageTile);
+  if (auto* texture_cache = command_processor_.texture_cache()) {
+    texture_cache->MarkRangeAsResolved(written_address, written_length);
+  }
+
+  ++direct_telemetry.direct_host_attempt;
+  ++direct_telemetry.direct_host_success;
+  ++direct_telemetry.tile_candidate_total;
+  ++direct_telemetry.tile_accept;
+  ++direct_telemetry.tile_accept_fast;
+  ++direct_telemetry.store_dontcare_eligible;
+  if (::cvars::metal_tile_direct_host_resolve_dontcare_store) {
+    ++direct_telemetry.store_dontcare_attempt;
+    active_render_encoder->setColorStoreAction(MTL::StoreActionDontCare,
+                                               color_attachment_index);
+    ++direct_telemetry.store_dontcare_applied;
+  } else {
+    ++direct_telemetry.store_dontcare_skipped_disabled;
+  }
+  ++direct_telemetry.tile_execute_success;
   return true;
 }
 
@@ -5430,7 +6327,8 @@ bool MetalRenderTargetCache::Resolve(
       if (direct_host_resolve_enabled &&
           TryDirectHostResolveCopy(resolve_info, copy_constants, copy_shader,
                                    dump_base, dump_row_length_used, dump_rows,
-                                   dump_pitch, command_buffer, written_address,
+                                   dump_pitch, resolve_plan.needs_resolve_clear,
+                                   command_buffer, written_address,
                                    written_length)) {
         copy_succeeded = true;
       } else {

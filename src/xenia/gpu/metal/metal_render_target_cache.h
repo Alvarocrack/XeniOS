@@ -214,6 +214,50 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   static constexpr size_t kRenderPassCompatibilityReasonCount =
       static_cast<size_t>(RenderPassCompatibilityReason::kCount);
   struct TelemetryStats {
+    struct ResolveDirectHostTelemetry {
+      uint64_t direct_host_attempt = 0;
+      uint64_t direct_host_success = 0;
+      uint64_t direct_host_reject_gamma = 0;
+      uint64_t direct_host_reject_exp_bias = 0;
+      uint64_t direct_host_reject_format_mismatch = 0;
+      uint64_t direct_host_reject_sample_select = 0;
+      uint64_t direct_host_reject_depth_no_fast = 0;
+      uint64_t tile_candidate_total = 0;
+      uint64_t tile_reject_source_not_current_rt = 0;
+      uint64_t tile_reject_multi_source_rect = 0;
+      uint64_t tile_reject_depth = 0;
+      uint64_t tile_reject_copy_clear = 0;
+      uint64_t tile_reject_uint_transfer_view = 0;
+      uint64_t tile_accept = 0;
+      uint64_t tile_accept_fast = 0;
+      uint64_t tile_accept_full_color = 0;
+      uint64_t tile_execute_attempt = 0;
+      uint64_t tile_execute_success = 0;
+      uint64_t tile_execute_reject = 0;
+      uint64_t tile_execute_reject_invalid = 0;
+      uint64_t tile_execute_reject_no_active = 0;
+      uint64_t tile_execute_reject_scaled = 0;
+      uint64_t tile_execute_reject_copy_clear = 0;
+      uint64_t tile_execute_reject_depth = 0;
+      uint64_t tile_execute_reject_shader = 0;
+      uint64_t tile_execute_reject_full_color = 0;
+      uint64_t tile_execute_reject_gamma = 0;
+      uint64_t tile_execute_reject_sample_select = 0;
+      uint64_t tile_execute_reject_exp_bias = 0;
+      uint64_t tile_execute_reject_format_mismatch = 0;
+      uint64_t tile_execute_reject_multi_source_rect = 0;
+      uint64_t tile_execute_reject_source_not_current_rt = 0;
+      uint64_t tile_execute_reject_uint_transfer_view = 0;
+      uint64_t tile_execute_reject_texture = 0;
+      uint64_t tile_execute_reject_attachment = 0;
+      uint64_t tile_execute_reject_pipeline = 0;
+      uint64_t tile_execute_reject_dest_buffer = 0;
+      uint64_t store_dontcare_eligible = 0;
+      uint64_t store_dontcare_skipped_disabled = 0;
+      uint64_t store_dontcare_attempt = 0;
+      uint64_t store_dontcare_applied = 0;
+    };
+
     uint64_t render_pass_descriptor_requests = 0;
     uint64_t render_pass_descriptor_cache_hits = 0;
     uint64_t render_pass_descriptor_rebuilds = 0;
@@ -254,6 +298,7 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     uint64_t resolve_plan_needs_encoder_end = 0;
     uint64_t resolve_plan_no_encoder_end = 0;
     uint64_t resolve_execute_calls = 0;
+    ResolveDirectHostTelemetry resolve_direct_host = {};
 
     uint64_t perform_transfer_calls = 0;
     uint64_t perform_transfer_active_encoder_calls = 0;
@@ -318,6 +363,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
                uint32_t& written_length,
                MTL::CommandBuffer* command_buffer = nullptr,
                const ResolvePlan* prepared_resolve_plan = nullptr);
+  bool TryTileDirectHostResolveCopy(
+      const ResolvePlan& resolve_plan,
+      MTL::RenderCommandEncoder* active_render_encoder,
+      MTL::RenderPassDescriptor* active_render_pass_descriptor,
+      uint32_t& written_address, uint32_t& written_length);
 
  protected:
   // Virtual methods from RenderTargetCache
@@ -399,6 +449,38 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::ComputePipelineState*
       direct_host_depth_resolve_pipelines_[kDirectHostResolveMsaaCount]
                                           [kDirectHostResolveScaledCount] = {};
+
+  struct TileDirectHostResolvePipelineKey {
+    uint32_t color_attachment_index = 0;
+    uint32_t sample_count = 1;
+    std::array<MTL::PixelFormat, xenos::kMaxColorRenderTargets>
+        color_attachment_formats = {};
+
+    bool operator==(const TileDirectHostResolvePipelineKey& other) const {
+      return color_attachment_index == other.color_attachment_index &&
+             sample_count == other.sample_count &&
+             color_attachment_formats == other.color_attachment_formats;
+    }
+
+    struct Hasher {
+      size_t operator()(const TileDirectHostResolvePipelineKey& key) const {
+        auto combine = [](size_t seed, size_t value) {
+          return seed ^ (value + 0x9E3779B9 + (seed << 6) + (seed >> 2));
+        };
+        size_t h = key.color_attachment_index;
+        h = combine(h, key.sample_count);
+        for (MTL::PixelFormat color_format : key.color_attachment_formats) {
+          h = combine(h, size_t(color_format));
+        }
+        return h;
+      }
+    };
+  };
+  MTL::Library* tile_direct_host_resolve_library_ = nullptr;
+  std::unordered_map<TileDirectHostResolvePipelineKey,
+                     MTL::RenderPipelineState*,
+                     TileDirectHostResolvePipelineKey::Hasher>
+      tile_direct_host_resolve_pipelines_;
 
   // Host depth store compute shaders (1x/2x/4x MSAA).
   MTL::ComputePipelineState* host_depth_store_pipelines_[3] = {};
@@ -824,8 +906,12 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       const draw_util::ResolveCopyShaderConstants& copy_constants,
       draw_util::ResolveCopyShaderIndex copy_shader, uint32_t dump_base,
       uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
-      MTL::CommandBuffer* command_buffer, uint32_t& written_address,
-      uint32_t& written_length);
+      bool resolve_has_clear, MTL::CommandBuffer* command_buffer,
+      uint32_t& written_address, uint32_t& written_length);
+  MTL::Library* GetOrCreateTileDirectHostResolveLibrary();
+  MTL::RenderPipelineState* GetOrCreateTileDirectHostResolvePipeline(
+      uint32_t color_attachment_index, uint32_t sample_count,
+      const TransferColorAttachmentFormats& color_attachment_formats);
   struct ResolveDestinationBuffer {
     MTL::Buffer* buffer = nullptr;
     size_t offset = 0;

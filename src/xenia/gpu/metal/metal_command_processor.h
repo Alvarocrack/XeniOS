@@ -202,6 +202,8 @@ class MetalCommandProcessor final : public CommandProcessor {
 
   void MarkSharedMemoryComputeWritePending(
       uint32_t address, uint32_t length, MTL::ComputeCommandEncoder* encoder);
+  void MarkSharedMemoryRenderWritePending(uint32_t address, uint32_t length,
+                                          MTL::RenderStages stages);
   bool PrepareSharedMemoryComputeReadDependency(
       const SharedMemoryRange* ranges, uint32_t range_count,
       bool consumer_can_join_current_submission,
