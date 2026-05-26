@@ -702,6 +702,9 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     return false;
   }
 
+  // TODO (xenios-jp): Move this exact range preflight earlier in draw setup so
+  // texture uploads stay ordered before the render encoder is opened instead
+  // of ending an active encoder when outdated texture data is discovered late.
   return shared_memory().RequestRanges(ranges.data(),
                                        static_cast<uint32_t>(ranges.size()));
 }
