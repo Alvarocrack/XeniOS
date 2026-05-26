@@ -2378,6 +2378,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   const bool has_texture_request_work =
       texture_cache_ && used_texture_mask && texture_request_work_mask;
+  const bool may_texture_request_load_data =
+      has_texture_request_work &&
+      texture_cache_->MayRequestTexturesLoadData(used_texture_mask);
   if (has_texture_request_work) {
     ++backend_telemetry_.texture_request_work_draws;
     backend_telemetry_.texture_request_work_mask_or |= texture_request_work_mask;
@@ -2401,15 +2404,25 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
     } else {
       ++backend_telemetry_.texture_request_work_pass_compatible;
+      if (may_texture_request_load_data) {
+        // Texture uploads may read shared memory and mutate Metal textures that
+        // prior draws in the still-open render encoder may also sample. Match
+        // the D3D12/Vulkan command-stream ordering by closing the encoder
+        // before RequestTextures, so the upload joins the current command buffer
+        // after previous draws and before this draw. Descriptor-only texture
+        // request work does not need this boundary.
+        // TODO (xenios-jp): Replace this conservative boundary with bounded
+        // preflight/lookahead so compatible draw runs can keep the render
+        // encoder open without reordering texture upload work.
+        EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
+      }
     }
   }
 
   bool requested_textures_before_render_encoder = false;
   if (has_texture_request_work && !current_render_encoder_) {
-    // Join upload compute/blit work into the current submission only when no
-    // render encoder is active. Ending an active encoder here creates extra
-    // tile store/load churn on Apple GPUs, so active-pass texture loads keep
-    // their existing standalone fallback.
+    // Join upload compute/blit work into the current submission before opening
+    // the render encoder for this draw.
     if (!EnsureCommandBuffer()) {
       return false;
     }
@@ -2570,6 +2583,14 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   if (has_texture_request_work && !requested_textures_before_render_encoder) {
+    if (current_render_encoder_ && may_texture_request_load_data) {
+      // Fallback for paths that could not request textures in the main
+      // pre-render-encoder block, such as missing draw-pass descriptors.
+      EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
+    }
+    if (!EnsureCommandBuffer()) {
+      return false;
+    }
     texture_cache_->RequestTextures(used_texture_mask);
     ++backend_telemetry_.texture_requests_after_encoder_begin;
   }
