@@ -6730,381 +6730,395 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     return;
   }
 
-  xe::RingBuffer warm_reader = reader_;
-  RegisterFile warm_regs = *register_file_;
-  uint64_t warm_bin_select = bin_select_;
-  uint64_t warm_bin_mask = bin_mask_;
-  std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges> warm_ranges;
-  uint32_t warm_range_count = 0;
-  std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>
-      warm_index_ranges;
-  uint32_t warm_index_range_count = 0;
-  uint32_t warm_draw_count = 0;
-  VertexFetchWarmerStopReason stop_reason =
-      VertexFetchWarmerStopReason::kRingEnd;
+  struct WarmScanResult {
+    std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>
+        vertex_ranges;
+    std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>
+        index_ranges;
+    uint32_t vertex_range_count = 0;
+    uint32_t index_range_count = 0;
+    uint32_t draw_count = 0;
+    VertexFetchWarmerStopReason stop_reason =
+        VertexFetchWarmerStopReason::kRingEnd;
 
-  auto stop_with = [&](VertexFetchWarmerStopReason reason) {
-    stop_reason = reason;
-    return false;
+    bool has_ranges() const { return vertex_range_count || index_range_count; }
   };
-  auto stop_unsupported_no_packet = [&]() {
-    ++backend_telemetry_.vertex_fetch_warmer_unsupported_no_packet;
-    return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
-  };
-  auto mark_unsupported_packet = [&](uint32_t unsupported_packet,
-                                     uint32_t payload_dword_count) {
-    RecordVertexFetchWarmerUnsupportedPacket(unsupported_packet,
-                                             payload_dword_count);
-    stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
-  };
-  auto stop_unsupported_packet = [&](uint32_t unsupported_packet,
-                                     uint32_t payload_dword_count) {
-    mark_unsupported_packet(unsupported_packet, payload_dword_count);
-    return false;
-  };
-  auto has_dwords = [&](uint32_t dword_count) {
-    return warm_reader.read_count() >= dword_count * sizeof(uint32_t);
-  };
-  auto append_invalid_range =
-      [&](std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>&
-              ranges,
-          uint32_t& range_count, uint32_t start, uint32_t length) {
-        if (!length || shared_memory_->IsRangeValid(start, length)) {
-          return true;
-        }
-        if (range_count >= ranges.size()) {
-          return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
-        }
-        ranges[range_count++] = {start, length};
-        return true;
-      };
-  auto append_future_dma_index_range = [&]() {
-    reg::VGT_DRAW_INITIATOR vgt_draw_initiator =
-        warm_regs.Get<reg::VGT_DRAW_INITIATOR>();
-    if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA) {
-      return true;
-    }
-    reg::VGT_DMA_SIZE vgt_dma_size = warm_regs.Get<reg::VGT_DMA_SIZE>();
-    uint32_t guest_index_count =
-        std::min(vgt_draw_initiator.num_indices, vgt_dma_size.num_words);
-    if (!guest_index_count) {
-      return true;
-    }
-    uint32_t index_size_log2 =
-        vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 1 : 2;
-    uint32_t guest_index_base =
-        warm_regs[XE_GPU_REG_VGT_DMA_BASE] & ~uint32_t((1u << index_size_log2) - 1);
-    uint32_t guest_index_bytes = guest_index_count << index_size_log2;
-    if (guest_index_base > SharedMemory::kBufferSize ||
-        SharedMemory::kBufferSize - guest_index_base < guest_index_bytes) {
-      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
-    }
-    return append_invalid_range(warm_index_ranges, warm_index_range_count,
-                                guest_index_base, guest_index_bytes);
-  };
-  auto append_future_draw_ranges = [&]() {
-    if (warm_regs.Get<reg::RB_MODECONTROL>().edram_mode ==
-        xenos::EdramMode::kCopy) {
-      return stop_with(VertexFetchWarmerStopReason::kMemoryOrWaitPacket);
-    }
-    if (!append_future_dma_index_range()) {
+
+  auto scan_warm_ranges = [&]() {
+    WarmScanResult result;
+    xe::RingBuffer warm_reader = reader_;
+    RegisterFile warm_regs = *register_file_;
+    uint64_t warm_bin_select = bin_select_;
+    uint64_t warm_bin_mask = bin_mask_;
+
+    auto stop_with = [&](VertexFetchWarmerStopReason reason) {
+      result.stop_reason = reason;
       return false;
-    }
-
-    std::array<SharedMemory::Range, kMaxVertexFetchSharedMemoryRanges>
-        draw_ranges;
-    uint32_t draw_range_count = 0;
-    if (!CollectVertexFetchSharedMemoryRanges(
-            warm_regs, vertex_shader, draw_ranges.data(),
-            uint32_t(draw_ranges.size()), &draw_range_count, false)) {
-      return stop_unsupported_no_packet();
-    }
-
-    for (uint32_t i = 0; i < draw_range_count; ++i) {
-      const SharedMemory::Range& range = draw_ranges[i];
-      if (!append_invalid_range(warm_ranges, warm_range_count, range.start,
-                                range.length)) {
+    };
+    auto stop_unsupported_no_packet = [&]() {
+      ++backend_telemetry_.vertex_fetch_warmer_unsupported_no_packet;
+      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+    };
+    auto mark_unsupported_packet = [&](uint32_t unsupported_packet,
+                                       uint32_t payload_dword_count) {
+      RecordVertexFetchWarmerUnsupportedPacket(unsupported_packet,
+                                               payload_dword_count);
+      result.stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+    };
+    auto stop_unsupported_packet = [&](uint32_t unsupported_packet,
+                                       uint32_t payload_dword_count) {
+      mark_unsupported_packet(unsupported_packet, payload_dword_count);
+      return false;
+    };
+    auto has_dwords = [&](uint32_t dword_count) {
+      return warm_reader.read_count() >= dword_count * sizeof(uint32_t);
+    };
+    auto append_invalid_range =
+        [&](std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>&
+                ranges,
+            uint32_t& range_count, uint32_t start, uint32_t length) {
+          if (!length || shared_memory_->IsRangeValid(start, length)) {
+            return true;
+          }
+          if (range_count >= ranges.size()) {
+            return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
+          }
+          ranges[range_count++] = {start, length};
+          return true;
+        };
+    auto append_future_dma_index_range = [&]() {
+      reg::VGT_DRAW_INITIATOR vgt_draw_initiator =
+          warm_regs.Get<reg::VGT_DRAW_INITIATOR>();
+      if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA) {
+        return true;
+      }
+      reg::VGT_DMA_SIZE vgt_dma_size = warm_regs.Get<reg::VGT_DMA_SIZE>();
+      uint32_t guest_index_count =
+          std::min(vgt_draw_initiator.num_indices, vgt_dma_size.num_words);
+      if (!guest_index_count) {
+        return true;
+      }
+      uint32_t index_size_log2 =
+          vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 1 : 2;
+      uint32_t guest_index_base = warm_regs[XE_GPU_REG_VGT_DMA_BASE] &
+                                  ~uint32_t((1u << index_size_log2) - 1);
+      uint32_t guest_index_bytes = guest_index_count << index_size_log2;
+      if (guest_index_base > SharedMemory::kBufferSize ||
+          SharedMemory::kBufferSize - guest_index_base < guest_index_bytes) {
+        return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+      }
+      return append_invalid_range(result.index_ranges, result.index_range_count,
+                                  guest_index_base, guest_index_bytes);
+    };
+    auto append_future_draw_ranges = [&]() {
+      if (warm_regs.Get<reg::RB_MODECONTROL>().edram_mode ==
+          xenos::EdramMode::kCopy) {
+        return stop_with(VertexFetchWarmerStopReason::kMemoryOrWaitPacket);
+      }
+      if (!append_future_dma_index_range()) {
         return false;
       }
-    }
 
-    ++warm_draw_count;
-    if (warm_draw_count >= kMetalVertexFetchWarmMaxDraws) {
-      return stop_with(VertexFetchWarmerStopReason::kMaxDraws);
-    }
-    return true;
-  };
-  auto parse_draw_packet = [&](uint32_t draw_packet,
-                               uint32_t payload_dword_count,
-                               uint32_t count_remaining) {
-    if (!count_remaining) {
-      return stop_unsupported_packet(draw_packet, payload_dword_count);
-    }
-    reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
-    vgt_draw_initiator.value = warm_reader.ReadAndSwap<uint32_t>();
-    --count_remaining;
-    if (!WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DRAW_INITIATOR,
-                                  vgt_draw_initiator.value)) {
-      return stop_unsupported_packet(draw_packet, payload_dword_count);
-    }
+      std::array<SharedMemory::Range, kMaxVertexFetchSharedMemoryRanges>
+          draw_ranges;
+      uint32_t draw_range_count = 0;
+      if (!CollectVertexFetchSharedMemoryRanges(
+              warm_regs, vertex_shader, draw_ranges.data(),
+              uint32_t(draw_ranges.size()), &draw_range_count, false)) {
+        return stop_unsupported_no_packet();
+      }
 
-    switch (vgt_draw_initiator.source_select) {
-      case xenos::SourceSelect::kDMA: {
-        if (count_remaining < 2) {
-          return stop_unsupported_packet(draw_packet, payload_dword_count);
+      for (uint32_t i = 0; i < draw_range_count; ++i) {
+        const SharedMemory::Range& range = draw_ranges[i];
+        if (!append_invalid_range(result.vertex_ranges,
+                                  result.vertex_range_count, range.start,
+                                  range.length)) {
+          return false;
         }
-        uint32_t vgt_dma_base = warm_reader.ReadAndSwap<uint32_t>();
-        reg::VGT_DMA_SIZE vgt_dma_size;
-        vgt_dma_size.value = warm_reader.ReadAndSwap<uint32_t>();
-        count_remaining -= 2;
-        if (!WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DMA_BASE,
-                                      vgt_dma_base) ||
-            !WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DMA_SIZE,
-                                      vgt_dma_size.value)) {
-          return stop_unsupported_packet(draw_packet, payload_dword_count);
-        }
-      } break;
-      case xenos::SourceSelect::kAutoIndex:
-        break;
-      default:
+      }
+
+      ++result.draw_count;
+      if (result.draw_count >= kMetalVertexFetchWarmMaxDraws) {
+        return stop_with(VertexFetchWarmerStopReason::kMaxDraws);
+      }
+      return true;
+    };
+    auto parse_draw_packet = [&](uint32_t draw_packet,
+                                 uint32_t payload_dword_count,
+                                 uint32_t count_remaining) {
+      if (!count_remaining) {
         return stop_unsupported_packet(draw_packet, payload_dword_count);
-    }
+      }
+      reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+      vgt_draw_initiator.value = warm_reader.ReadAndSwap<uint32_t>();
+      --count_remaining;
+      if (!WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DRAW_INITIATOR,
+                                    vgt_draw_initiator.value)) {
+        return stop_unsupported_packet(draw_packet, payload_dword_count);
+      }
 
-    warm_reader.AdvanceRead(count_remaining * sizeof(uint32_t));
-    return append_future_draw_ranges();
-  };
+      switch (vgt_draw_initiator.source_select) {
+        case xenos::SourceSelect::kDMA: {
+          if (count_remaining < 2) {
+            return stop_unsupported_packet(draw_packet, payload_dword_count);
+          }
+          uint32_t vgt_dma_base = warm_reader.ReadAndSwap<uint32_t>();
+          reg::VGT_DMA_SIZE vgt_dma_size;
+          vgt_dma_size.value = warm_reader.ReadAndSwap<uint32_t>();
+          count_remaining -= 2;
+          if (!WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DMA_BASE,
+                                        vgt_dma_base) ||
+              !WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DMA_SIZE,
+                                        vgt_dma_size.value)) {
+            return stop_unsupported_packet(draw_packet, payload_dword_count);
+          }
+        } break;
+        case xenos::SourceSelect::kAutoIndex:
+          break;
+        default:
+          return stop_unsupported_packet(draw_packet, payload_dword_count);
+      }
 
-  while (true) {
-    if (!has_dwords(1)) {
-      stop_reason = VertexFetchWarmerStopReason::kRingEnd;
-      break;
-    }
+      warm_reader.AdvanceRead(count_remaining * sizeof(uint32_t));
+      return append_future_draw_ranges();
+    };
 
-    uint32_t packet = warm_reader.ReadAndSwap<uint32_t>();
-    if (!packet || packet == 0x0BADF00D) {
-      continue;
-    }
-
-    uint32_t packet_type = packet >> 30;
-    if (packet_type == 2) {
-      continue;
-    }
-
-    if (packet_type == 0) {
-      uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-      if (!has_dwords(count)) {
-        stop_reason = VertexFetchWarmerStopReason::kRingEnd;
+    while (true) {
+      if (!has_dwords(1)) {
+        result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
         break;
       }
-      uint32_t base_index = packet & 0x7FFF;
-      uint32_t write_one_reg = (packet >> 15) & 0x1;
-      bool wrote = write_one_reg
-                       ? WriteSpeculativeOneRegisterFromRing(
-                             &warm_reader, warm_regs, base_index, count)
-                       : WriteSpeculativeRegisterRangeFromRing(
-                             &warm_reader, warm_regs, base_index, count);
-      if (!wrote) {
-        mark_unsupported_packet(packet, count);
-        break;
-      }
-      continue;
-    }
 
-    if (packet_type == 1) {
-      if (!has_dwords(2)) {
-        stop_reason = VertexFetchWarmerStopReason::kRingEnd;
-        break;
-      }
-      uint32_t reg_index_1 = packet & 0x7FF;
-      uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
-      uint32_t reg_data_1 = warm_reader.ReadAndSwap<uint32_t>();
-      uint32_t reg_data_2 = warm_reader.ReadAndSwap<uint32_t>();
-      if (!WriteSpeculativeRegister(warm_regs, reg_index_1, reg_data_1) ||
-          !WriteSpeculativeRegister(warm_regs, reg_index_2, reg_data_2)) {
-        mark_unsupported_packet(packet, 2);
-        break;
-      }
-      continue;
-    }
-
-    uint32_t opcode = (packet >> 8) & 0x7F;
-    uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-    if (!has_dwords(count)) {
-      stop_reason = VertexFetchWarmerStopReason::kRingEnd;
-      break;
-    }
-
-    if (packet & 1) {
-      bool any_pass = (warm_bin_select & warm_bin_mask) != 0;
-      if (!any_pass || opcode == xenos::PM4_XE_SWAP) {
-        warm_reader.AdvanceRead(count * sizeof(uint32_t));
+      uint32_t packet = warm_reader.ReadAndSwap<uint32_t>();
+      if (!packet || packet == 0x0BADF00D) {
         continue;
       }
-    }
 
-    switch (opcode) {
-      case xenos::PM4_NOP:
-        warm_reader.AdvanceRead(count * sizeof(uint32_t));
-        break;
-      case xenos::PM4_SET_BIN_MASK_LO:
-      case xenos::PM4_SET_BIN_MASK_HI:
-      case xenos::PM4_SET_BIN_SELECT_LO:
-      case xenos::PM4_SET_BIN_SELECT_HI: {
-        if (count < 1) {
+      uint32_t packet_type = packet >> 30;
+      if (packet_type == 2) {
+        continue;
+      }
+
+      if (packet_type == 0) {
+        uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+        if (!has_dwords(count)) {
+          result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
+          break;
+        }
+        uint32_t base_index = packet & 0x7FFF;
+        uint32_t write_one_reg = (packet >> 15) & 0x1;
+        bool wrote = write_one_reg
+                         ? WriteSpeculativeOneRegisterFromRing(
+                               &warm_reader, warm_regs, base_index, count)
+                         : WriteSpeculativeRegisterRangeFromRing(
+                               &warm_reader, warm_regs, base_index, count);
+        if (!wrote) {
           mark_unsupported_packet(packet, count);
-          goto finish_parse;
+          break;
         }
-        uint32_t value = warm_reader.ReadAndSwap<uint32_t>();
-        switch (opcode) {
-          case xenos::PM4_SET_BIN_MASK_LO:
-            warm_bin_mask = (warm_bin_mask & 0xFFFFFFFF00000000ull) | value;
-            break;
-          case xenos::PM4_SET_BIN_MASK_HI:
-            warm_bin_mask =
-                (warm_bin_mask & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-            break;
-          case xenos::PM4_SET_BIN_SELECT_LO:
-            warm_bin_select =
-                (warm_bin_select & 0xFFFFFFFF00000000ull) | value;
-            break;
-          case xenos::PM4_SET_BIN_SELECT_HI:
-            warm_bin_select =
-                (warm_bin_select & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-            break;
+        continue;
+      }
+
+      if (packet_type == 1) {
+        if (!has_dwords(2)) {
+          result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
+          break;
         }
-        warm_reader.AdvanceRead((count - 1) * sizeof(uint32_t));
-      } break;
-      case xenos::PM4_SET_BIN_MASK:
-      case xenos::PM4_SET_BIN_SELECT: {
-        if (count < 2) {
-          mark_unsupported_packet(packet, count);
-          goto finish_parse;
+        uint32_t reg_index_1 = packet & 0x7FF;
+        uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
+        uint32_t reg_data_1 = warm_reader.ReadAndSwap<uint32_t>();
+        uint32_t reg_data_2 = warm_reader.ReadAndSwap<uint32_t>();
+        if (!WriteSpeculativeRegister(warm_regs, reg_index_1, reg_data_1) ||
+            !WriteSpeculativeRegister(warm_regs, reg_index_2, reg_data_2)) {
+          mark_unsupported_packet(packet, 2);
+          break;
         }
-        uint64_t val_hi = warm_reader.ReadAndSwap<uint32_t>();
-        uint64_t val_lo = warm_reader.ReadAndSwap<uint32_t>();
-        if (opcode == xenos::PM4_SET_BIN_MASK) {
-          warm_bin_mask = (val_hi << 32) | val_lo;
-        } else {
-          warm_bin_select = (val_hi << 32) | val_lo;
-        }
-        warm_reader.AdvanceRead((count - 2) * sizeof(uint32_t));
-      } break;
-      case xenos::PM4_SET_BIN_BASE_OFFSET:
-      case xenos::PM4_CONTEXT_UPDATE:
-        // These packets do not affect register state or guest-memory read
-        // residency, so the bounded preflight can safely step over them.
-        warm_reader.AdvanceRead(count * sizeof(uint32_t));
+        continue;
+      }
+
+      uint32_t opcode = (packet >> 8) & 0x7F;
+      uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+      if (!has_dwords(count)) {
+        result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
         break;
-      case xenos::PM4_SET_CONSTANT: {
-        uint32_t offset_type = warm_reader.ReadAndSwap<uint32_t>();
-        uint32_t index = offset_type & 0x7FF;
-        uint32_t constant_type = (offset_type >> 16) & 0xFF;
-        uint32_t countm1 = count - 1;
-        uint32_t base = 0;
-        switch (constant_type) {
-          case 0:
-            base = 0x4000 + index;
-            break;
-          case 1:
-            base = 0x4800 + index;
-            break;
-          case 2:
-            base = 0x4900 + index;
-            break;
-          case 3:
-            base = 0x4908 + index;
-            break;
-          case 4:
-            base = 0x2000 + index;
-            break;
-          default:
+      }
+
+      if (packet & 1) {
+        bool any_pass = (warm_bin_select & warm_bin_mask) != 0;
+        if (!any_pass || opcode == xenos::PM4_XE_SWAP) {
+          warm_reader.AdvanceRead(count * sizeof(uint32_t));
+          continue;
+        }
+      }
+
+      switch (opcode) {
+        case xenos::PM4_NOP:
+          warm_reader.AdvanceRead(count * sizeof(uint32_t));
+          break;
+        case xenos::PM4_SET_BIN_MASK_LO:
+        case xenos::PM4_SET_BIN_MASK_HI:
+        case xenos::PM4_SET_BIN_SELECT_LO:
+        case xenos::PM4_SET_BIN_SELECT_HI: {
+          if (count < 1) {
             mark_unsupported_packet(packet, count);
             goto finish_parse;
-        }
-        if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
-                                                   base, countm1)) {
+          }
+          uint32_t value = warm_reader.ReadAndSwap<uint32_t>();
+          switch (opcode) {
+            case xenos::PM4_SET_BIN_MASK_LO:
+              warm_bin_mask = (warm_bin_mask & 0xFFFFFFFF00000000ull) | value;
+              break;
+            case xenos::PM4_SET_BIN_MASK_HI:
+              warm_bin_mask =
+                  (warm_bin_mask & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+              break;
+            case xenos::PM4_SET_BIN_SELECT_LO:
+              warm_bin_select =
+                  (warm_bin_select & 0xFFFFFFFF00000000ull) | value;
+              break;
+            case xenos::PM4_SET_BIN_SELECT_HI:
+              warm_bin_select =
+                  (warm_bin_select & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+              break;
+          }
+          warm_reader.AdvanceRead((count - 1) * sizeof(uint32_t));
+        } break;
+        case xenos::PM4_SET_BIN_MASK:
+        case xenos::PM4_SET_BIN_SELECT: {
+          if (count < 2) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          uint64_t val_hi = warm_reader.ReadAndSwap<uint32_t>();
+          uint64_t val_lo = warm_reader.ReadAndSwap<uint32_t>();
+          if (opcode == xenos::PM4_SET_BIN_MASK) {
+            warm_bin_mask = (val_hi << 32) | val_lo;
+          } else {
+            warm_bin_select = (val_hi << 32) | val_lo;
+          }
+          warm_reader.AdvanceRead((count - 2) * sizeof(uint32_t));
+        } break;
+        case xenos::PM4_SET_BIN_BASE_OFFSET:
+        case xenos::PM4_CONTEXT_UPDATE:
+          // These packets do not affect register state or guest-memory read
+          // residency, so the bounded preflight can safely step over them.
+          warm_reader.AdvanceRead(count * sizeof(uint32_t));
+          break;
+        case xenos::PM4_SET_CONSTANT: {
+          uint32_t offset_type = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t index = offset_type & 0x7FF;
+          uint32_t constant_type = (offset_type >> 16) & 0xFF;
+          uint32_t countm1 = count - 1;
+          uint32_t base = 0;
+          switch (constant_type) {
+            case 0:
+              base = 0x4000 + index;
+              break;
+            case 1:
+              base = 0x4800 + index;
+              break;
+            case 2:
+              base = 0x4900 + index;
+              break;
+            case 3:
+              base = 0x4908 + index;
+              break;
+            case 4:
+              base = 0x2000 + index;
+              break;
+            default:
+              mark_unsupported_packet(packet, count);
+              goto finish_parse;
+          }
+          if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
+                                                     base, countm1)) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+        } break;
+        case xenos::PM4_SET_CONSTANT2:
+        case xenos::PM4_SET_SHADER_CONSTANTS: {
+          uint32_t offset_type = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t index = offset_type & 0xFFFF;
+          uint32_t countm1 = count - 1;
+          if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
+                                                     index, countm1)) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+        } break;
+        case xenos::PM4_DRAW_INDX:
+          warm_reader.AdvanceRead(sizeof(uint32_t));
+          if (!parse_draw_packet(packet, count, count - 1)) {
+            goto finish_parse;
+          }
+          break;
+        case xenos::PM4_DRAW_INDX_2:
+          if (!parse_draw_packet(packet, count, count)) {
+            goto finish_parse;
+          }
+          break;
+        case xenos::PM4_IM_LOAD:
+        case xenos::PM4_IM_LOAD_IMMEDIATE:
+        case xenos::PM4_LOAD_ALU_CONSTANT:
+        case xenos::PM4_LOAD_CONSTANT_CONTEXT:
+        case xenos::PM4_SET_STATE:
+        case xenos::PM4_SET_SHADER_BASES:
+        case xenos::PM4_INVALIDATE_STATE:
+          result.stop_reason = VertexFetchWarmerStopReason::kShaderLoad;
+          goto finish_parse;
+        case xenos::PM4_INDIRECT_BUFFER:
+        case xenos::PM4_INDIRECT_BUFFER_PFD:
+        case xenos::PM4_WAIT_REG_MEM:
+        case xenos::PM4_WAIT_FOR_IDLE:
+        case xenos::PM4_REG_RMW:
+        case xenos::PM4_REG_TO_MEM:
+        case xenos::PM4_MEM_WRITE:
+        case xenos::PM4_COND_WRITE:
+        case xenos::PM4_EVENT_WRITE:
+        case xenos::PM4_EVENT_WRITE_SHD:
+        case xenos::PM4_EVENT_WRITE_EXT:
+        case xenos::PM4_EVENT_WRITE_ZPD:
+        case xenos::PM4_INTERRUPT:
+        case xenos::PM4_XE_SWAP:
+        case xenos::PM4_VIZ_QUERY:
+          result.stop_reason = VertexFetchWarmerStopReason::kMemoryOrWaitPacket;
+          goto finish_parse;
+        default:
           mark_unsupported_packet(packet, count);
           goto finish_parse;
-        }
-      } break;
-      case xenos::PM4_SET_CONSTANT2:
-      case xenos::PM4_SET_SHADER_CONSTANTS: {
-        uint32_t offset_type = warm_reader.ReadAndSwap<uint32_t>();
-        uint32_t index = offset_type & 0xFFFF;
-        uint32_t countm1 = count - 1;
-        if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
-                                                   index, countm1)) {
-          mark_unsupported_packet(packet, count);
-          goto finish_parse;
-        }
-      } break;
-      case xenos::PM4_DRAW_INDX:
-        warm_reader.AdvanceRead(sizeof(uint32_t));
-        if (!parse_draw_packet(packet, count, count - 1)) {
-          goto finish_parse;
-        }
-        break;
-      case xenos::PM4_DRAW_INDX_2:
-        if (!parse_draw_packet(packet, count, count)) {
-          goto finish_parse;
-        }
-        break;
-      case xenos::PM4_IM_LOAD:
-      case xenos::PM4_IM_LOAD_IMMEDIATE:
-      case xenos::PM4_LOAD_ALU_CONSTANT:
-      case xenos::PM4_LOAD_CONSTANT_CONTEXT:
-      case xenos::PM4_SET_STATE:
-      case xenos::PM4_SET_SHADER_BASES:
-      case xenos::PM4_INVALIDATE_STATE:
-        stop_reason = VertexFetchWarmerStopReason::kShaderLoad;
-        goto finish_parse;
-      case xenos::PM4_INDIRECT_BUFFER:
-      case xenos::PM4_INDIRECT_BUFFER_PFD:
-      case xenos::PM4_WAIT_REG_MEM:
-      case xenos::PM4_WAIT_FOR_IDLE:
-      case xenos::PM4_REG_RMW:
-      case xenos::PM4_REG_TO_MEM:
-      case xenos::PM4_MEM_WRITE:
-      case xenos::PM4_COND_WRITE:
-      case xenos::PM4_EVENT_WRITE:
-      case xenos::PM4_EVENT_WRITE_SHD:
-      case xenos::PM4_EVENT_WRITE_EXT:
-      case xenos::PM4_EVENT_WRITE_ZPD:
-      case xenos::PM4_INTERRUPT:
-      case xenos::PM4_XE_SWAP:
-      case xenos::PM4_VIZ_QUERY:
-        stop_reason = VertexFetchWarmerStopReason::kMemoryOrWaitPacket;
-        goto finish_parse;
-      default:
-        mark_unsupported_packet(packet, count);
-        goto finish_parse;
+      }
     }
-  }
 
-finish_parse:
-  if (!warm_range_count && !warm_index_range_count) {
-    finish(stop_reason, false);
+  finish_parse:
+    return result;
+  };
+
+  WarmScanResult scan_result = scan_warm_ranges();
+  if (!scan_result.has_ranges()) {
+    finish(scan_result.stop_reason, false);
     return;
   }
-  if (warm_range_count &&
+  if (scan_result.vertex_range_count &&
       !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
-                                 warm_ranges.data(), warm_range_count)) {
+                                 scan_result.vertex_ranges.data(),
+                                 scan_result.vertex_range_count)) {
     finish(VertexFetchWarmerStopReason::kRequestFailed, false);
     return;
   }
-  if (warm_index_range_count &&
+  if (scan_result.index_range_count &&
       !RequestSharedMemoryRanges(SharedMemoryRequestReason::kGuestIndex,
-                                 warm_index_ranges.data(),
-                                 warm_index_range_count)) {
+                                 scan_result.index_ranges.data(),
+                                 scan_result.index_range_count)) {
     finish(VertexFetchWarmerStopReason::kRequestFailed, false);
     return;
   }
-  backend_telemetry_.vertex_fetch_warmer_draws += warm_draw_count;
+  backend_telemetry_.vertex_fetch_warmer_draws += scan_result.draw_count;
   backend_telemetry_.vertex_fetch_warmer_ranges +=
-      warm_range_count + warm_index_range_count;
+      scan_result.vertex_range_count + scan_result.index_range_count;
   backend_telemetry_.vertex_fetch_warmer_index_ranges +=
-      warm_index_range_count;
-  finish(stop_reason, true);
+      scan_result.index_range_count;
+  finish(scan_result.stop_reason, true);
 }
 
 MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
