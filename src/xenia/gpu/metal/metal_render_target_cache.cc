@@ -2368,6 +2368,11 @@ bool MetalRenderTargetCache::PrepareResolveDestinationBuffer(
   if (!destination.buffer) {
     return false;
   }
+  // TODO(xenios-jp): Route resolve/export destination residency through a
+  // command-processor preflight reason instead of calling shared memory
+  // directly. A direct request here can lazily open the shared-memory upload
+  // blit encoder and end an active render pass; the residency planner should
+  // discover and batch these ranges before opening the render encoder.
   return shared->RequestRange(resolve_info.copy_dest_extent_start,
                               resolve_info.copy_dest_extent_length);
 }
