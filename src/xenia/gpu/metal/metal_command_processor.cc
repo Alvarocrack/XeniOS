@@ -5254,7 +5254,6 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   uint64_t changed = 0;
   uint64_t unchanged = 0;
   uint32_t written_fetch_mask = 0;
-  uint32_t changed_fetch_mask = 0;
   DxbcShader::FetchConstantDwordMask written_fetch_dword_mask = {};
   uint32_t* register_values = register_file_->values;
 
@@ -5284,7 +5283,6 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
       } else {
         ++changed;
         fetch_changed = true;
-        changed_fetch_mask |= uint32_t(1) << fetch_index;
       }
       written_fetch_mask |= uint32_t(1) << fetch_index;
       MarkFetchConstantDword(written_fetch_dword_mask, dword);
@@ -5320,15 +5318,15 @@ void MetalCommandProcessor::WriteFetchConstantsFromMem(uint32_t start_index,
   if (current_fetch_binding_touched) {
     cbuffer_binding_fetch_.up_to_date = false;
   }
-  if (texture_cache_ && changed_fetch_mask) {
-    uint32_t mask = changed_fetch_mask;
+  if (texture_cache_ && written_fetch_mask) {
+    uint32_t mask = written_fetch_mask;
     uint32_t fetch_index = 0;
     while (xe::bit_scan_forward(mask, &fetch_index)) {
       mask = xe::clear_lowest_bit(mask);
       texture_cache_->TextureFetchConstantWritten(fetch_index);
     }
     backend_telemetry_.texture_fetch_constant_invalidations +=
-        xe::bit_count(changed_fetch_mask);
+        xe::bit_count(written_fetch_mask);
   }
 }
 
@@ -5409,7 +5407,7 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     if (current_fetch_binding_touched) {
       cbuffer_binding_fetch_.up_to_date = false;
     }
-    if (texture_cache_ && value_changed) {
+    if (texture_cache_) {
       texture_cache_->TextureFetchConstantWritten(
           fetch_dword / 6);
       ++backend_telemetry_.texture_fetch_constant_invalidations;
