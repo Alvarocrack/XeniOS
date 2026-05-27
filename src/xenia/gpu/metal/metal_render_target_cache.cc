@@ -6628,7 +6628,11 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     ++direct_telemetry.tile_accept_fast;
   }
   ++direct_telemetry.store_dontcare_eligible;
-  if (::cvars::metal_tile_direct_host_resolve_dontcare_store) {
+  // Source-side eligibility is not attachment liveness proof. Keep storing
+  // until AttachmentPlan proves no later host RT observer can read this color.
+  const bool store_dontcare_liveness_proven = false;
+  if (::cvars::metal_tile_direct_host_resolve_dontcare_store &&
+      store_dontcare_liveness_proven) {
     ++direct_telemetry.store_dontcare_attempt;
     active_render_encoder->setColorStoreAction(MTL::StoreActionDontCare,
                                                color_attachment_index);
