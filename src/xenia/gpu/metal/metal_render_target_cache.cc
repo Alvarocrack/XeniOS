@@ -169,11 +169,10 @@ DEFINE_bool(
     "render pass with a tile shader before ending the render encoder",
     "Metal");
 DEFINE_bool(
-    metal_tile_direct_host_resolve_dontcare_store, true,
+    metal_tile_direct_host_resolve_dontcare_store, false,
     "Experimental: after a tile direct-host resolve, mark the source color "
-    "attachment store action DontCare. This prototype defaults on for "
-    "telemetry, but still needs render-target liveness proof before it is "
-    "considered generally safe.",
+    "attachment store action DontCare. Disabled by default until AttachmentPlan "
+    "proves no later host render-target observer needs the attachment.",
     "Metal");
 DEFINE_bool(metal_use_heaps, true,
             "Use MTLHeap-backed texture allocations in Metal to reduce "
@@ -6269,10 +6268,8 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 // - store_dontcare_skipped_disabled/attempt/applied explain why source-eligible
 //   cases did or did not call setColorStoreAction(DontCare). The call is
 //   mechanically easy, but semantically valid only when no later host-RT
-//   observer needs the attachment contents. The prototype currently defaults
-//   metal_tile_direct_host_resolve_dontcare_store on so traces expose the
-//   bandwidth upside, but this still needs real RT liveness proof before it is
-//   no longer experimental.
+//   observer needs the attachment contents. Keep the cvar opt-in until real RT
+//   liveness proof exists.
 //
 // Representative prototype telemetry:
 // - Fast subset covered: 360/360 in one sample, 478/480 in another; the missing
