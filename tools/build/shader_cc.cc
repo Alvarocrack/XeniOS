@@ -512,7 +512,7 @@ int main(int argc, char** argv) {
         "metal",
         "-x",
         "metal",
-        "-std=macos-metal2.3",
+        "-std=macos-metal2.4",
         "-mmacosx-version-min=" XE_METAL_MIN_OS,
         "-D",
         "SHADING_LANGUAGE_MSL_XE=1",

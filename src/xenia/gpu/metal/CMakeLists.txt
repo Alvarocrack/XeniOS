@@ -154,6 +154,37 @@ if(APPLE)
   target_include_directories(xenia-gpu-metal BEFORE PRIVATE
                              "${_direct_host_resolve_generated_root}")
 
+  set(_tile_direct_host_resolve_shader
+      "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/tile_direct_host_resolve.metal")
+  set(_tile_direct_host_resolve_generated_root
+      "${PROJECT_BINARY_DIR}/generated")
+  set(_tile_direct_host_resolve_out
+      "${_tile_direct_host_resolve_generated_root}/xenia/gpu/shaders/bytecode/metal/tile_direct_host_resolve.h")
+  set(_tile_direct_host_resolve_dep "${_tile_direct_host_resolve_out}.d")
+  file(MAKE_DIRECTORY
+       "${_tile_direct_host_resolve_generated_root}/xenia/gpu/shaders/bytecode/metal")
+  add_custom_command(
+    OUTPUT "${_tile_direct_host_resolve_out}"
+    COMMAND $<TARGET_FILE:xenia-shader-cc>
+            ${_metal_shader_args}
+            --depfile "${_tile_direct_host_resolve_dep}"
+            "${_tile_direct_host_resolve_shader}"
+            "${_tile_direct_host_resolve_out}"
+    DEPENDS "${_tile_direct_host_resolve_shader}" xenia-shader-cc
+    DEPFILE "${_tile_direct_host_resolve_dep}"
+    COMMENT "Metal: tile_direct_host_resolve.metal"
+    VERBATIM
+  )
+  add_custom_target(xenia-gpu-metal-tile-direct-host-resolve-shader
+                    DEPENDS "${_tile_direct_host_resolve_out}")
+  add_dependencies(xenia-gpu-metal
+                   xenia-gpu-metal-tile-direct-host-resolve-shader)
+  target_include_directories(xenia-gpu-metal BEFORE PRIVATE
+                             "${_tile_direct_host_resolve_generated_root}")
+  set_source_files_properties("${_tile_direct_host_resolve_shader}"
+                              PROPERTIES HEADER_FILE_ONLY TRUE)
+  target_sources(xenia-gpu-metal PRIVATE "${_tile_direct_host_resolve_shader}")
+
   set(_texture_upload_repack_shader
       "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/texture_upload_repack.metal")
   set(_texture_upload_repack_generated_root
