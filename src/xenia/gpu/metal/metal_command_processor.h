@@ -529,6 +529,8 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_run_planner_event_write_no_memory_skipped = 0;
     uint64_t render_run_planner_event_write_ext_crossed = 0;
     uint64_t render_run_planner_event_write_ext_overlap_stops = 0;
+    uint64_t render_run_planner_event_write_shd_crossed = 0;
+    uint64_t render_run_planner_event_write_shd_overlap_stops = 0;
     uint64_t render_run_planner_texture_after_guest_write_skipped = 0;
     std::array<uint64_t, 128> render_run_planner_event_query_stop_opcodes = {};
     uint64_t render_run_planner_load_alu_constant_scanned = 0;
