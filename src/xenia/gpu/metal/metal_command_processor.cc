@@ -6239,9 +6239,14 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       vertex_fetch_warmer_unsupported_type3_opcodes);
   XELOGI(
       "MetalTelemetry[{}]: render_run_planner_event_query "
-      "event_write_no_memory_skipped={} stop_opcodes={{ {} }}",
+      "event_write_no_memory_skipped={} event_write_ext "
+      "crossed/overlap/texture_skip={}/{}/{} stop_opcodes={{ {} }}",
       reason,
       backend_telemetry_.render_run_planner_event_write_no_memory_skipped,
+      backend_telemetry_.render_run_planner_event_write_ext_crossed,
+      backend_telemetry_.render_run_planner_event_write_ext_overlap_stops,
+      backend_telemetry_
+          .render_run_planner_texture_after_guest_write_skipped,
       render_run_planner_event_query_stop_opcodes);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
@@ -7049,11 +7054,71 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     auto has_dwords = [&](uint32_t dword_count) {
       return warm_reader.read_count() >= dword_count * sizeof(uint32_t);
     };
+    std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>
+        crossed_guest_write_ranges;
+    uint32_t crossed_guest_write_range_count = 0;
+    auto ranges_overlap = [](uint32_t lhs_start, uint32_t lhs_length,
+                             uint32_t rhs_start, uint32_t rhs_length) {
+      if (!lhs_length || !rhs_length) {
+        return false;
+      }
+      uint64_t lhs_end = uint64_t(lhs_start) + lhs_length;
+      uint64_t rhs_end = uint64_t(rhs_start) + rhs_length;
+      return lhs_start < rhs_end && rhs_start < lhs_end;
+    };
+    auto append_crossed_guest_write_range = [&](uint32_t start,
+                                                uint32_t length) {
+      if (!length) {
+        return true;
+      }
+      uint32_t merged_start = start;
+      uint32_t merged_end = start + length;
+      for (uint32_t i = 0; i < crossed_guest_write_range_count;) {
+        uint32_t existing_start = crossed_guest_write_ranges[i].start;
+        uint32_t existing_end =
+            existing_start + crossed_guest_write_ranges[i].length;
+        if (merged_end < existing_start || merged_start > existing_end) {
+          ++i;
+          continue;
+        }
+        merged_start = std::min(merged_start, existing_start);
+        merged_end = std::max(merged_end, existing_end);
+        crossed_guest_write_ranges[i] =
+            crossed_guest_write_ranges[--crossed_guest_write_range_count];
+      }
+      if (crossed_guest_write_range_count >=
+          crossed_guest_write_ranges.size()) {
+        return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
+      }
+      crossed_guest_write_ranges[crossed_guest_write_range_count++] = {
+          merged_start, merged_end - merged_start};
+      return true;
+    };
+    auto read_overlaps_crossed_guest_write = [&](uint32_t start,
+                                                 uint32_t length) {
+      for (uint32_t i = 0; i < crossed_guest_write_range_count; ++i) {
+        const SharedMemory::Range& write_range = crossed_guest_write_ranges[i];
+        if (ranges_overlap(start, length, write_range.start,
+                           write_range.length)) {
+          return true;
+        }
+      }
+      return false;
+    };
     auto append_invalid_range =
         [&](std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>&
                 ranges,
             uint32_t& range_count, uint32_t start, uint32_t length) {
-          if (!length || shared_memory_->IsRangeValid(start, length)) {
+          if (!length) {
+            return true;
+          }
+          if (read_overlaps_crossed_guest_write(start, length)) {
+            ++backend_telemetry_
+                  .render_run_planner_event_write_ext_overlap_stops;
+            stop_event_or_query(xenos::PM4_EVENT_WRITE_EXT);
+            return false;
+          }
+          if (shared_memory_->IsRangeValid(start, length)) {
             return true;
           }
           uint32_t merged_start = start;
@@ -7136,11 +7201,16 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       }
 
       if (texture_cache_ && used_texture_mask) {
-        MetalTextureCache::PreloadTexturesResult preload_result =
-            texture_cache_->PreloadTexturesFromRegisterFile(warm_regs,
-                                                            used_texture_mask);
-        result.texture_request_count += preload_result.request_count;
-        result.texture_load_count += preload_result.load_count;
+        if (crossed_guest_write_range_count) {
+          ++backend_telemetry_
+                .render_run_planner_texture_after_guest_write_skipped;
+        } else {
+          MetalTextureCache::PreloadTexturesResult preload_result =
+              texture_cache_->PreloadTexturesFromRegisterFile(
+                  warm_regs, used_texture_mask);
+          result.texture_request_count += preload_result.request_count;
+          result.texture_load_count += preload_result.load_count;
+        }
       }
 
       ++result.draw_count;
@@ -7428,9 +7498,40 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           ++backend_telemetry_
                 .render_run_planner_event_write_no_memory_skipped;
         } break;
+        case xenos::PM4_EVENT_WRITE_EXT: {
+          if (count != 2) {
+            stop_event_or_query(opcode);
+            goto finish_parse;
+          }
+          uint32_t initiator = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t event_type = initiator & 0x3F;
+          uint32_t address = warm_reader.ReadAndSwap<uint32_t>();
+          if (!WriteSpeculativeRegister(warm_regs,
+                                        XE_GPU_REG_VGT_EVENT_INITIATOR,
+                                        event_type)) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          auto endianness = static_cast<xenos::Endian>(address & 0x3);
+          address &= ~uint32_t(0x3);
+          if (endianness != xenos::Endian::k8in16) {
+            stop_event_or_query(opcode);
+            goto finish_parse;
+          }
+          constexpr uint32_t kEventWriteExtLength =
+              uint32_t(sizeof(uint16_t) * 6);
+          if (address < SharedMemory::kBufferSize) {
+            uint32_t length =
+                std::min(kEventWriteExtLength,
+                         uint32_t(SharedMemory::kBufferSize - address));
+            if (!append_crossed_guest_write_range(address, length)) {
+              goto finish_parse;
+            }
+          }
+          ++backend_telemetry_.render_run_planner_event_write_ext_crossed;
+        } break;
         case xenos::PM4_EVENT_WRITE_SHD:
         case xenos::PM4_EVENT_WRITE_CFL:
-        case xenos::PM4_EVENT_WRITE_EXT:
         case xenos::PM4_EVENT_WRITE_ZPD:
         case xenos::PM4_INTERRUPT:
         case xenos::PM4_VIZ_QUERY:
