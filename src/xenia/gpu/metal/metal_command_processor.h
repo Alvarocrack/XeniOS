@@ -531,6 +531,18 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_run_planner_event_write_ext_overlap_stops = 0;
     uint64_t render_run_planner_texture_after_guest_write_skipped = 0;
     std::array<uint64_t, 128> render_run_planner_event_query_stop_opcodes = {};
+    uint64_t render_run_planner_load_alu_constant_scanned = 0;
+    uint64_t render_run_planner_load_alu_constant_bytes = 0;
+    uint64_t render_run_planner_load_alu_constant_overlap_stops = 0;
+    uint64_t render_run_planner_load_alu_constant_oob_stops = 0;
+    uint64_t render_run_planner_im_load_crossed = 0;
+    uint64_t render_run_planner_im_load_immediate_crossed = 0;
+    uint64_t render_run_planner_im_load_overlap_stops = 0;
+    uint64_t render_run_planner_im_load_oob_stops = 0;
+    uint64_t render_run_planner_im_load_invalid_type_stops = 0;
+    uint64_t render_run_planner_future_memexport_stops = 0;
+    uint64_t render_run_planner_texture_after_shader_load_skipped = 0;
+    std::array<uint64_t, 128> render_run_planner_shader_stop_opcodes = {};
 
     uint64_t constant_upload_system = 0;
     uint64_t constant_upload_float_vertex = 0;

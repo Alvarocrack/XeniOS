@@ -213,6 +213,22 @@ bool WriteSpeculativeOneRegisterFromRing(xe::RingBuffer* ring,
   return true;
 }
 
+bool WriteSpeculativeRegisterRangeFromMem(RegisterFile& regs, uint32_t base,
+                                          const uint32_t* source,
+                                          uint32_t count) {
+  if (!count) {
+    return true;
+  }
+  if (base >= RegisterFile::kRegisterCount ||
+      count > RegisterFile::kRegisterCount - base) {
+    return false;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    regs.values[base + i] = xe::load_and_swap<uint32_t>(source + i);
+  }
+  return true;
+}
+
 bool GetTextureSize(MTL::Texture* texture, uint32_t& width_out,
                     uint32_t& height_out) {
   if (!texture) {
@@ -5909,6 +5925,24 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (render_run_planner_event_query_stop_opcodes.empty()) {
     render_run_planner_event_query_stop_opcodes = "none";
   }
+  std::string render_run_planner_shader_stop_opcodes;
+  for (size_t i = 0;
+       i < backend_telemetry_.render_run_planner_shader_stop_opcodes.size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_.render_run_planner_shader_stop_opcodes[i];
+    if (!count) {
+      continue;
+    }
+    if (!render_run_planner_shader_stop_opcodes.empty()) {
+      render_run_planner_shader_stop_opcodes += ", ";
+    }
+    render_run_planner_shader_stop_opcodes +=
+        fmt::format("0x{:02X}={}", i, count);
+  }
+  if (render_run_planner_shader_stop_opcodes.empty()) {
+    render_run_planner_shader_stop_opcodes = "none";
+  }
 
   std::string render_run_planner_stop_reasons;
   for (size_t i = 0;
@@ -6248,6 +6282,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_
           .render_run_planner_texture_after_guest_write_skipped,
       render_run_planner_event_query_stop_opcodes);
+  XELOGI(
+      "MetalTelemetry[{}]: render_run_planner_shader_state "
+      "load_alu_constant scanned/bytes/overlap/oob={}/{}/{}/{} "
+      "im_load crossed/immediate/overlap/oob/invalid/memexport/"
+      "texture_skip={}/{}/{}/{}/{}/{}/{} stop_opcodes={{ {} }}",
+      reason, backend_telemetry_.render_run_planner_load_alu_constant_scanned,
+      backend_telemetry_.render_run_planner_load_alu_constant_bytes,
+      backend_telemetry_
+          .render_run_planner_load_alu_constant_overlap_stops,
+      backend_telemetry_.render_run_planner_load_alu_constant_oob_stops,
+      backend_telemetry_.render_run_planner_im_load_crossed,
+      backend_telemetry_.render_run_planner_im_load_immediate_crossed,
+      backend_telemetry_.render_run_planner_im_load_overlap_stops,
+      backend_telemetry_.render_run_planner_im_load_oob_stops,
+      backend_telemetry_.render_run_planner_im_load_invalid_type_stops,
+      backend_telemetry_.render_run_planner_future_memexport_stops,
+      backend_telemetry_
+          .render_run_planner_texture_after_shader_load_skipped,
+      render_run_planner_shader_stop_opcodes);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
       "dirty_marks={} dirty_reasons={{ {} }} compat_checks={} "
@@ -7011,8 +7064,11 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     const uint32_t initial_read_count_dwords =
         static_cast<uint32_t>(warm_reader.read_count() / sizeof(uint32_t));
     RegisterFile warm_regs = *register_file_;
+    Shader* warm_vertex_shader = active_vertex_shader();
+    Shader* warm_pixel_shader = active_pixel_shader();
     uint64_t warm_bin_select = bin_select_;
     uint64_t warm_bin_mask = bin_mask_;
+    bool texture_preload_safe_after_shader_state = true;
 
     auto scanned_dwords = [&]() {
       uint32_t remaining_dwords =
@@ -7045,6 +7101,14 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
               [stop_opcode];
       }
       result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+    };
+    auto stop_shader_state = [&](uint32_t stop_opcode) {
+      if (stop_opcode <
+          backend_telemetry_.render_run_planner_shader_stop_opcodes.size()) {
+        ++backend_telemetry_
+              .render_run_planner_shader_stop_opcodes[stop_opcode];
+      }
+      result.stop_reason = VertexFetchWarmerStopReason::kShaderLoad;
     };
     auto stop_unsupported_packet = [&](uint32_t unsupported_packet,
                                        uint32_t payload_dword_count) {
@@ -7104,6 +7168,48 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         }
       }
       return false;
+    };
+    auto set_scan_shader = [&](xenos::ShaderType shader_type, Shader* shader,
+                               uint32_t opcode) {
+      switch (shader_type) {
+        case xenos::ShaderType::kVertex:
+          warm_vertex_shader = shader;
+          return true;
+        case xenos::ShaderType::kPixel:
+          warm_pixel_shader = shader;
+          return true;
+      }
+      ++backend_telemetry_.render_run_planner_im_load_invalid_type_stops;
+      stop_shader_state(opcode);
+      return false;
+    };
+    auto is_valid_scan_shader_type = [&](xenos::ShaderType shader_type,
+                                         uint32_t opcode) {
+      switch (shader_type) {
+        case xenos::ShaderType::kVertex:
+        case xenos::ShaderType::kPixel:
+          return true;
+      }
+      ++backend_telemetry_.render_run_planner_im_load_invalid_type_stops;
+      stop_shader_state(opcode);
+      return false;
+    };
+    auto analyze_scan_shader = [&](Shader* shader) {
+      if (!shader) {
+        return true;
+      }
+      if (!shader->is_ucode_analyzed()) {
+        shader->AnalyzeUcode(pipeline_cache_->ucode_disasm_buffer());
+      }
+      return true;
+    };
+    auto scan_shader_memexport_used = [&]() {
+      if (!analyze_scan_shader(warm_vertex_shader) ||
+          !analyze_scan_shader(warm_pixel_shader)) {
+        return true;
+      }
+      return (warm_vertex_shader && warm_vertex_shader->memexport_eM_written()) ||
+             (warm_pixel_shader && warm_pixel_shader->memexport_eM_written());
     };
     auto append_invalid_range =
         [&](std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>&
@@ -7181,12 +7287,23 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       if (!append_future_dma_index_range()) {
         return false;
       }
+      if (!warm_vertex_shader) {
+        stop_shader_state(xenos::PM4_IM_LOAD);
+        return false;
+      }
+      if (!analyze_scan_shader(warm_vertex_shader)) {
+        return stop_unsupported_no_packet();
+      }
+      if (scan_shader_memexport_used()) {
+        ++backend_telemetry_.render_run_planner_future_memexport_stops;
+        return stop_with(VertexFetchWarmerStopReason::kMemexport);
+      }
 
       std::array<SharedMemory::Range, kMaxVertexFetchSharedMemoryRanges>
           draw_ranges;
       uint32_t draw_range_count = 0;
       if (!CollectVertexFetchSharedMemoryRanges(
-              warm_regs, vertex_shader, draw_ranges.data(),
+              warm_regs, *warm_vertex_shader, draw_ranges.data(),
               uint32_t(draw_ranges.size()), &draw_range_count, false)) {
         return stop_unsupported_no_packet();
       }
@@ -7201,7 +7318,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       }
 
       if (texture_cache_ && used_texture_mask) {
-        if (crossed_guest_write_range_count) {
+        if (!texture_preload_safe_after_shader_state) {
+          ++backend_telemetry_
+                .render_run_planner_texture_after_shader_load_skipped;
+        } else if (crossed_guest_write_range_count) {
           ++backend_telemetry_
                 .render_run_planner_texture_after_guest_write_skipped;
         } else {
@@ -7456,13 +7576,130 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           // rather than ending a host-only materialization plan.
           warm_reader.AdvanceRead(count * sizeof(uint32_t));
           break;
-        case xenos::PM4_IM_LOAD:
-        case xenos::PM4_IM_LOAD_IMMEDIATE:
-        case xenos::PM4_LOAD_ALU_CONSTANT:
+        case xenos::PM4_LOAD_ALU_CONSTANT: {
+          if (count != 3) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          uint32_t address = warm_reader.ReadAndSwap<uint32_t>() & 0x3FFFFFFF;
+          uint32_t offset_type = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t index = offset_type & 0x7FF;
+          uint32_t size_dwords = warm_reader.ReadAndSwap<uint32_t>() & 0xFFF;
+          uint32_t type = (offset_type >> 16) & 0xFF;
+          uint32_t base = 0;
+          switch (type) {
+            case 0:
+              base = 0x4000 + index;
+              break;
+            case 1:
+              base = 0x4800 + index;
+              break;
+            case 2:
+              base = 0x4900 + index;
+              break;
+            case 3:
+              base = 0x4908 + index;
+              break;
+            case 4:
+              base = 0x2000 + index;
+              break;
+            default:
+              mark_unsupported_packet(packet, count);
+              goto finish_parse;
+          }
+          uint32_t byte_count = size_dwords * uint32_t(sizeof(uint32_t));
+          if (address > SharedMemory::kBufferSize ||
+              byte_count > SharedMemory::kBufferSize - address) {
+            ++backend_telemetry_
+                  .render_run_planner_load_alu_constant_oob_stops;
+            stop_shader_state(opcode);
+            goto finish_parse;
+          }
+          if (read_overlaps_crossed_guest_write(address, byte_count)) {
+            ++backend_telemetry_
+                  .render_run_planner_load_alu_constant_overlap_stops;
+            stop_shader_state(opcode);
+            goto finish_parse;
+          }
+          const uint32_t* source =
+              memory_->TranslatePhysical<const uint32_t*>(address);
+          if (!WriteSpeculativeRegisterRangeFromMem(warm_regs, base, source,
+                                                    size_dwords)) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          ++backend_telemetry_.render_run_planner_load_alu_constant_scanned;
+          backend_telemetry_.render_run_planner_load_alu_constant_bytes +=
+              byte_count;
+        } break;
+        case xenos::PM4_IM_LOAD: {
+          if (count != 2) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          uint32_t addr_type = warm_reader.ReadAndSwap<uint32_t>();
+          auto shader_type = static_cast<xenos::ShaderType>(addr_type & 0x3);
+          uint32_t address = addr_type & ~uint32_t(0x3);
+          uint32_t start_size = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t start = start_size >> 16;
+          uint32_t size_dwords = start_size & 0xFFFF;
+          uint32_t byte_count = size_dwords * uint32_t(sizeof(uint32_t));
+          if (!is_valid_scan_shader_type(shader_type, opcode)) {
+            goto finish_parse;
+          }
+          if (start != 0 || address > SharedMemory::kBufferSize ||
+              byte_count > SharedMemory::kBufferSize - address) {
+            ++backend_telemetry_.render_run_planner_im_load_oob_stops;
+            stop_shader_state(opcode);
+            goto finish_parse;
+          }
+          if (read_overlaps_crossed_guest_write(address, byte_count)) {
+            ++backend_telemetry_.render_run_planner_im_load_overlap_stops;
+            stop_shader_state(opcode);
+            goto finish_parse;
+          }
+          const uint32_t* source =
+              memory_->TranslatePhysical<const uint32_t*>(address);
+          Shader* shader = LoadShader(shader_type, source, size_dwords);
+          if (!set_scan_shader(shader_type, shader, opcode)) {
+            goto finish_parse;
+          }
+          texture_preload_safe_after_shader_state = false;
+          ++backend_telemetry_.render_run_planner_im_load_crossed;
+        } break;
+        case xenos::PM4_IM_LOAD_IMMEDIATE: {
+          if (count < 2) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+          uint32_t shader_type_value = warm_reader.ReadAndSwap<uint32_t>();
+          auto shader_type = static_cast<xenos::ShaderType>(shader_type_value);
+          uint32_t start_size = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t start = start_size >> 16;
+          uint32_t size_dwords = start_size & 0xFFFF;
+          if (!is_valid_scan_shader_type(shader_type, opcode)) {
+            goto finish_parse;
+          }
+          if (start != 0 || size_dwords > count - 2) {
+            ++backend_telemetry_.render_run_planner_im_load_oob_stops;
+            stop_shader_state(opcode);
+            goto finish_parse;
+          }
+          const uint32_t* source =
+              reinterpret_cast<const uint32_t*>(warm_reader.read_ptr());
+          Shader* shader = LoadShader(shader_type, source, size_dwords);
+          if (!set_scan_shader(shader_type, shader, opcode)) {
+            goto finish_parse;
+          }
+          warm_reader.AdvanceRead(size_dwords * sizeof(uint32_t));
+          warm_reader.AdvanceRead((count - 2 - size_dwords) * sizeof(uint32_t));
+          texture_preload_safe_after_shader_state = false;
+          ++backend_telemetry_.render_run_planner_im_load_immediate_crossed;
+        } break;
         case xenos::PM4_LOAD_CONSTANT_CONTEXT:
         case xenos::PM4_SET_STATE:
         case xenos::PM4_SET_SHADER_BASES:
-          result.stop_reason = VertexFetchWarmerStopReason::kShaderLoad;
+          stop_shader_state(opcode);
           goto finish_parse;
         case xenos::PM4_INDIRECT_BUFFER:
         case xenos::PM4_INDIRECT_BUFFER_PFD:
