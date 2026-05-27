@@ -69,7 +69,7 @@ constexpr size_t kMaxPendingSharedMemoryWrites = 16;
 constexpr size_t kMaxPendingSharedMemoryWriteCapacity = 64;
 constexpr size_t kMaxSharedMemoryWaitSegmentsPerPending = 64;
 constexpr uint32_t kMaxVertexFetchSharedMemoryRanges = 96;
-constexpr uint32_t kMetalVertexFetchWarmMaxDraws = 16;
+constexpr uint32_t kMetalVertexFetchWarmMaxDraws = 64;
 constexpr uint32_t kMetalVertexFetchWarmMaxRanges = 256;
 
 struct SharedMemoryRangeSegment {
@@ -2711,15 +2711,6 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       EndRenderEncoder(
           RenderEncoderEndReason::kSharedMemoryUploadBeforeDrawPass);
     }
-    if (vertex_fetch_range_count &&
-        !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
-                                   vertex_fetch_ranges.data(),
-                                   vertex_fetch_range_count)) {
-      XELOGE("Failed to request {} vertex-fetch ranges in shared memory",
-             vertex_fetch_range_count);
-      return false;
-    }
-
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       uint32_t base_bytes = memexport_range.base_address_dwords << 2;
       if (!RequestSharedMemoryRange(SharedMemoryRequestReason::kMemexportStream,
@@ -2843,6 +2834,14 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     WarmVertexFetchSharedMemoryBeforeRenderPass(
         *vertex_shader, vertex_fetch_ranges.data(), vertex_fetch_range_count,
         memexport_used);
+  }
+  if (shared_memory_ && vertex_fetch_range_count &&
+      !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
+                                 vertex_fetch_ranges.data(),
+                                 vertex_fetch_range_count)) {
+    XELOGE("Failed to request {} vertex-fetch ranges in shared memory",
+           vertex_fetch_range_count);
+    return false;
   }
 
   if (!BeginRenderEncoderForDraw(fallback_depth_attachment_required)) {
@@ -6786,6 +6785,14 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           ranges[range_count++] = {start, length};
           return true;
         };
+    for (uint32_t i = 0; i < current_range_count; ++i) {
+      const SharedMemory::Range& range = current_ranges[i];
+      if (!append_invalid_range(result.vertex_ranges,
+                                result.vertex_range_count, range.start,
+                                range.length)) {
+        return result;
+      }
+    }
     auto append_future_dma_index_range = [&]() {
       reg::VGT_DRAW_INITIATOR vgt_draw_initiator =
           warm_regs.Get<reg::VGT_DRAW_INITIATOR>();
