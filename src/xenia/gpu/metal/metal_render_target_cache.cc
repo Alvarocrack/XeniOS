@@ -380,6 +380,26 @@ uint32_t DirectHostResolvePixelsPerThread(
   }
 }
 
+uint32_t TileDirectHostResolveFullPixelsPerThread(
+    draw_util::ResolveCopyShaderIndex shader) {
+  // Sub-32bpp destinations still need one lane to pack multiple pixels into a
+  // dword. Full dword-or-larger destinations use one pixel per lane to avoid
+  // the register-heavy four-pixel tile shader unroll.
+  switch (shader) {
+    case draw_util::ResolveCopyShaderIndex::kFull8bpp:
+    case draw_util::ResolveCopyShaderIndex::kFull16bpp:
+      return 4;
+    case draw_util::ResolveCopyShaderIndex::kFull32bpp:
+    case draw_util::ResolveCopyShaderIndex::kFull64bpp:
+    case draw_util::ResolveCopyShaderIndex::kFull128bpp:
+      return 1;
+    default:
+      break;
+  }
+  assert_unhandled_case(shader);
+  return 1;
+}
+
 const char* ResolveCopyEncoderLabel(bool direct_host_rt_candidate) {
   return direct_host_rt_candidate ? "XeniaResolveCopyDirectCandidate"
                                   : "XeniaResolveCopyFallback";
@@ -5250,6 +5270,13 @@ constant uint kXenosFormat_10_11_11_AS_16_16_16_16 = 55u;
 constant uint kXenosFormat_11_11_10_AS_16_16_16_16 = 56u;
 constant uint kXenosCopySampleSelect01 = 4u;
 constant uint kXenosCopySampleSelect0123 = 6u;
+constant bool kTileDirectHostResolveIsFullColor [[function_constant(0)]];
+constant uint kTileDirectHostResolveFullDestBppLog2 [[function_constant(1)]];
+constant uint kTileDirectHostResolveFullPixelsPerThread [[function_constant(2)]];
+constant uint kTileDirectHostResolveSourceFormat [[function_constant(3)]];
+constant uint kTileDirectHostResolveDestFormat [[function_constant(4)]];
+constant uint kTileDirectHostResolveTileWidth = 16u;
+constant uint kTileDirectHostResolveTileHeight = 16u;
 
 struct TileDirectHostResolveConstants {
   uint edram_info;
@@ -5280,8 +5307,8 @@ struct TileDirectHostResolveConstants {
   float dest_exp_bias_factor;
   uint pixels_per_thread;
   uint dest_bpp_log2;
-  uint padding0;
-  uint padding1;
+  uint source_to_dump_tiles;
+  uint rect_row_last;
   uint padding2;
   uint padding3;
 };
@@ -5472,17 +5499,13 @@ inline bool TilePositionInResolveRect(
   uint tile_size_y = 16u;
   uint source_tile_x = source_sample.x / tile_size_x;
   uint source_tile_y = source_sample.y / tile_size_y;
-  uint source_tile =
+  uint local_tile =
       (c.source_base_tiles + source_tile_y * c.source_pitch_tiles +
-       source_tile_x) &
+       source_tile_x + c.source_to_dump_tiles) &
       (kEdramTileCount - 1u);
-  uint local_tile = source_tile >= c.dump_base
-                        ? source_tile - c.dump_base
-                        : source_tile + kEdramTileCount - c.dump_base;
   uint dump_tile_y = local_tile / c.dump_pitch_tiles;
   uint dump_tile_x = local_tile - dump_tile_y * c.dump_pitch_tiles;
-  if (dump_tile_y < c.rect_row_first ||
-      dump_tile_y >= c.rect_row_first + c.rect_rows) {
+  if (dump_tile_y < c.rect_row_first || dump_tile_y >= c.rect_row_last) {
     return false;
   }
   uint row_start = 0u;
@@ -5492,7 +5515,7 @@ inline bool TilePositionInResolveRect(
     row_end = c.rect_row_last_end;
   } else if (dump_tile_y == c.rect_row_first) {
     row_start = c.rect_row_first_start;
-  } else if (dump_tile_y == c.rect_row_first + c.rect_rows - 1u) {
+  } else if (dump_tile_y == c.rect_row_last - 1u) {
     row_end = c.rect_row_last_end;
   }
   return dump_tile_x >= row_start && dump_tile_x < row_end;
@@ -5706,10 +5729,13 @@ inline float4 TileUnpack64(uint2 packed, uint format) {
 
 inline float4 TileRoundTripSourceColor(
     constant TileDirectHostResolveConstants& c, float4 color) {
-  return c.is_64bpp != 0u ? TileUnpack64(TilePack64(color, c.source_format),
-                                         c.source_format)
-                          : TileUnpack32(TilePack32(color, c.source_format),
-                                         c.source_format);
+  return c.is_64bpp != 0u
+             ? TileUnpack64(TilePack64(color,
+                                       kTileDirectHostResolveSourceFormat),
+                            kTileDirectHostResolveSourceFormat)
+             : TileUnpack32(TilePack32(color,
+                                       kTileDirectHostResolveSourceFormat),
+                            kTileDirectHostResolveSourceFormat);
 }
 
 inline uint2 TilePackFull16bpp4Pixels(float4 pixel_0, float4 pixel_1,
@@ -5814,6 +5840,31 @@ inline uint4 TilePackFull32bpp4Pixels(float4 pixel_0, float4 pixel_1,
   return packed;
 }
 
+inline uint TilePackFull32bppPixel(float4 pixel, uint format) {
+  switch (format) {
+    case kXenosFormat_8_8_8_8:
+    case kXenosFormat_8_8_8_8_A:
+    case kXenosFormat_8_8_8_8_AS_16_16_16_16:
+      return TilePackR8G8B8A8UNorm(pixel);
+    case kXenosFormat_2_10_10_10:
+    case kXenosFormat_2_10_10_10_AS_16_16_16_16:
+      return TilePackR10G10B10A2UNorm(pixel);
+    case kXenosFormat_10_11_11:
+    case kXenosFormat_10_11_11_AS_16_16_16_16:
+      return TilePackR11G11B10UNorm(pixel.rgb);
+    case kXenosFormat_11_11_10:
+    case kXenosFormat_11_11_10_AS_16_16_16_16:
+      return TilePackR10G11B11UNorm(pixel.rgb);
+    case kXenosFormat_16_16_EDRAM:
+    case kXenosFormat_16_16:
+      return TilePackR16G16UNorm(pixel.rg);
+    case kXenosFormat_16_16_FLOAT:
+      return as_type<uint>(half2(pixel.r, pixel.g));
+    default:
+      return as_type<uint>(pixel.r);
+  }
+}
+
 struct TilePackFull64bppResult {
   uint4 packed_01;
   uint4 packed_23;
@@ -5855,13 +5906,26 @@ inline TilePackFull64bppResult TilePackFull64bpp4Pixels(
   return result;
 }
 
+inline uint2 TilePackFull64bppPixel(float4 pixel, uint format) {
+  switch (format) {
+    case kXenosFormat_16_16_16_16_EDRAM:
+    case kXenosFormat_16_16_16_16:
+      return TilePackR16G16B16A16UNorm(pixel);
+    case kXenosFormat_16_16_16_16_FLOAT:
+      return uint2(as_type<uint>(half2(pixel.r, pixel.g)),
+                   as_type<uint>(half2(pixel.b, pixel.a)));
+    default:
+      return as_type<uint2>(pixel.rg);
+  }
+}
+
 inline float4 TileApplyFullColorExpBiasAndSwap(TileResolveInfo info,
                                                float4 color,
                                                float exp_bias) {
   if ((info.edram_format == kXenosColorRTFormatRGB10A2Float ||
        info.edram_format == kXenosColorRTFormatRGB10A2FloatAsRGBA16) &&
-      info.dest_format != kXenosFormat_16_16_16_16_FLOAT &&
-      info.dest_format != kXenosFormat_32_32_32_32_FLOAT) {
+      kTileDirectHostResolveDestFormat != kXenosFormat_16_16_16_16_FLOAT &&
+      kTileDirectHostResolveDestFormat != kXenosFormat_32_32_32_32_FLOAT) {
     color.xyz *= exp_bias;
   } else {
     color *= exp_bias;
@@ -5872,13 +5936,11 @@ inline float4 TileApplyFullColorExpBiasAndSwap(TileResolveInfo info,
   return color;
 }
 
-inline float TileSelectFull8Red(TileResolveInfo info,
-                                constant TileDirectHostResolveConstants& c,
-                                float4 color) {
+inline float TileSelectFull8Red(TileResolveInfo info, float4 color) {
   if (!info.dest_swap) {
     return color.r;
   }
-  switch (c.source_format) {
+  switch (kTileDirectHostResolveSourceFormat) {
     case kXenosColorRTFormatRGBA8:
     case kXenosColorRTFormatRGBA8Gamma:
     case kXenosColorRTFormatRGB10A2:
@@ -5910,26 +5972,32 @@ inline TileFullLoadResult TileReadFullColorSample##ID(                        \
     constant TileDirectHostResolveConstants& c, ushort2 local_tid,            \
     uint2 pixel_pos, uint sample_index) {                                      \
   TileFullLoadResult result;                                                   \
+  result.color = float4(0.0f);                                                \
+  result.exp_bias = 1.0f;                                                     \
+  result.valid = false;                                                       \
   uint2 source_sample = pixel_pos;                                             \
-  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
-    result.color = block.read(local_tid).color;                               \
-  } else if (c.msaa_samples == kXenosMsaaSamples2X) {                         \
+  uint sample_id = 0u;                                                        \
+  if (c.msaa_samples == kXenosMsaaSamples2X) {                                \
     uint sample_y = sample_index & 1u;                                        \
     source_sample = uint2(pixel_pos.x, (pixel_pos.y << 1u) + sample_y);       \
-    uint sample_id = sample_y != 0u ? c.msaa_2x_sample_1                     \
-                                    : c.msaa_2x_sample_0;                    \
-    result.color = block.read(local_tid, ushort(sample_id),                   \
-                              imageblock_data_rate::sample).color;           \
-  } else {                                                                    \
+    sample_id = sample_y != 0u ? c.msaa_2x_sample_1                          \
+                               : c.msaa_2x_sample_0;                         \
+  } else if (c.msaa_samples != kXenosMsaaSamples1X) {                         \
     uint2 sample_offset = TileSampleOffsetForIndex(sample_index);             \
     source_sample = (pixel_pos << 1u) + sample_offset;                        \
-    uint sample_id = sample_offset.x | (sample_offset.y << 1u);              \
+    sample_id = sample_offset.x | (sample_offset.y << 1u);                   \
+  }                                                                           \
+  result.valid = TilePositionInResolveRect(c, source_sample);                 \
+  if (!result.valid) {                                                        \
+    return result;                                                            \
+  }                                                                           \
+  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
+    result.color = block.read(local_tid).color;                               \
+  } else {                                                                    \
     result.color = block.read(local_tid, ushort(sample_id),                   \
                               imageblock_data_rate::sample).color;           \
   }                                                                           \
   result.color = TileRoundTripSourceColor(c, result.color);                  \
-  result.valid = TilePositionInResolveRect(c, source_sample);                 \
-  result.exp_bias = 1.0f;                                                     \
   return result;                                                              \
 }                                                                             \
 inline TileFullLoadResult TileLoadFullRawColor##ID(                           \
@@ -5942,22 +6010,34 @@ inline TileFullLoadResult TileLoadFullRawColor##ID(                           \
   TileFullLoadResult result = TileReadFullColorSample##ID(                   \
       block, c, local_tid, pixel_pos, first_sample);                         \
   result.exp_bias = info.dest_exp_bias_factor;                               \
+  if (!result.valid) {                                                        \
+    return result;                                                            \
+  }                                                                           \
   if (info.sample_select >= kXenosCopySampleSelect01) {                      \
     result.exp_bias *= 0.5f;                                                  \
     TileFullLoadResult sample = TileReadFullColorSample##ID(                 \
         block, c, local_tid, pixel_pos, first_sample + 1u);                  \
+    if (!sample.valid) {                                                       \
+      result.valid = false;                                                    \
+      return result;                                                           \
+    }                                                                          \
     result.color += sample.color;                                             \
-    result.valid = result.valid && sample.valid;                             \
     if (info.sample_select >= kXenosCopySampleSelect0123) {                  \
       result.exp_bias *= 0.5f;                                                \
       sample = TileReadFullColorSample##ID(block, c, local_tid, pixel_pos,   \
                                            first_sample + 2u);               \
+      if (!sample.valid) {                                                     \
+        result.valid = false;                                                  \
+        return result;                                                         \
+      }                                                                        \
       result.color += sample.color;                                           \
-      result.valid = result.valid && sample.valid;                           \
       sample = TileReadFullColorSample##ID(block, c, local_tid, pixel_pos,   \
                                            first_sample + 3u);               \
+      if (!sample.valid) {                                                     \
+        result.valid = false;                                                  \
+        return result;                                                         \
+      }                                                                        \
       result.color += sample.color;                                           \
-      result.valid = result.valid && sample.valid;                           \
     }                                                                         \
   }                                                                           \
   return result;                                                              \
@@ -5967,7 +6047,26 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
     constant TileDirectHostResolveConstants& c [[buffer(0)]],                 \
     device uint* dest [[buffer(1)]],                                           \
     ushort2 tid [[thread_position_in_threadgroup]],                           \
-    uint2 pos [[thread_position_in_grid]]) {                                  \
+    uint2 grid_pos [[thread_position_in_grid]],                               \
+    uint2 tile_pos [[threadgroup_position_in_grid]]) {                        \
+  ushort2 local_tid = tid;                                                     \
+  uint2 pos = grid_pos;                                                        \
+  if (kTileDirectHostResolveIsFullColor) {                                    \
+    /* 8x8 full-color dispatches are remapped to 4x16 four-pixel blocks. */   \
+    uint threads_per_tile_width =                                             \
+        kTileDirectHostResolveFullPixelsPerThread == 4u ? 8u : 16u;           \
+    uint block_index = uint(tid.y) * threads_per_tile_width + uint(tid.x);    \
+    uint blocks_per_row =                                                     \
+        kTileDirectHostResolveTileWidth /                                     \
+        kTileDirectHostResolveFullPixelsPerThread;                            \
+    local_tid = ushort2(                                                      \
+        ushort((block_index - (block_index / blocks_per_row) *                \
+                blocks_per_row) * kTileDirectHostResolveFullPixelsPerThread), \
+        ushort(block_index / blocks_per_row));                                \
+    pos = tile_pos * uint2(kTileDirectHostResolveTileWidth,                   \
+                           kTileDirectHostResolveTileHeight) +                \
+          uint2(local_tid);                                                    \
+  }                                                                           \
   if (pos.x >= c.source_width || pos.y >= c.source_height) {                  \
     return;                                                                   \
   }                                                                           \
@@ -5981,66 +6080,103 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
       pixel_index.y >= c.height_scaled) {                                     \
     return;                                                                   \
   }                                                                           \
-  if (c.is_full_color != 0u) {                                                \
-    if (c.pixels_per_thread == 0u ||                                          \
-        (pixel_index.x % c.pixels_per_thread) != 0u ||                       \
-        pixel_index.x + c.pixels_per_thread > info.width_scaled ||           \
-        pos.x + c.pixels_per_thread > c.source_width) {                      \
+  if (kTileDirectHostResolveIsFullColor) {                                    \
+    if (kTileDirectHostResolveFullPixelsPerThread == 0u ||                   \
+        pixel_index.x + kTileDirectHostResolveFullPixelsPerThread >          \
+            info.width_scaled ||                                             \
+        pos.x + kTileDirectHostResolveFullPixelsPerThread > c.source_width) { \
       return;                                                                 \
     }                                                                         \
-    if (c.dest_bpp_log2 == 0u) {                                              \
+    if (kTileDirectHostResolveFullPixelsPerThread == 1u) {                   \
       TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 0u);                                      \
+          block, c, info, local_tid, pos, 0u);                                \
+      if (!r0.valid) {                                                         \
+        return;                                                               \
+      }                                                                       \
+      float4 pixel_0 = TileApplyFullColorExpBiasAndSwap(                    \
+          info, r0.color, r0.exp_bias);                                       \
+      uint address = TileDestPixelAddress(                                   \
+          info, pixel_index, kTileDirectHostResolveFullDestBppLog2);         \
+      uint dest_index = address >> 2u;                                       \
+      if (kTileDirectHostResolveFullDestBppLog2 == 2u) {                     \
+        dest[dest_index] = XeEndianSwap32(                                   \
+            TilePackFull32bppPixel(                                           \
+                pixel_0, kTileDirectHostResolveDestFormat),                  \
+            info.dest_endian_128);                                            \
+        return;                                                               \
+      }                                                                       \
+      if (kTileDirectHostResolveFullDestBppLog2 == 3u) {                     \
+        uint2 packed = XeEndianSwap64(                                       \
+            TilePackFull64bppPixel(                                           \
+                pixel_0, kTileDirectHostResolveDestFormat),                  \
+            info.dest_endian_128);                                            \
+        dest[dest_index] = packed.x;                                          \
+        dest[dest_index + 1u] = packed.y;                                    \
+        return;                                                               \
+      }                                                                       \
+      if (kTileDirectHostResolveFullDestBppLog2 == 4u) {                     \
+        uint4 packed = XeEndianSwap128(as_type<uint4>(pixel_0),              \
+                                       info.dest_endian_128);                \
+        dest[dest_index] = packed.x;                                          \
+        dest[dest_index + 1u] = packed.y;                                    \
+        dest[dest_index + 2u] = packed.z;                                    \
+        dest[dest_index + 3u] = packed.w;                                    \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+    if (kTileDirectHostResolveFullDestBppLog2 == 0u) {                       \
+      TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
+          block, c, info, local_tid, pos, 0u);                                \
       TileFullLoadResult r1 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 1u);                                      \
+          block, c, info, local_tid, pos, 1u);                                      \
       TileFullLoadResult r2 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 2u);                                      \
+          block, c, info, local_tid, pos, 2u);                                      \
       TileFullLoadResult r3 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 3u);                                      \
+          block, c, info, local_tid, pos, 3u);                                      \
       bool valid = r0.valid && r1.valid && r2.valid && r3.valid;             \
       float4 pixels_0123 = float4(                                           \
-          TileSelectFull8Red(info, c, r0.color) * r0.exp_bias,               \
-          TileSelectFull8Red(info, c, r1.color) * r1.exp_bias,               \
-          TileSelectFull8Red(info, c, r2.color) * r2.exp_bias,               \
-          TileSelectFull8Red(info, c, r3.color) * r3.exp_bias);              \
+          TileSelectFull8Red(info, r0.color) * r0.exp_bias,                  \
+          TileSelectFull8Red(info, r1.color) * r1.exp_bias,                  \
+          TileSelectFull8Red(info, r2.color) * r2.exp_bias,                  \
+          TileSelectFull8Red(info, r3.color) * r3.exp_bias);                 \
       uint address = TileDestPixelAddress(info, pixel_index, 0u);            \
       uint dest_index = address >> 2u;                                       \
-      if (c.pixels_per_thread == 4u) {                                       \
+      if (kTileDirectHostResolveFullPixelsPerThread == 4u) {                 \
         if (!valid) {                                                         \
           return;                                                             \
         }                                                                     \
         dest[dest_index] = TilePackR8G8B8A8UNorm(pixels_0123);               \
         return;                                                               \
       }                                                                       \
-      if (c.pixels_per_thread != 8u) {                                       \
+      if (kTileDirectHostResolveFullPixelsPerThread != 8u) {                 \
         return;                                                               \
       }                                                                       \
       TileFullLoadResult r4 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 4u);                                      \
+          block, c, info, local_tid, pos, 4u);                                      \
       TileFullLoadResult r5 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 5u);                                      \
+          block, c, info, local_tid, pos, 5u);                                      \
       TileFullLoadResult r6 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 6u);                                      \
+          block, c, info, local_tid, pos, 6u);                                      \
       TileFullLoadResult r7 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 7u);                                      \
+          block, c, info, local_tid, pos, 7u);                                      \
       valid = valid && r4.valid && r5.valid && r6.valid && r7.valid;         \
       if (!valid) {                                                           \
         return;                                                               \
       }                                                                       \
       float4 pixels_4567 = float4(                                           \
-          TileSelectFull8Red(info, c, r4.color) * r4.exp_bias,               \
-          TileSelectFull8Red(info, c, r5.color) * r5.exp_bias,               \
-          TileSelectFull8Red(info, c, r6.color) * r6.exp_bias,               \
-          TileSelectFull8Red(info, c, r7.color) * r7.exp_bias);              \
+          TileSelectFull8Red(info, r4.color) * r4.exp_bias,                  \
+          TileSelectFull8Red(info, r5.color) * r5.exp_bias,                  \
+          TileSelectFull8Red(info, r6.color) * r6.exp_bias,                  \
+          TileSelectFull8Red(info, r7.color) * r7.exp_bias);                 \
       dest[dest_index] = TilePackR8G8B8A8UNorm(pixels_0123);                 \
       dest[dest_index + 1u] = TilePackR8G8B8A8UNorm(pixels_4567);            \
       return;                                                                 \
     }                                                                         \
-    if (c.dest_bpp_log2 == 4u) {                                              \
+    if (kTileDirectHostResolveFullDestBppLog2 == 4u) {                       \
       TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 0u);                                      \
+          block, c, info, local_tid, pos, 0u);                                      \
       TileFullLoadResult r1 = TileLoadFullRawColor##ID(                      \
-          block, c, info, tid, pos, 1u);                                      \
+          block, c, info, local_tid, pos, 1u);                                      \
       if (!r0.valid || !r1.valid) {                                           \
         return;                                                               \
       }                                                                       \
@@ -6068,13 +6204,13 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
       return;                                                                 \
     }                                                                         \
     TileFullLoadResult r0 = TileLoadFullRawColor##ID(                        \
-        block, c, info, tid, pos, 0u);                                        \
+        block, c, info, local_tid, pos, 0u);                                        \
     TileFullLoadResult r1 = TileLoadFullRawColor##ID(                        \
-        block, c, info, tid, pos, 1u);                                        \
+        block, c, info, local_tid, pos, 1u);                                        \
     TileFullLoadResult r2 = TileLoadFullRawColor##ID(                        \
-        block, c, info, tid, pos, 2u);                                        \
+        block, c, info, local_tid, pos, 2u);                                        \
     TileFullLoadResult r3 = TileLoadFullRawColor##ID(                        \
-        block, c, info, tid, pos, 3u);                                        \
+        block, c, info, local_tid, pos, 3u);                                        \
     if (!r0.valid || !r1.valid || !r2.valid || !r3.valid) {                  \
       return;                                                                 \
     }                                                                         \
@@ -6086,22 +6222,22 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
         info, r2.color, r2.exp_bias);                                         \
     float4 pixel_3 = TileApplyFullColorExpBiasAndSwap(                      \
         info, r3.color, r3.exp_bias);                                         \
-    uint address = TileDestPixelAddress(info, pixel_index,                   \
-                                        c.dest_bpp_log2);                    \
+    uint address = TileDestPixelAddress(                                     \
+        info, pixel_index, kTileDirectHostResolveFullDestBppLog2);           \
     uint dest_index = address >> 2u;                                         \
-    if (c.dest_bpp_log2 == 1u) {                                             \
+    if (kTileDirectHostResolveFullDestBppLog2 == 1u) {                       \
       uint2 packed = XeEndianSwap16(                                         \
           TilePackFull16bpp4Pixels(pixel_0, pixel_1, pixel_2, pixel_3,       \
-                                   info.dest_format),                        \
+                                   kTileDirectHostResolveDestFormat),         \
           info.dest_endian_128);                                             \
       dest[dest_index] = packed.x;                                            \
       dest[dest_index + 1u] = packed.y;                                      \
       return;                                                                 \
     }                                                                         \
-    if (c.dest_bpp_log2 == 2u) {                                             \
+    if (kTileDirectHostResolveFullDestBppLog2 == 2u) {                       \
       uint4 packed = XeEndianSwap32(                                         \
           TilePackFull32bpp4Pixels(pixel_0, pixel_1, pixel_2, pixel_3,       \
-                                   info.dest_format),                        \
+                                   kTileDirectHostResolveDestFormat),         \
           info.dest_endian_128);                                             \
       dest[dest_index] = packed.x;                                            \
       dest[dest_index + 1u] = packed.y;                                      \
@@ -6109,11 +6245,12 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
       dest[dest_index + 3u] = packed.w;                                      \
       return;                                                                 \
     }                                                                         \
-    if (c.dest_bpp_log2 != 3u) {                                             \
+    if (kTileDirectHostResolveFullDestBppLog2 != 3u) {                       \
       return;                                                                 \
     }                                                                         \
     TilePackFull64bppResult packed_64 = TilePackFull64bpp4Pixels(           \
-        pixel_0, pixel_1, pixel_2, pixel_3, info.dest_format);               \
+        pixel_0, pixel_1, pixel_2, pixel_3,                                  \
+        kTileDirectHostResolveDestFormat);                                    \
     uint4 packed = XeEndianSwap64(packed_64.packed_01,                      \
                                   info.dest_endian_128);                    \
     dest[dest_index] = packed.x;                                              \
@@ -6132,25 +6269,26 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
   }                                                                           \
   uint selected_sample = TileFirstSampleIndex(info.sample_select);            \
   uint2 source_sample = pos;                                                   \
-  float4 color;                                                               \
-  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
-    color = block.read(tid).color;                                            \
-  } else if (c.msaa_samples == kXenosMsaaSamples2X) {                         \
+  uint sample_id = 0u;                                                        \
+  if (c.msaa_samples == kXenosMsaaSamples2X) {                                \
     uint sample_y = selected_sample & 1u;                                     \
     source_sample = uint2(pos.x, (pos.y << 1u) + sample_y);                  \
-    uint sample_id = sample_y != 0u ? c.msaa_2x_sample_1                     \
-                                    : c.msaa_2x_sample_0;                    \
-    color = block.read(tid, ushort(sample_id),                                \
-                       imageblock_data_rate::sample).color;                  \
-  } else {                                                                    \
+    sample_id = sample_y != 0u ? c.msaa_2x_sample_1                          \
+                               : c.msaa_2x_sample_0;                         \
+  } else if (c.msaa_samples != kXenosMsaaSamples1X) {                         \
     uint2 sample_offset = TileSampleOffsetForIndex(selected_sample);          \
     source_sample = (pos << 1u) + sample_offset;                              \
-    uint sample_id = sample_offset.x | (sample_offset.y << 1u);              \
-    color = block.read(tid, ushort(sample_id),                                \
-                       imageblock_data_rate::sample).color;                  \
+    sample_id = sample_offset.x | (sample_offset.y << 1u);                   \
   }                                                                           \
   if (!TilePositionInResolveRect(c, source_sample)) {                         \
     return;                                                                   \
+  }                                                                           \
+  float4 color;                                                               \
+  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
+    color = block.read(local_tid).color;                                      \
+  } else {                                                                    \
+    color = block.read(local_tid, ushort(sample_id),                          \
+                       imageblock_data_rate::sample).color;                  \
   }                                                                           \
   if (info.dest_swap) {                                                       \
     color = color.bgra;                                                       \
@@ -6199,7 +6337,9 @@ DEFINE_TILE_DIRECT_HOST_RESOLVE_COLOR(3)
 
 MTL::RenderPipelineState*
 MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
-    uint32_t color_attachment_index, uint32_t sample_count,
+    uint32_t color_attachment_index, uint32_t sample_count, bool full_color,
+    uint32_t full_dest_bpp_log2, uint32_t full_pixels_per_thread,
+    uint32_t full_source_format, uint32_t full_dest_format,
     const TransferColorAttachmentFormats& color_attachment_formats) {
   if (color_attachment_index >= xenos::kMaxColorRenderTargets) {
     return nullptr;
@@ -6207,6 +6347,11 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
   TileDirectHostResolvePipelineKey key = {};
   key.color_attachment_index = color_attachment_index;
   key.sample_count = sample_count ? sample_count : 1;
+  key.full_color = full_color ? 1u : 0u;
+  key.full_dest_bpp_log2 = full_color ? full_dest_bpp_log2 : 0u;
+  key.full_pixels_per_thread = full_color ? full_pixels_per_thread : 0u;
+  key.full_source_format = full_color ? full_source_format : 0u;
+  key.full_dest_format = full_color ? full_dest_format : 0u;
   key.color_attachment_formats = color_attachment_formats;
   auto it = tile_direct_host_resolve_pipelines_.find(key);
   if (it != tile_direct_host_resolve_pipelines_.end()) {
@@ -6222,11 +6367,32 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
                   color_attachment_index);
   NS::String* function_name_ns =
       NS::String::string(function_name.c_str(), NS::UTF8StringEncoding);
-  MTL::Function* tile_function = library->newFunction(function_name_ns);
+  MTL::FunctionConstantValues* function_constants =
+      MTL::FunctionConstantValues::alloc()->init();
+  bool function_full_color = key.full_color != 0;
+  function_constants->setConstantValue(&function_full_color, MTL::DataTypeBool,
+                                       NS::UInteger(0));
+  function_constants->setConstantValue(&key.full_dest_bpp_log2,
+                                       MTL::DataTypeUInt, NS::UInteger(1));
+  function_constants->setConstantValue(&key.full_pixels_per_thread,
+                                       MTL::DataTypeUInt, NS::UInteger(2));
+  function_constants->setConstantValue(&key.full_source_format,
+                                       MTL::DataTypeUInt, NS::UInteger(3));
+  function_constants->setConstantValue(&key.full_dest_format,
+                                       MTL::DataTypeUInt, NS::UInteger(4));
+  NS::Error* function_error = nullptr;
+  MTL::Function* tile_function =
+      library->newFunction(function_name_ns, function_constants,
+                           &function_error);
+  function_constants->release();
   if (!tile_function) {
     XELOGE(
-        "MetalRenderTargetCache: missing tile direct host resolve function {}",
-        function_name);
+        "MetalRenderTargetCache: failed to specialize tile direct host resolve "
+        "function {}: {}",
+        function_name,
+        function_error && function_error->localizedDescription()
+            ? function_error->localizedDescription()->utf8String()
+            : "unknown error");
     return nullptr;
   }
 
@@ -6234,7 +6400,8 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
       MTL::TileRenderPipelineDescriptor::alloc()->init();
   desc->setTileFunction(tile_function);
   desc->setRasterSampleCount(key.sample_count);
-  desc->setThreadgroupSizeMatchesTileSize(true);
+  desc->setThreadgroupSizeMatchesTileSize(!key.full_color ||
+                                          key.full_pixels_per_thread == 1u);
   desc->setMaxTotalThreadsPerThreadgroup(
       kTileDirectHostResolveTileWidth * kTileDirectHostResolveTileHeight);
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
@@ -6464,10 +6631,14 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
       selected_sample > 1) {
     return reject_with(direct_telemetry.tile_execute_reject_sample_select);
   }
-  const uint32_t pixels_per_thread = DirectHostResolvePixelsPerThread(
-      copy_shader, key.Is64bpp(), key.msaa_samples);
+  const uint32_t pixels_per_thread =
+      copy_shader_is_full_color
+          ? TileDirectHostResolveFullPixelsPerThread(copy_shader)
+          : DirectHostResolvePixelsPerThread(copy_shader, key.Is64bpp(),
+                                             key.msaa_samples);
   if (copy_shader_is_full_color &&
       (!pixels_per_thread ||
+       (pixels_per_thread != 1u && pixels_per_thread != 4u) ||
        (kTileDirectHostResolveTileWidth % pixels_per_thread) != 0u)) {
     return reject_with(direct_telemetry.tile_execute_reject_shader);
   }
@@ -6502,8 +6673,22 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
                                           attachment_formats)) {
     return reject_with(direct_telemetry.tile_execute_reject_attachment);
   }
+  const uint32_t full_dest_bpp_log2 =
+      copy_shader_is_full_color
+          ? DirectHostResolveFullDestBppLog2(copy_shader)
+          : 0u;
+  const uint32_t full_pixels_per_thread =
+      copy_shader_is_full_color ? pixels_per_thread : 0u;
+  const uint32_t full_source_format =
+      copy_shader_is_full_color ? uint32_t(key.GetColorFormat()) : 0u;
+  const uint32_t full_dest_format =
+      copy_shader_is_full_color
+          ? uint32_t(resolve_info.copy_dest_info.copy_dest_format)
+          : 0u;
   MTL::RenderPipelineState* pipeline = GetOrCreateTileDirectHostResolvePipeline(
       color_attachment_index, uint32_t(source_texture->sampleCount()),
+      copy_shader_is_full_color, full_dest_bpp_log2, full_pixels_per_thread,
+      full_source_format, full_dest_format,
       attachment_formats.color_attachment_formats);
   if (!pipeline) {
     return reject_with(direct_telemetry.tile_execute_reject_pipeline);
@@ -6544,8 +6729,8 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     float dest_exp_bias_factor;
     uint32_t pixels_per_thread;
     uint32_t dest_bpp_log2;
-    uint32_t padding0;
-    uint32_t padding1;
+    uint32_t source_to_dump_tiles;
+    uint32_t rect_row_last;
     uint32_t padding2;
     uint32_t padding3;
   };
@@ -6567,6 +6752,7 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   constants.rect_rows = rect.rows;
   constants.rect_row_first_start = rect.row_first_start;
   constants.rect_row_last_end = rect.row_last_end;
+  constants.rect_row_last = rect.row_first + rect.rows;
   constants.source_base_tiles = key.base_tiles;
   constants.source_pitch_tiles = key.GetPitchTiles();
   constants.source_width = uint32_t(source_texture->width());
@@ -6588,10 +6774,12 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
       uint32_t(int32_t(0x3F800000) + dest_exp_bias * int32_t(1 << 23));
   std::memcpy(&constants.dest_exp_bias_factor, &dest_exp_bias_bits,
               sizeof(constants.dest_exp_bias_factor));
-  constants.pixels_per_thread = pixels_per_thread;
-  constants.dest_bpp_log2 = copy_shader_is_full_color
-                                ? DirectHostResolveFullDestBppLog2(copy_shader)
+  constants.pixels_per_thread = full_pixels_per_thread;
+  constants.dest_bpp_log2 =
+      copy_shader_is_full_color ? full_dest_bpp_log2
                                 : (key.Is64bpp() ? 3u : 2u);
+  constants.source_to_dump_tiles =
+      (xenos::kEdramTileCount - dump_base) & (xenos::kEdramTileCount - 1u);
 
   ++telemetry_.resolve_execute_calls;
   command_processor_.SetSwapDestSwap(
@@ -6606,8 +6794,14 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
   active_render_encoder->setTileBuffer(destination_buffer, 0, 1);
   active_render_encoder->useResource(destination_buffer, MTL::ResourceUsageWrite,
                                      MTL::RenderStageTile);
+  const NS::UInteger threads_per_tile_width =
+      copy_shader_is_full_color && full_pixels_per_thread == 4u ? 8u
+                                                                : 16u;
+  const NS::UInteger threads_per_tile_height =
+      copy_shader_is_full_color && full_pixels_per_thread == 4u ? 8u
+                                                                : 16u;
   active_render_encoder->dispatchThreadsPerTile(MTL::Size::Make(
-      kTileDirectHostResolveTileWidth, kTileDirectHostResolveTileHeight, 1));
+      threads_per_tile_width, threads_per_tile_height, 1));
   active_render_encoder->popDebugGroup();
 
   written_address = resolve_info.copy_dest_extent_start;

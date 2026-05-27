@@ -457,12 +457,22 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   struct TileDirectHostResolvePipelineKey {
     uint32_t color_attachment_index = 0;
     uint32_t sample_count = 1;
+    uint32_t full_color = 0;
+    uint32_t full_dest_bpp_log2 = 0;
+    uint32_t full_pixels_per_thread = 0;
+    uint32_t full_source_format = 0;
+    uint32_t full_dest_format = 0;
     std::array<MTL::PixelFormat, xenos::kMaxColorRenderTargets>
         color_attachment_formats = {};
 
     bool operator==(const TileDirectHostResolvePipelineKey& other) const {
       return color_attachment_index == other.color_attachment_index &&
              sample_count == other.sample_count &&
+             full_color == other.full_color &&
+             full_dest_bpp_log2 == other.full_dest_bpp_log2 &&
+             full_pixels_per_thread == other.full_pixels_per_thread &&
+             full_source_format == other.full_source_format &&
+             full_dest_format == other.full_dest_format &&
              color_attachment_formats == other.color_attachment_formats;
     }
 
@@ -473,6 +483,11 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
         };
         size_t h = key.color_attachment_index;
         h = combine(h, key.sample_count);
+        h = combine(h, key.full_color);
+        h = combine(h, key.full_dest_bpp_log2);
+        h = combine(h, key.full_pixels_per_thread);
+        h = combine(h, key.full_source_format);
+        h = combine(h, key.full_dest_format);
         for (MTL::PixelFormat color_format : key.color_attachment_formats) {
           h = combine(h, size_t(color_format));
         }
@@ -945,7 +960,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       uint32_t& written_address, uint32_t& written_length);
   MTL::Library* GetOrCreateTileDirectHostResolveLibrary();
   MTL::RenderPipelineState* GetOrCreateTileDirectHostResolvePipeline(
-      uint32_t color_attachment_index, uint32_t sample_count,
+      uint32_t color_attachment_index, uint32_t sample_count, bool full_color,
+      uint32_t full_dest_bpp_log2, uint32_t full_pixels_per_thread,
+      uint32_t full_source_format, uint32_t full_dest_format,
       const TransferColorAttachmentFormats& color_attachment_formats);
   struct ResolveDestinationBuffer {
     MTL::Buffer* buffer = nullptr;
