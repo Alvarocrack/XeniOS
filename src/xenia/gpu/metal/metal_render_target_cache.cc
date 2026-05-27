@@ -5607,6 +5607,13 @@ inline uint TileFloat32To7e3(float value) {
   return TilePreClampedFloat32To7e3(clamp(value, 0.0f, 31.875f));
 }
 
+inline uint TilePackR10G10B10A2Float(float4 color) {
+  return TileFloat32To7e3(color.r) |
+         (TileFloat32To7e3(color.g) << 10u) |
+         (TileFloat32To7e3(color.b) << 20u) |
+         (TilePackUnorm(color.a, 3.0f) << 30u);
+}
+
 inline uint TilePack32(float4 color, uint format) {
   switch (format) {
     case kXenosColorRTFormatRGBA8:
@@ -5623,10 +5630,7 @@ inline uint TilePack32(float4 color, uint format) {
              (TilePackUnorm(color.a, 3.0f) << 30u);
     case kXenosColorRTFormatRGB10A2Float:
     case kXenosColorRTFormatRGB10A2FloatAsRGBA16:
-      return TileFloat32To7e3(color.r) |
-             (TileFloat32To7e3(color.g) << 10u) |
-             (TileFloat32To7e3(color.b) << 20u) |
-             (TilePackUnorm(color.a, 3.0f) << 30u);
+      return TilePackR10G10B10A2Float(color);
     case kXenosColorRTFormatRG16:
       return TilePackSnorm16(color.r) | (TilePackSnorm16(color.g) << 16u);
     case kXenosColorRTFormatRG16Float:
@@ -5681,6 +5685,10 @@ inline float4 TileUnpackR10G10B10A2Float(uint packed) {
                 TileUnpackR10Float(packed >> 10u),
                 TileUnpackR10Float(packed >> 20u),
                 float((packed >> 30u) & 3u) * (1.0f / 3.0f));
+}
+
+inline float4 TileRoundTripR10G10B10A2Float(float4 color) {
+  return TileUnpackR10G10B10A2Float(TilePackR10G10B10A2Float(color));
 }
 
 inline float2 TileUnpackR16G16Edram(uint packed) {
@@ -5919,6 +5927,26 @@ inline uint2 TilePackFull64bppPixel(float4 pixel, uint format) {
   }
 }
 
+inline bool TileIsRgb10A2FloatToRgba16UNormResolve() {
+  return (kTileDirectHostResolveSourceFormat ==
+              kXenosColorRTFormatRGB10A2Float ||
+          kTileDirectHostResolveSourceFormat ==
+              kXenosColorRTFormatRGB10A2FloatAsRGBA16) &&
+         (kTileDirectHostResolveDestFormat ==
+              kXenosFormat_16_16_16_16_EDRAM ||
+          kTileDirectHostResolveDestFormat == kXenosFormat_16_16_16_16);
+}
+
+inline uint2 TilePackRoundedRgb10A2FloatToRgba16UNorm(float4 color,
+                                                       float exp_bias,
+                                                       bool dest_swap) {
+  color.xyz *= exp_bias;
+  if (dest_swap) {
+    color = color.bgra;
+  }
+  return TilePackR16G16B16A16UNorm(color);
+}
+
 inline float4 TileApplyFullColorExpBiasAndSwap(TileResolveInfo info,
                                                float4 color,
                                                float exp_bias) {
@@ -6000,6 +6028,39 @@ inline TileFullLoadResult TileReadFullColorSample##ID(                        \
   result.color = TileRoundTripSourceColor(c, result.color);                  \
   return result;                                                              \
 }                                                                             \
+inline TileFullLoadResult TileReadFullRgb10A2FloatSample##ID(                \
+    imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
+    constant TileDirectHostResolveConstants& c, ushort2 local_tid,            \
+    uint2 pixel_pos, uint sample_index) {                                      \
+  TileFullLoadResult result;                                                   \
+  result.color = float4(0.0f);                                                \
+  result.exp_bias = 1.0f;                                                     \
+  result.valid = false;                                                       \
+  uint2 source_sample = pixel_pos;                                             \
+  uint sample_id = 0u;                                                        \
+  if (c.msaa_samples == kXenosMsaaSamples2X) {                                \
+    uint sample_y = sample_index & 1u;                                        \
+    source_sample = uint2(pixel_pos.x, (pixel_pos.y << 1u) + sample_y);       \
+    sample_id = sample_y != 0u ? c.msaa_2x_sample_1                          \
+                               : c.msaa_2x_sample_0;                         \
+  } else if (c.msaa_samples != kXenosMsaaSamples1X) {                         \
+    uint2 sample_offset = TileSampleOffsetForIndex(sample_index);             \
+    source_sample = (pixel_pos << 1u) + sample_offset;                        \
+    sample_id = sample_offset.x | (sample_offset.y << 1u);                   \
+  }                                                                           \
+  result.valid = TilePositionInResolveRect(c, source_sample);                 \
+  if (!result.valid) {                                                        \
+    return result;                                                            \
+  }                                                                           \
+  if (c.msaa_samples == kXenosMsaaSamples1X) {                                \
+    result.color = block.read(local_tid).color;                               \
+  } else {                                                                    \
+    result.color = block.read(local_tid, ushort(sample_id),                   \
+                              imageblock_data_rate::sample).color;           \
+  }                                                                           \
+  result.color = TileRoundTripR10G10B10A2Float(result.color);                 \
+  return result;                                                              \
+}                                                                             \
 inline TileFullLoadResult TileLoadFullRawColor##ID(                           \
     imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
     constant TileDirectHostResolveConstants& c, TileResolveInfo info,         \
@@ -6033,6 +6094,48 @@ inline TileFullLoadResult TileLoadFullRawColor##ID(                           \
       result.color += sample.color;                                           \
       sample = TileReadFullColorSample##ID(block, c, local_tid, pixel_pos,   \
                                            first_sample + 3u);               \
+      if (!sample.valid) {                                                     \
+        result.valid = false;                                                  \
+        return result;                                                         \
+      }                                                                        \
+      result.color += sample.color;                                           \
+    }                                                                         \
+  }                                                                           \
+  return result;                                                              \
+}                                                                             \
+inline TileFullLoadResult TileLoadFullRgb10A2FloatColor##ID(                 \
+    imageblock<ColorBlock##ID, imageblock_layout_implicit> block,             \
+    constant TileDirectHostResolveConstants& c, TileResolveInfo info,         \
+    ushort2 tid, uint2 pos, uint lane) {                                      \
+  ushort2 local_tid = ushort2(tid.x + ushort(lane), tid.y);                  \
+  uint2 pixel_pos = pos + uint2(lane, 0u);                                    \
+  uint first_sample = TileFirstSampleIndex(info.sample_select);               \
+  TileFullLoadResult result = TileReadFullRgb10A2FloatSample##ID(            \
+      block, c, local_tid, pixel_pos, first_sample);                         \
+  result.exp_bias = info.dest_exp_bias_factor;                               \
+  if (!result.valid) {                                                        \
+    return result;                                                            \
+  }                                                                           \
+  if (info.sample_select >= kXenosCopySampleSelect01) {                      \
+    result.exp_bias *= 0.5f;                                                  \
+    TileFullLoadResult sample = TileReadFullRgb10A2FloatSample##ID(          \
+        block, c, local_tid, pixel_pos, first_sample + 1u);                  \
+    if (!sample.valid) {                                                       \
+      result.valid = false;                                                    \
+      return result;                                                           \
+    }                                                                          \
+    result.color += sample.color;                                             \
+    if (info.sample_select >= kXenosCopySampleSelect0123) {                  \
+      result.exp_bias *= 0.5f;                                                \
+      sample = TileReadFullRgb10A2FloatSample##ID(                           \
+          block, c, local_tid, pixel_pos, first_sample + 2u);                 \
+      if (!sample.valid) {                                                     \
+        result.valid = false;                                                  \
+        return result;                                                         \
+      }                                                                        \
+      result.color += sample.color;                                           \
+      sample = TileReadFullRgb10A2FloatSample##ID(                           \
+          block, c, local_tid, pixel_pos, first_sample + 3u);                 \
       if (!sample.valid) {                                                     \
         result.valid = false;                                                  \
         return result;                                                         \
@@ -6088,6 +6191,24 @@ kernel void xenia_tile_direct_host_resolve_color##ID(                         \
       return;                                                                 \
     }                                                                         \
     if (kTileDirectHostResolveFullPixelsPerThread == 1u) {                   \
+      if (kTileDirectHostResolveFullDestBppLog2 == 3u &&                     \
+          TileIsRgb10A2FloatToRgba16UNormResolve()) {                        \
+        TileFullLoadResult r0 = TileLoadFullRgb10A2FloatColor##ID(           \
+            block, c, info, local_tid, pos, 0u);                              \
+        if (!r0.valid) {                                                       \
+          return;                                                             \
+        }                                                                     \
+        uint address = TileDestPixelAddress(                                  \
+            info, pixel_index, kTileDirectHostResolveFullDestBppLog2);       \
+        uint dest_index = address >> 2u;                                     \
+        uint2 packed = XeEndianSwap64(                                       \
+            TilePackRoundedRgb10A2FloatToRgba16UNorm(                        \
+                r0.color, r0.exp_bias, info.dest_swap),                      \
+            info.dest_endian_128);                                            \
+        dest[dest_index] = packed.x;                                          \
+        dest[dest_index + 1u] = packed.y;                                    \
+        return;                                                               \
+      }                                                                       \
       TileFullLoadResult r0 = TileLoadFullRawColor##ID(                      \
           block, c, info, local_tid, pos, 0u);                                \
       if (!r0.valid) {                                                         \
