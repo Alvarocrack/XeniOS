@@ -413,6 +413,7 @@ std::string FindFxc() {
 int main(int argc, char** argv) {
   bool msl_mode = false;
   bool dxbc_mode = false;
+  bool metal_debug = false;
   std::string depfile_path;
   std::vector<ShaderDefine> defines;
   std::string identifier_override;
@@ -425,6 +426,11 @@ int main(int argc, char** argv) {
       return 1;
 #endif
       msl_mode = true;
+      ++arg_idx;
+    } else if (std::strcmp(argv[arg_idx], "--metal-debug") == 0) {
+      // Embed MSL source + line tables in the .metallib so the shader is
+      // viewable with per-line cost in the Xcode GPU trace. Increases size.
+      metal_debug = true;
       ++arg_idx;
     } else if (std::strcmp(argv[arg_idx], "--dxbc") == 0) {
       dxbc_mode = true;
@@ -512,6 +518,13 @@ int main(int argc, char** argv) {
         "SHADING_LANGUAGE_MSL_XE=1",
         "-w",
     };
+    if (metal_debug) {
+      // Record preprocessed MSL source and line tables into the AIR/metallib
+      // so Xcode's GPU trace can show source + per-line cost for these
+      // offline-compiled compute/resolve shaders.
+      metal_cmd.push_back("-frecord-sources");
+      metal_cmd.push_back("-gline-tables-only");
+    }
     AppendDefines(&metal_cmd, defines, "-D");
     std::string input_dir = input_path.parent_path().string();
     if (!input_dir.empty()) {

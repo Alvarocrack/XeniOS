@@ -41,7 +41,13 @@ target_link_libraries(xenia-gpu-metal PUBLIC
 )
 xe_shader_rules_metal(xenia-gpu-metal ${CMAKE_CURRENT_SOURCE_DIR}/../shaders)
 if(APPLE)
+  option(XE_METAL_SHADER_DEBUG_INFO
+         "Embed MSL source + line tables in generated Metal metallibs so the compute/resolve shaders are viewable with per-line cost in the Xcode GPU trace (increases generated header/binary size)."
+         ON)
   set(_metal_shader_args --msl)
+  if(XE_METAL_SHADER_DEBUG_INFO)
+    list(APPEND _metal_shader_args --metal-debug)
+  endif()
   set(_direct_host_resolve_generated_root "${PROJECT_BINARY_DIR}/generated")
   set(_direct_host_resolve_bytecode_dir
       "${_direct_host_resolve_generated_root}/xenia/gpu/shaders/bytecode/metal")

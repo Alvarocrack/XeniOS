@@ -238,8 +238,21 @@ MTL::ComputePipelineState* CreateComputePipelineFromEmbeddedLibrary(
     return nullptr;
   }
 
-  MTL::ComputePipelineState* pipeline =
-      device->newComputePipelineState(fn, &error);
+  // Label the pipeline so each resolve variant is distinguishable in the
+  // Xcode GPU trace; the entrypoint is always "entry_xe", so without a label
+  // every variant looks identical there.
+  MTL::ComputePipelineDescriptor* pipeline_desc =
+      MTL::ComputePipelineDescriptor::alloc()->init();
+  pipeline_desc->setComputeFunction(fn);
+  if (debug_name) {
+    pipeline_desc->setLabel(
+        NS::String::string(debug_name, NS::UTF8StringEncoding));
+  }
+  MTL::ComputePipelineState* pipeline = device->newComputePipelineState(
+      pipeline_desc, MTL::PipelineOptionNone,
+      static_cast<MTL::AutoreleasedComputePipelineReflection*>(nullptr),
+      &error);
+  pipeline_desc->release();
   fn->release();
   lib->release();
 
@@ -6520,6 +6533,20 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
   MTL::TileRenderPipelineDescriptor* desc =
       MTL::TileRenderPipelineDescriptor::alloc()->init();
   desc->setTileFunction(tile_function);
+  // Label the specialized pipeline so each format/bpp/MSAA variant is
+  // distinguishable in the Xcode GPU trace. The function name is identical
+  // across variants (specialization is via function constants), so without
+  // this every variant shows as the same "xenia_tile_direct_host_resolve_*".
+  std::string pipeline_label =
+      key.full_color
+          ? fmt::format(
+                "{} full dst{}bpp src_fmt={} dst_fmt={} {}xMSAA ppt{}",
+                function_name, 8u << key.full_dest_bpp_log2,
+                key.full_source_format, key.full_dest_format,
+                key.sample_count, key.full_pixels_per_thread)
+          : fmt::format("{} raw {}xMSAA", function_name, key.sample_count);
+  desc->setLabel(
+      NS::String::string(pipeline_label.c_str(), NS::UTF8StringEncoding));
   desc->setRasterSampleCount(key.sample_count);
   desc->setThreadgroupSizeMatchesTileSize(!key.full_color ||
                                           key.full_pixels_per_thread == 1u);
