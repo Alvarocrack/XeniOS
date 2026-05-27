@@ -524,6 +524,8 @@ class MetalCommandProcessor final : public CommandProcessor {
         render_run_planner_host_materialization_miss_sources = {};
     std::array<uint64_t, kRenderRunPlannerStopReasonCount>
         render_run_planner_stop_reasons = {};
+    uint64_t render_run_planner_event_write_no_memory_skipped = 0;
+    std::array<uint64_t, 128> render_run_planner_event_query_stop_opcodes = {};
 
     uint64_t constant_upload_system = 0;
     uint64_t constant_upload_float_vertex = 0;

@@ -5889,6 +5889,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (vertex_fetch_warmer_unsupported_type3_opcodes.empty()) {
     vertex_fetch_warmer_unsupported_type3_opcodes = "none";
   }
+  std::string render_run_planner_event_query_stop_opcodes;
+  for (size_t i = 0; i < backend_telemetry_
+                             .render_run_planner_event_query_stop_opcodes
+                             .size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_.render_run_planner_event_query_stop_opcodes[i];
+    if (!count) {
+      continue;
+    }
+    if (!render_run_planner_event_query_stop_opcodes.empty()) {
+      render_run_planner_event_query_stop_opcodes += ", ";
+    }
+    render_run_planner_event_query_stop_opcodes +=
+        fmt::format("0x{:02X}={}", i, count);
+  }
+  if (render_run_planner_event_query_stop_opcodes.empty()) {
+    render_run_planner_event_query_stop_opcodes = "none";
+  }
 
   std::string render_run_planner_stop_reasons;
   for (size_t i = 0;
@@ -6214,6 +6233,12 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "packet_types={{ {} }} type3_opcodes packets/payload_dwords={{ {} }}",
       reason, vertex_fetch_warmer_unsupported_packet_types,
       vertex_fetch_warmer_unsupported_type3_opcodes);
+  XELOGI(
+      "MetalTelemetry[{}]: render_run_planner_event_query "
+      "event_write_no_memory_skipped={} stop_opcodes={{ {} }}",
+      reason,
+      backend_telemetry_.render_run_planner_event_write_no_memory_skipped,
+      render_run_planner_event_query_stop_opcodes);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
       "dirty_marks={} dirty_reasons={{ {} }} compat_checks={} "
@@ -7002,6 +7027,15 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
                                                payload_dword_count);
       result.stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
     };
+    auto stop_event_or_query = [&](uint32_t stop_opcode) {
+      if (stop_opcode <
+          backend_telemetry_.render_run_planner_event_query_stop_opcodes
+              .size()) {
+        ++backend_telemetry_.render_run_planner_event_query_stop_opcodes
+              [stop_opcode];
+      }
+      result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+    };
     auto stop_unsupported_packet = [&](uint32_t unsupported_packet,
                                        uint32_t payload_dword_count) {
       mark_unsupported_packet(unsupported_packet, payload_dword_count);
@@ -7354,7 +7388,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           goto finish_parse;
         case xenos::PM4_EVENT_WRITE: {
           if (count != 1) {
-            result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+            stop_event_or_query(opcode);
             goto finish_parse;
           }
           uint32_t initiator = warm_reader.ReadAndSwap<uint32_t>();
@@ -7365,6 +7399,8 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
             mark_unsupported_packet(packet, count);
             goto finish_parse;
           }
+          ++backend_telemetry_
+                .render_run_planner_event_write_no_memory_skipped;
         } break;
         case xenos::PM4_EVENT_WRITE_SHD:
         case xenos::PM4_EVENT_WRITE_CFL:
@@ -7372,7 +7408,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         case xenos::PM4_EVENT_WRITE_ZPD:
         case xenos::PM4_INTERRUPT:
         case xenos::PM4_VIZ_QUERY:
-          result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+          stop_event_or_query(opcode);
           goto finish_parse;
         case xenos::PM4_REG_RMW:
         case xenos::PM4_COND_EXEC:
