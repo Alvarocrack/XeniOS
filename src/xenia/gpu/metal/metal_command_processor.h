@@ -779,7 +779,8 @@ class MetalCommandProcessor final : public CommandProcessor {
                                                 uint32_t payload_dword_count);
   void WarmVertexFetchSharedMemoryBeforeRenderPass(
       const Shader& vertex_shader, const SharedMemory::Range* current_ranges,
-      uint32_t current_range_count, bool current_draw_memexport_used);
+      uint32_t current_range_count, bool current_draw_memexport_used,
+      uint32_t used_texture_mask);
 
   void UseRenderEncoderAttachmentHeaps(MTL::RenderPassDescriptor* descriptor);
   void UseRenderEncoderResources(const MTL::Resource* const resources[],

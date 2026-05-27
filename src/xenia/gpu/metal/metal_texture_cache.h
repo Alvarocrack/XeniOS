@@ -138,6 +138,11 @@ class MetalTextureCache : public TextureCache {
 
   // TextureCache virtual method overrides
   void RequestTextures(uint32_t used_texture_mask) override;
+  // Preloads texture data described by speculative registers without changing
+  // active texture bindings. Used by Metal render-run preflight before opening
+  // a render encoder.
+  uint32_t PreloadTexturesFromRegisterFile(const RegisterFile& regs,
+                                           uint32_t used_texture_mask);
   bool PrepareTextureDataLoadRanges(Texture** textures,
                                     uint32_t texture_count,
                                     uint64_t base_outdated_mask,

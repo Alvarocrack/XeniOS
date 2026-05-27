@@ -858,6 +858,66 @@ class MetalTextureCache::UploadBatchScope {
   bool success_ = true;
 };
 
+uint32_t MetalTextureCache::PreloadTexturesFromRegisterFile(
+    const RegisterFile& regs, uint32_t used_texture_mask) {
+  SCOPE_profile_cpu_f("gpu");
+  if (!used_texture_mask) {
+    return 0;
+  }
+
+  Texture* textures_to_load[64];
+  uint32_t texture_count = 0;
+  auto append_texture = [&](TextureKey key) {
+    Texture* texture = FindOrCreateTexture(key);
+    if (!texture || (!texture->base_outdated_lockless() &&
+                     !texture->mips_outdated_lockless())) {
+      return;
+    }
+    assert_true(texture_count < xe::countof(textures_to_load));
+    if (texture_count < xe::countof(textures_to_load)) {
+      textures_to_load[texture_count++] = texture;
+    }
+  };
+
+  uint32_t remaining_bits = used_texture_mask;
+  uint32_t index = 0;
+  while (xe::bit_scan_forward(remaining_bits, &index)) {
+    remaining_bits = xe::clear_lowest_bit(remaining_bits);
+
+    TextureKey key;
+    uint8_t swizzled_signs = kSwizzledSignsUnsigned;
+    BindingInfoFromFetchConstant(regs.GetTextureFetch(index), key,
+                                 &swizzled_signs);
+    if (!key.is_valid) {
+      continue;
+    }
+
+    if (IsSignedVersionSeparateForFormat(key)) {
+      if (texture_util::IsAnySignNotSigned(swizzled_signs)) {
+        append_texture(key);
+      }
+      if (texture_util::IsAnySignSigned(swizzled_signs)) {
+        TextureKey signed_key = key;
+        signed_key.signed_separate = 1;
+        append_texture(signed_key);
+      }
+    } else {
+      append_texture(key);
+    }
+  }
+
+  if (!texture_count) {
+    return 0;
+  }
+
+  uint64_t load_calls_before = telemetry_.load_texture_calls;
+  UploadBatchScope upload_batch(*this);
+  LoadTexturesData(textures_to_load, texture_count);
+  upload_batch.End();
+  return static_cast<uint32_t>(telemetry_.load_texture_calls -
+                               load_calls_before);
+}
+
 bool MetalTextureCache::IsDecompressionNeededForKey(TextureKey key) const {
   switch (key.format) {
     case xenos::TextureFormat::k_DXT1:
