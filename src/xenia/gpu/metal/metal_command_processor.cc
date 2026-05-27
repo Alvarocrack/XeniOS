@@ -7380,13 +7380,18 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
             goto finish_parse;
           }
           break;
+        case xenos::PM4_INVALIDATE_STATE:
+          // The shared PM4 implementation currently treats INVALIDATE_STATE as
+          // a no-op after reading the mask. Step over that implemented behavior
+          // rather than ending a host-only materialization plan.
+          warm_reader.AdvanceRead(count * sizeof(uint32_t));
+          break;
         case xenos::PM4_IM_LOAD:
         case xenos::PM4_IM_LOAD_IMMEDIATE:
         case xenos::PM4_LOAD_ALU_CONSTANT:
         case xenos::PM4_LOAD_CONSTANT_CONTEXT:
         case xenos::PM4_SET_STATE:
         case xenos::PM4_SET_SHADER_BASES:
-        case xenos::PM4_INVALIDATE_STATE:
           result.stop_reason = VertexFetchWarmerStopReason::kShaderLoad;
           goto finish_parse;
         case xenos::PM4_INDIRECT_BUFFER:
