@@ -717,6 +717,34 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
     bool preflighted = false;
     bool load_action_safe = false;
   };
+  struct AttachmentPlanAttachment {
+    MetalRenderTarget* render_target = nullptr;
+    RenderTargetKey key = {};
+    MTL::Texture* texture = nullptr;
+    MTL::PixelFormat format = MTL::PixelFormatInvalid;
+    uint32_t sample_count = 1;
+    bool bound = false;
+    bool needs_initial_clear = false;
+    bool pending_transfer = false;
+    bool full_overwrite = false;
+    bool load_action_safe = false;
+    bool previous_contents_needed = false;
+  };
+  struct AttachmentPlan {
+    AttachmentPlanAttachment depth = {};
+    std::array<AttachmentPlanAttachment, xenos::kMaxColorRenderTargets>
+        colors = {};
+    uint32_t expected_sample_count = 1;
+    bool fallback_depth_attachment_required = false;
+    bool has_any_render_target = false;
+    bool has_any_color_target = false;
+    uint32_t coverage_width = 0;
+    uint32_t coverage_height = 0;
+    uint32_t coverage_samples = 1;
+    uint32_t pending_transfer_mask = 0;
+    uint32_t full_overwrite_mask = 0;
+    uint32_t load_dontcare_mask = 0;
+  };
 
   std::unordered_map<TransferPipelineKey, MTL::RenderPipelineState*,
                      TransferPipelineKey::Hasher>
@@ -830,6 +858,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       const TransferAttachmentFormats& attachment_formats);
   bool PreflightPendingDrawPassTransfers(
       MTL::RenderPassDescriptor* pass_descriptor);
+  bool BuildCurrentAttachmentPlan(uint32_t expected_sample_count,
+                                  bool fallback_depth_attachment_required,
+                                  AttachmentPlan& plan_out);
   void MarkRenderPassDescriptorDirty(RenderPassDescriptorDirtyReason reason);
   RenderPassCompatibilityReason GetRenderPassDescriptorCompatibilityReason(
       MTL::RenderPassDescriptor* pass_descriptor,

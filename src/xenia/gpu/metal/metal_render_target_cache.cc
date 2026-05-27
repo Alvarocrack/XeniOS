@@ -3118,6 +3118,85 @@ bool MetalRenderTargetCache::PreflightPendingDrawPassTransfers(
   return PreflightPendingDrawPassTransfers(attachment_formats);
 }
 
+bool MetalRenderTargetCache::BuildCurrentAttachmentPlan(
+    uint32_t expected_sample_count, bool fallback_depth_attachment_required,
+    AttachmentPlan& plan_out) {
+  plan_out = AttachmentPlan();
+  plan_out.expected_sample_count = expected_sample_count;
+  plan_out.fallback_depth_attachment_required =
+      fallback_depth_attachment_required;
+  plan_out.coverage_samples = std::max(1u, expected_sample_count);
+  plan_out.pending_transfer_mask = pending_draw_pass_transfer_mask_;
+  plan_out.full_overwrite_mask = pending_draw_pass_full_overwrite_mask_;
+
+  pending_draw_pass_load_dontcare_mask_ = 0;
+  if (HasPendingDrawPassTransfers() &&
+      EnsurePendingDrawPassTransfersPreflighted()) {
+    for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
+      if ((pending_draw_pass_transfer_mask_ & (uint32_t(1) << i)) &&
+          pending_draw_pass_transfer_plans_[i].load_action_safe) {
+        pending_draw_pass_load_dontcare_mask_ |= uint32_t(1) << i;
+      }
+    }
+  }
+  plan_out.load_dontcare_mask = pending_draw_pass_load_dontcare_mask_;
+
+  auto update_coverage = [&](MTL::Texture* texture) {
+    if (!texture || plan_out.coverage_width) {
+      return;
+    }
+    plan_out.coverage_width = static_cast<uint32_t>(texture->width());
+    plan_out.coverage_height = static_cast<uint32_t>(texture->height());
+    if (texture->sampleCount() > 0) {
+      plan_out.coverage_samples =
+          std::max<uint32_t>(plan_out.coverage_samples,
+                             static_cast<uint32_t>(texture->sampleCount()));
+    }
+  };
+  auto fill_attachment = [&](AttachmentPlanAttachment& attachment,
+                             MetalRenderTarget* render_target,
+                             uint32_t pending_index) {
+    if (!render_target || !render_target->texture()) {
+      return;
+    }
+    attachment.render_target = render_target;
+    attachment.key = render_target->key();
+    attachment.texture = render_target->draw_texture();
+    attachment.format =
+        attachment.texture ? attachment.texture->pixelFormat()
+                           : MTL::PixelFormatInvalid;
+    attachment.sample_count =
+        attachment.texture && attachment.texture->sampleCount()
+            ? static_cast<uint32_t>(attachment.texture->sampleCount())
+            : 1u;
+    attachment.bound = attachment.texture != nullptr;
+    attachment.needs_initial_clear = render_target->needs_initial_clear();
+    const uint32_t pending_bit = uint32_t(1) << pending_index;
+    attachment.pending_transfer =
+        (pending_draw_pass_transfer_mask_ & pending_bit) != 0;
+    attachment.full_overwrite =
+        (pending_draw_pass_full_overwrite_mask_ & pending_bit) != 0;
+    attachment.load_action_safe =
+        (pending_draw_pass_load_dontcare_mask_ & pending_bit) != 0;
+    attachment.previous_contents_needed =
+        attachment.bound && !attachment.needs_initial_clear &&
+        !attachment.load_action_safe;
+    if (attachment.bound) {
+      plan_out.has_any_render_target = true;
+      update_coverage(attachment.texture);
+    }
+  };
+
+  fill_attachment(plan_out.depth, current_depth_target_, 0);
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    fill_attachment(plan_out.colors[i], current_color_targets_[i], i + 1);
+    if (plan_out.colors[i].bound) {
+      plan_out.has_any_color_target = true;
+    }
+  }
+  return true;
+}
+
 bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
     MTL::RenderCommandEncoder* encoder,
     MTL::RenderPassDescriptor* pass_descriptor,
@@ -3767,41 +3846,36 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
         kTileDirectHostResolveTileHeight);
   }
 
-  bool has_any_render_target = false;
-  bool has_any_color_target = false;
-  uint32_t coverage_width = 0;
-  uint32_t coverage_height = 0;
-  uint32_t coverage_samples = std::max(1u, expected_sample_count);
-
-  pending_draw_pass_load_dontcare_mask_ = 0;
-  if (HasPendingDrawPassTransfers() &&
-      EnsurePendingDrawPassTransfersPreflighted()) {
-    for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
-      if ((pending_draw_pass_transfer_mask_ & (uint32_t(1) << i)) &&
-          pending_draw_pass_transfer_plans_[i].load_action_safe) {
-        pending_draw_pass_load_dontcare_mask_ |= uint32_t(1) << i;
-      }
-    }
+  AttachmentPlan attachment_plan;
+  if (!BuildCurrentAttachmentPlan(expected_sample_count,
+                                  fallback_depth_attachment_required,
+                                  attachment_plan)) {
+    return nullptr;
   }
+  bool has_any_render_target = attachment_plan.has_any_render_target;
+  bool has_any_color_target = attachment_plan.has_any_color_target;
+  uint32_t coverage_width = attachment_plan.coverage_width;
+  uint32_t coverage_height = attachment_plan.coverage_height;
+  uint32_t coverage_samples = attachment_plan.coverage_samples;
 
   // Bind the actual render targets retrieved from base class in Update()
 
   // Bind depth target if present
-  if (current_depth_target_ && current_depth_target_->texture()) {
+  const AttachmentPlanAttachment& depth_plan = attachment_plan.depth;
+  if (depth_plan.bound && depth_plan.render_target && depth_plan.texture) {
     auto* depth_attachment = cached_render_pass_descriptor_->depthAttachment();
-    depth_attachment->setTexture(current_depth_target_->draw_texture());
+    depth_attachment->setTexture(depth_plan.texture);
 
     // Clear on first bind to avoid synchronous clears at creation.
-    bool depth_needs_clear = current_depth_target_->needs_initial_clear();
-    bool depth_load_dontcare =
-        (pending_draw_pass_load_dontcare_mask_ & uint32_t(1)) != 0;
+    bool depth_needs_clear = depth_plan.needs_initial_clear;
+    bool depth_load_dontcare = depth_plan.load_action_safe;
     AttachmentLoadStoreActions depth_load_store =
         GetRealAttachmentLoadStoreActions(depth_needs_clear,
                                           !depth_load_dontcare);
     SetAttachmentLoadStoreActions(depth_attachment, depth_load_store);
     if (depth_needs_clear) {
       depth_attachment->setClearDepth(GetDepthTargetClearDepth());
-      current_depth_target_->SetNeedsInitialClear(false);
+      depth_plan.render_target->SetNeedsInitialClear(false);
       MarkRenderPassDescriptorDirty(
           RenderPassDescriptorDirtyReason::
               kDescriptorDepthInitialClearConsumed);
@@ -3810,14 +3884,13 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     // If the depth texture includes stencil, bind the same texture to the
     // stencil attachment too (Metal requires explicit stencil attachment
     // binding to match pipeline state).
-    MTL::PixelFormat depth_pixel_format =
-        current_depth_target_->draw_texture()->pixelFormat();
+    MTL::PixelFormat depth_pixel_format = depth_plan.texture->pixelFormat();
     if (depth_pixel_format == MTL::PixelFormatDepth32Float_Stencil8 ||
         depth_pixel_format == MTL::PixelFormatDepth24Unorm_Stencil8 ||
         depth_pixel_format == MTL::PixelFormatX32_Stencil8) {
       auto* stencil_attachment =
           cached_render_pass_descriptor_->stencilAttachment();
-      stencil_attachment->setTexture(current_depth_target_->draw_texture());
+      stencil_attachment->setTexture(depth_plan.texture);
       AttachmentLoadStoreActions stencil_load_store = depth_load_store;
       if (!depth_needs_clear && depth_load_dontcare) {
         stencil_load_store = {MTL::LoadActionClear, MTL::StoreActionStore};
@@ -3831,34 +3904,20 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
     has_any_render_target = true;
 
     // Track this as a real render target for capture
-    last_real_depth_target_ = current_depth_target_;
-
-    if (!coverage_width && current_depth_target_->draw_texture()) {
-      coverage_width =
-          static_cast<uint32_t>(current_depth_target_->draw_texture()->width());
-      coverage_height = static_cast<uint32_t>(
-          current_depth_target_->draw_texture()->height());
-      if (current_depth_target_->draw_texture()->sampleCount() > 0) {
-        coverage_samples = std::max<uint32_t>(
-            coverage_samples,
-            static_cast<uint32_t>(
-                current_depth_target_->draw_texture()->sampleCount()));
-      }
-    }
+    last_real_depth_target_ = depth_plan.render_target;
   }
 
   // Bind color targets
   for (uint32_t i = 0; i < 4; ++i) {
-    if (current_color_targets_[i] && current_color_targets_[i]->texture()) {
+    const AttachmentPlanAttachment& color_plan = attachment_plan.colors[i];
+    if (color_plan.bound && color_plan.render_target && color_plan.texture) {
       auto* color_attachment =
           cached_render_pass_descriptor_->colorAttachments()->object(i);
-      color_attachment->setTexture(current_color_targets_[i]->draw_texture());
+      color_attachment->setTexture(color_plan.texture);
 
       // Clear on first bind to avoid synchronous clears at creation.
-      bool color_needs_clear = current_color_targets_[i]->needs_initial_clear();
-      bool color_load_dontcare =
-          (pending_draw_pass_load_dontcare_mask_ & (uint32_t(1) << (i + 1))) !=
-          0;
+      bool color_needs_clear = color_plan.needs_initial_clear;
+      bool color_load_dontcare = color_plan.load_action_safe;
       AttachmentLoadStoreActions color_load_store =
           GetRealAttachmentLoadStoreActions(color_needs_clear,
                                             !color_load_dontcare);
@@ -3866,7 +3925,7 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       if (color_needs_clear) {
         color_attachment->setClearColor(
             MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.0));
-        current_color_targets_[i]->SetNeedsInitialClear(false);
+        color_plan.render_target->SetNeedsInitialClear(false);
         MarkRenderPassDescriptorDirty(
             RenderPassDescriptorDirtyReason::
                 kDescriptorColorInitialClearConsumed);
@@ -3876,20 +3935,7 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       has_any_color_target = true;
 
       // Track this as a real render target for capture
-      last_real_color_targets_[i] = current_color_targets_[i];
-
-      if (!coverage_width) {
-        coverage_width = static_cast<uint32_t>(
-            current_color_targets_[i]->draw_texture()->width());
-        coverage_height = static_cast<uint32_t>(
-            current_color_targets_[i]->draw_texture()->height());
-        if (current_color_targets_[i]->draw_texture()->sampleCount() > 0) {
-          coverage_samples = std::max<uint32_t>(
-              coverage_samples,
-              static_cast<uint32_t>(
-                  current_color_targets_[i]->draw_texture()->sampleCount()));
-        }
-      }
+      last_real_color_targets_[i] = color_plan.render_target;
     }
   }
 
