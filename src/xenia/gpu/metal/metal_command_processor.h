@@ -511,6 +511,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_run_planner_smem_ranges_coalesced = 0;
     uint64_t render_run_planner_smem_bytes_collected = 0;
     uint64_t render_run_planner_texture_requests_collected = 0;
+    uint64_t render_run_planner_texture_loads_collected = 0;
     uint64_t render_run_planner_upload_smem_before_encoder = 0;
     uint64_t render_run_planner_upload_texture_before_encoder = 0;
     uint64_t render_run_planner_miss_active_smem_upload = 0;

@@ -858,16 +858,19 @@ class MetalTextureCache::UploadBatchScope {
   bool success_ = true;
 };
 
-uint32_t MetalTextureCache::PreloadTexturesFromRegisterFile(
+MetalTextureCache::PreloadTexturesResult
+MetalTextureCache::PreloadTexturesFromRegisterFile(
     const RegisterFile& regs, uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
+  PreloadTexturesResult result;
   if (!used_texture_mask) {
-    return 0;
+    return result;
   }
 
   Texture* textures_to_load[64];
   uint32_t texture_count = 0;
   auto append_texture = [&](TextureKey key) {
+    ++result.request_count;
     Texture* texture = FindOrCreateTexture(key);
     if (!texture || (!texture->base_outdated_lockless() &&
                      !texture->mips_outdated_lockless())) {
@@ -907,15 +910,16 @@ uint32_t MetalTextureCache::PreloadTexturesFromRegisterFile(
   }
 
   if (!texture_count) {
-    return 0;
+    return result;
   }
 
   uint64_t load_calls_before = telemetry_.load_texture_calls;
   UploadBatchScope upload_batch(*this);
   LoadTexturesData(textures_to_load, texture_count);
   upload_batch.End();
-  return static_cast<uint32_t>(telemetry_.load_texture_calls -
-                               load_calls_before);
+  result.load_count = static_cast<uint32_t>(telemetry_.load_texture_calls -
+                                            load_calls_before);
+  return result;
 }
 
 bool MetalTextureCache::IsDecompressionNeededForKey(TextureKey key) const {

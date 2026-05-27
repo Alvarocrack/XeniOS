@@ -141,8 +141,12 @@ class MetalTextureCache : public TextureCache {
   // Preloads texture data described by speculative registers without changing
   // active texture bindings. Used by Metal render-run preflight before opening
   // a render encoder.
-  uint32_t PreloadTexturesFromRegisterFile(const RegisterFile& regs,
-                                           uint32_t used_texture_mask);
+  struct PreloadTexturesResult {
+    uint32_t request_count = 0;
+    uint32_t load_count = 0;
+  };
+  PreloadTexturesResult PreloadTexturesFromRegisterFile(
+      const RegisterFile& regs, uint32_t used_texture_mask);
   bool PrepareTextureDataLoadRanges(Texture** textures,
                                     uint32_t texture_count,
                                     uint64_t base_outdated_mask,

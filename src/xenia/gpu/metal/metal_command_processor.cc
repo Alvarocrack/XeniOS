@@ -6150,7 +6150,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   XELOGI(
       "MetalTelemetry[{}]: render_run_planner runs={} draws={} "
       "pm4_dwords={} smem ranges/coalesced/bytes={}/{}/{} "
-      "texture_requests={} "
+      "texture_requests/loads={}/{} "
       "upload_before_encoder smem/texture={}/{} miss_active "
       "smem/texture/guest_index={}/{}/{} host_miss_sources={{ {} }} "
       "resolve_tile attempt/success={}/{} store_dontcare "
@@ -6162,6 +6162,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_run_planner_smem_ranges_coalesced,
       backend_telemetry_.render_run_planner_smem_bytes_collected,
       backend_telemetry_.render_run_planner_texture_requests_collected,
+      backend_telemetry_.render_run_planner_texture_loads_collected,
       backend_telemetry_.render_run_planner_upload_smem_before_encoder,
       backend_telemetry_.render_run_planner_upload_texture_before_encoder,
       backend_telemetry_.render_run_planner_miss_active_smem_upload,
@@ -6988,13 +6989,14 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     uint32_t vertex_range_count = 0;
     uint32_t index_range_count = 0;
     uint32_t texture_request_count = 0;
+    uint32_t texture_load_count = 0;
     uint32_t draw_count = 0;
     uint32_t pm4_dwords_scanned = 0;
     VertexFetchWarmerStopReason stop_reason =
         VertexFetchWarmerStopReason::kRingEnd;
 
     bool has_work() const {
-      return vertex_range_count || index_range_count || texture_request_count;
+      return vertex_range_count || index_range_count || texture_load_count;
     }
   };
 
@@ -7134,9 +7136,11 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       }
 
       if (texture_cache_ && used_texture_mask) {
-        result.texture_request_count +=
+        MetalTextureCache::PreloadTexturesResult preload_result =
             texture_cache_->PreloadTexturesFromRegisterFile(warm_regs,
                                                             used_texture_mask);
+        result.texture_request_count += preload_result.request_count;
+        result.texture_load_count += preload_result.load_count;
       }
 
       ++result.draw_count;
@@ -7452,8 +7456,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       scan_result.vertex_range_count + scan_result.index_range_count;
   backend_telemetry_.render_run_planner_texture_requests_collected +=
       scan_result.texture_request_count;
+  backend_telemetry_.render_run_planner_texture_loads_collected +=
+      scan_result.texture_load_count;
   backend_telemetry_.render_run_planner_upload_texture_before_encoder +=
-      scan_result.texture_request_count;
+      scan_result.texture_load_count;
   for (uint32_t i = 0; i < scan_result.vertex_range_count; ++i) {
     backend_telemetry_.render_run_planner_smem_bytes_collected +=
         scan_result.vertex_ranges[i].length;
