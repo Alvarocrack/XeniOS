@@ -607,6 +607,72 @@ const char* SharedMemoryPlannerStopReasonName(size_t reason) {
   return "invalid";
 }
 
+const char* RenderRunPlannerStopReasonName(size_t reason) {
+  switch (reason) {
+    case 0:
+      return "no_work";
+    case 1:
+      return "already_active_encoder";
+    case 2:
+      return "active_shared_memory_write";
+    case 3:
+      return "no_shared_memory";
+    case 4:
+      return "budget_draws";
+    case 5:
+      return "budget_dwords";
+    case 6:
+      return "budget_shared_memory_ranges";
+    case 7:
+      return "budget_texture_requests";
+    case 8:
+      return "unsupported_packet";
+    case 9:
+      return "indirect_buffer";
+    case 10:
+      return "wait_reg_mem";
+    case 11:
+      return "mem_write";
+    case 12:
+      return "event_or_query";
+    case 13:
+      return "shader_load_or_unknown_shader_state";
+    case 14:
+      return "memory_or_wait_packet";
+    case 15:
+      return "render_target_incompatible";
+    case 16:
+      return "resolve_copy";
+    case 17:
+      return "resolve_clear";
+    case 18:
+      return "memexport";
+    case 19:
+      return "unknown_guest_memory_write";
+    case 20:
+      return "ring_end";
+    case 21:
+      return "request_failed";
+    default:
+      return "invalid";
+  }
+}
+
+bool IsHostMaterializationTransferSource(
+    MetalCommandProcessor::TransferRequestSource source) {
+  using Source = MetalCommandProcessor::TransferRequestSource;
+  switch (source) {
+    case Source::kSharedMemoryUpload:
+    case Source::kGuestIndexCopy:
+      return true;
+    case Source::kUnknown:
+    case Source::kRenderTargetTransfer:
+    case Source::kCount:
+      return false;
+  }
+  return false;
+}
+
 const char* VertexFetchWarmerStopReasonName(size_t reason) {
   switch (reason) {
     case 0:
@@ -2642,6 +2708,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         // TODO (xenios-jp): Replace this conservative boundary with bounded
         // preflight/lookahead so compatible draw runs can keep the render
         // encoder open without reordering texture upload work.
+        ++backend_telemetry_.render_run_planner_miss_active_texture_upload;
         EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
       }
     }
@@ -2657,6 +2724,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     texture_cache_->RequestTextures(used_texture_mask);
     requested_textures_before_render_encoder = true;
     ++backend_telemetry_.texture_requests_before_encoder;
+    if (may_texture_request_load_data) {
+      ++backend_telemetry_.render_run_planner_upload_texture_before_encoder;
+    }
   }
 
   std::array<VertexBindingRange, 32> vertex_ranges;
@@ -2788,6 +2858,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     if (current_render_encoder_ && may_texture_request_load_data) {
       // Fallback for paths that could not request textures in the main
       // pre-render-encoder block, such as missing draw-pass descriptors.
+      ++backend_telemetry_.render_run_planner_miss_active_texture_upload;
       EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
     }
     if (!EnsureCommandBuffer()) {
@@ -2795,6 +2866,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
     texture_cache_->RequestTextures(used_texture_mask);
     ++backend_telemetry_.texture_requests_after_encoder_begin;
+    if (may_texture_request_load_data && !current_render_encoder_) {
+      ++backend_telemetry_.render_run_planner_upload_texture_before_encoder;
+    }
   }
 
   UniformBufferInfo uniforms;
@@ -5801,6 +5875,43 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
     vertex_fetch_warmer_unsupported_type3_opcodes = "none";
   }
 
+  std::string render_run_planner_stop_reasons;
+  for (size_t i = 0;
+       i < backend_telemetry_.render_run_planner_stop_reasons.size(); ++i) {
+    uint64_t count = backend_telemetry_.render_run_planner_stop_reasons[i];
+    if (!count) {
+      continue;
+    }
+    if (!render_run_planner_stop_reasons.empty()) {
+      render_run_planner_stop_reasons += ", ";
+    }
+    render_run_planner_stop_reasons +=
+        fmt::format("{}={}", RenderRunPlannerStopReasonName(i), count);
+  }
+  if (render_run_planner_stop_reasons.empty()) {
+    render_run_planner_stop_reasons = "none";
+  }
+  std::string render_run_planner_host_miss_sources;
+  for (size_t i = 0;
+       i < backend_telemetry_
+               .render_run_planner_host_materialization_miss_sources.size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_
+            .render_run_planner_host_materialization_miss_sources[i];
+    if (!count) {
+      continue;
+    }
+    if (!render_run_planner_host_miss_sources.empty()) {
+      render_run_planner_host_miss_sources += ", ";
+    }
+    render_run_planner_host_miss_sources +=
+        fmt::format("{}={}", TransferRequestSourceName(i), count);
+  }
+  if (render_run_planner_host_miss_sources.empty()) {
+    render_run_planner_host_miss_sources = "none";
+  }
+
   std::string pending_rejections;
   for (size_t i = 0; i < rt_stats.pending_draw_pass_rejections.size(); ++i) {
     uint64_t count = rt_stats.pending_draw_pass_rejections[i];
@@ -5983,6 +6094,31 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.texture_request_work_mask_or,
       backend_telemetry_.texture_requests_before_encoder,
       backend_telemetry_.texture_requests_after_encoder_begin);
+  XELOGI(
+      "MetalTelemetry[{}]: render_run_planner runs={} draws={} "
+      "pm4_dwords={} smem ranges/bytes={}/{} texture_requests={} "
+      "upload_before_encoder smem/texture={}/{} miss_active "
+      "smem/texture/guest_index={}/{}/{} host_miss_sources={{ {} }} "
+      "resolve_tile attempt/success={}/{} store_dontcare "
+      "eligible/proven/rejected={}/{}/{} stops={{ {} }}",
+      reason, backend_telemetry_.render_run_planner_runs,
+      backend_telemetry_.render_run_planner_draws_covered,
+      backend_telemetry_.render_run_planner_pm4_dwords_scanned,
+      backend_telemetry_.render_run_planner_smem_ranges_collected,
+      backend_telemetry_.render_run_planner_smem_bytes_collected,
+      backend_telemetry_.render_run_planner_texture_requests_collected,
+      backend_telemetry_.render_run_planner_upload_smem_before_encoder,
+      backend_telemetry_.render_run_planner_upload_texture_before_encoder,
+      backend_telemetry_.render_run_planner_miss_active_smem_upload,
+      backend_telemetry_.render_run_planner_miss_active_texture_upload,
+      backend_telemetry_.render_run_planner_miss_active_guest_index_copy,
+      render_run_planner_host_miss_sources,
+      backend_telemetry_.render_run_planner_resolve_tile_attempt,
+      backend_telemetry_.render_run_planner_resolve_tile_success,
+      backend_telemetry_.render_run_planner_store_dontcare_eligible,
+      backend_telemetry_.render_run_planner_store_dontcare_proven,
+      backend_telemetry_.render_run_planner_store_dontcare_rejected,
+      render_run_planner_stop_reasons);
   XELOGI(
       "MetalTelemetry[{}]: render_encoder begin_calls={} reused={} created={} "
       "descriptor_restarts={} resource_resets={} desc_fail={} create_fail={} "
@@ -6549,9 +6685,11 @@ bool MetalCommandProcessor::RequestSharedMemoryRanges(
       if (was_active) {
         ++backend_telemetry_
               .shared_memory_request_upload_calls_active[reason_index];
+        ++backend_telemetry_.render_run_planner_miss_active_smem_upload;
       } else {
         ++backend_telemetry_
               .shared_memory_request_upload_calls_no_active[reason_index];
+        ++backend_telemetry_.render_run_planner_upload_smem_before_encoder;
       }
     }
     if (!success) {
@@ -6670,6 +6808,14 @@ bool MetalCommandProcessor::HasActiveSharedMemoryWritePending() const {
   return false;
 }
 
+void MetalCommandProcessor::RecordRenderRunPlannerStop(
+    RenderRunPlannerStopReason reason) {
+  const size_t reason_index = static_cast<size_t>(reason);
+  if (reason_index < kRenderRunPlannerStopReasonCount) {
+    ++backend_telemetry_.render_run_planner_stop_reasons[reason_index];
+  }
+}
+
 void MetalCommandProcessor::RecordVertexFetchWarmerStop(
     VertexFetchWarmerStopReason reason) {
   const size_t reason_index = static_cast<size_t>(reason);
@@ -6699,8 +6845,39 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     const Shader& vertex_shader, const SharedMemory::Range* current_ranges,
     uint32_t current_range_count, bool current_draw_memexport_used) {
   ++backend_telemetry_.vertex_fetch_warmer_attempts;
+  auto map_stop_reason =
+      [](VertexFetchWarmerStopReason reason) -> RenderRunPlannerStopReason {
+    switch (reason) {
+      case VertexFetchWarmerStopReason::kNoSharedMemory:
+        return RenderRunPlannerStopReason::kNoSharedMemory;
+      case VertexFetchWarmerStopReason::kActiveEncoderNoInvalidRanges:
+        return RenderRunPlannerStopReason::kAlreadyActiveEncoder;
+      case VertexFetchWarmerStopReason::kActiveSharedMemoryWrite:
+        return RenderRunPlannerStopReason::kActiveSharedMemoryWrite;
+      case VertexFetchWarmerStopReason::kMemexport:
+        return RenderRunPlannerStopReason::kMemexport;
+      case VertexFetchWarmerStopReason::kUnsupportedPacket:
+        return RenderRunPlannerStopReason::kUnsupportedPacket;
+      case VertexFetchWarmerStopReason::kShaderLoad:
+        return RenderRunPlannerStopReason::kShaderLoadOrUnknownShaderState;
+      case VertexFetchWarmerStopReason::kMemoryOrWaitPacket:
+        return RenderRunPlannerStopReason::kMemoryOrWaitPacket;
+      case VertexFetchWarmerStopReason::kMaxDraws:
+        return RenderRunPlannerStopReason::kBudgetDraws;
+      case VertexFetchWarmerStopReason::kMaxRanges:
+        return RenderRunPlannerStopReason::kBudgetSharedMemoryRanges;
+      case VertexFetchWarmerStopReason::kRingEnd:
+        return RenderRunPlannerStopReason::kRingEnd;
+      case VertexFetchWarmerStopReason::kRequestFailed:
+        return RenderRunPlannerStopReason::kRequestFailed;
+      case VertexFetchWarmerStopReason::kCount:
+        break;
+    }
+    return RenderRunPlannerStopReason::kUnsupportedPacket;
+  };
   auto finish = [&](VertexFetchWarmerStopReason stop_reason, bool used) {
     RecordVertexFetchWarmerStop(stop_reason);
+    RecordRenderRunPlannerStop(map_stop_reason(stop_reason));
     if (used) {
       ++backend_telemetry_.vertex_fetch_warmer_used;
     } else {
@@ -7101,7 +7278,19 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     return result;
   };
 
+  ++backend_telemetry_.render_run_planner_runs;
   WarmScanResult scan_result = scan_warm_ranges();
+  backend_telemetry_.render_run_planner_draws_covered += scan_result.draw_count;
+  backend_telemetry_.render_run_planner_smem_ranges_collected +=
+      scan_result.vertex_range_count + scan_result.index_range_count;
+  for (uint32_t i = 0; i < scan_result.vertex_range_count; ++i) {
+    backend_telemetry_.render_run_planner_smem_bytes_collected +=
+        scan_result.vertex_ranges[i].length;
+  }
+  for (uint32_t i = 0; i < scan_result.index_range_count; ++i) {
+    backend_telemetry_.render_run_planner_smem_bytes_collected +=
+        scan_result.index_ranges[i].length;
+  }
   if (!scan_result.has_ranges()) {
     finish(scan_result.stop_reason, false);
     return;
@@ -7137,6 +7326,18 @@ MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
     if (ends_render_encoder) {
       ++backend_telemetry_.transfer_request_sources_active[source_index];
       ++backend_telemetry_.transfer_request_render_encoder_ends[source_index];
+      if (IsHostMaterializationTransferSource(source)) {
+        ++backend_telemetry_
+              .render_run_planner_host_materialization_miss_sources
+                  [source_index];
+        if (source == TransferRequestSource::kGuestIndexCopy) {
+          ++backend_telemetry_.render_run_planner_miss_active_guest_index_copy;
+        } else if (source == TransferRequestSource::kSharedMemoryUpload &&
+                   current_shared_memory_upload_reason_ ==
+                       SharedMemoryRequestReason::kUnknown) {
+          ++backend_telemetry_.render_run_planner_miss_active_smem_upload;
+        }
+      }
     } else {
       ++backend_telemetry_.transfer_request_sources_no_active[source_index];
     }

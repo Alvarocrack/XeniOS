@@ -448,6 +448,35 @@ class MetalCommandProcessor final : public CommandProcessor {
   static constexpr size_t kVertexFetchWarmerStopReasonCount =
       static_cast<size_t>(VertexFetchWarmerStopReason::kCount);
 
+  enum class RenderRunPlannerStopReason : uint32_t {
+    kNoWork,
+    kAlreadyActiveEncoder,
+    kActiveSharedMemoryWrite,
+    kNoSharedMemory,
+    kBudgetDraws,
+    kBudgetDwords,
+    kBudgetSharedMemoryRanges,
+    kBudgetTextureRequests,
+    kUnsupportedPacket,
+    kIndirectBuffer,
+    kWaitRegMem,
+    kMemWrite,
+    kEventOrQuery,
+    kShaderLoadOrUnknownShaderState,
+    kMemoryOrWaitPacket,
+    kRenderTargetIncompatible,
+    kResolveCopy,
+    kResolveClear,
+    kMemexport,
+    kUnknownGuestMemoryWrite,
+    kRingEnd,
+    kRequestFailed,
+    kCount,
+  };
+
+  static constexpr size_t kRenderRunPlannerStopReasonCount =
+      static_cast<size_t>(RenderRunPlannerStopReason::kCount);
+
   struct BackendTelemetryStats {
     static constexpr size_t kBindlessTelemetryStageCount = 2;
     static constexpr size_t kBindlessTelemetryCbvSlotsPerStage = 5;
@@ -467,6 +496,27 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t texture_request_work_mask_or = 0;
     uint64_t texture_requests_before_encoder = 0;
     uint64_t texture_requests_after_encoder_begin = 0;
+
+    uint64_t render_run_planner_runs = 0;
+    uint64_t render_run_planner_draws_covered = 0;
+    uint64_t render_run_planner_pm4_dwords_scanned = 0;
+    uint64_t render_run_planner_smem_ranges_collected = 0;
+    uint64_t render_run_planner_smem_bytes_collected = 0;
+    uint64_t render_run_planner_texture_requests_collected = 0;
+    uint64_t render_run_planner_upload_smem_before_encoder = 0;
+    uint64_t render_run_planner_upload_texture_before_encoder = 0;
+    uint64_t render_run_planner_miss_active_smem_upload = 0;
+    uint64_t render_run_planner_miss_active_texture_upload = 0;
+    uint64_t render_run_planner_miss_active_guest_index_copy = 0;
+    uint64_t render_run_planner_resolve_tile_attempt = 0;
+    uint64_t render_run_planner_resolve_tile_success = 0;
+    uint64_t render_run_planner_store_dontcare_eligible = 0;
+    uint64_t render_run_planner_store_dontcare_proven = 0;
+    uint64_t render_run_planner_store_dontcare_rejected = 0;
+    std::array<uint64_t, kTransferRequestSourceCount>
+        render_run_planner_host_materialization_miss_sources = {};
+    std::array<uint64_t, kRenderRunPlannerStopReasonCount>
+        render_run_planner_stop_reasons = {};
 
     uint64_t constant_upload_system = 0;
     uint64_t constant_upload_float_vertex = 0;
@@ -723,6 +773,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool AnySharedMemoryRangeInvalid(const SharedMemory::Range* ranges,
                                    uint32_t range_count) const;
   bool HasActiveSharedMemoryWritePending() const;
+  void RecordRenderRunPlannerStop(RenderRunPlannerStopReason reason);
   void RecordVertexFetchWarmerStop(VertexFetchWarmerStopReason reason);
   void RecordVertexFetchWarmerUnsupportedPacket(uint32_t packet,
                                                 uint32_t payload_dword_count);
