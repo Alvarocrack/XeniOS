@@ -6149,7 +6149,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.texture_requests_after_encoder_begin);
   XELOGI(
       "MetalTelemetry[{}]: render_run_planner runs={} draws={} "
-      "pm4_dwords={} smem ranges/bytes={}/{} texture_requests={} "
+      "pm4_dwords={} smem ranges/coalesced/bytes={}/{}/{} "
+      "texture_requests={} "
       "upload_before_encoder smem/texture={}/{} miss_active "
       "smem/texture/guest_index={}/{}/{} host_miss_sources={{ {} }} "
       "resolve_tile attempt/success={}/{} store_dontcare "
@@ -6158,6 +6159,7 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_run_planner_draws_covered,
       backend_telemetry_.render_run_planner_pm4_dwords_scanned,
       backend_telemetry_.render_run_planner_smem_ranges_collected,
+      backend_telemetry_.render_run_planner_smem_ranges_coalesced,
       backend_telemetry_.render_run_planner_smem_bytes_collected,
       backend_telemetry_.render_run_planner_texture_requests_collected,
       backend_telemetry_.render_run_planner_upload_smem_before_encoder,
@@ -7052,10 +7054,24 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           if (!length || shared_memory_->IsRangeValid(start, length)) {
             return true;
           }
+          uint32_t merged_start = start;
+          uint32_t merged_end = start + length;
+          for (uint32_t i = 0; i < range_count;) {
+            uint32_t existing_start = ranges[i].start;
+            uint32_t existing_end = existing_start + ranges[i].length;
+            if (merged_end < existing_start || merged_start > existing_end) {
+              ++i;
+              continue;
+            }
+            merged_start = std::min(merged_start, existing_start);
+            merged_end = std::max(merged_end, existing_end);
+            ranges[i] = ranges[--range_count];
+            ++backend_telemetry_.render_run_planner_smem_ranges_coalesced;
+          }
           if (range_count >= ranges.size()) {
             return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
           }
-          ranges[range_count++] = {start, length};
+          ranges[range_count++] = {merged_start, merged_end - merged_start};
           return true;
         };
     for (uint32_t i = 0; i < current_range_count; ++i) {

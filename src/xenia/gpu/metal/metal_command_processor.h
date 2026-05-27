@@ -508,6 +508,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_run_planner_draws_covered = 0;
     uint64_t render_run_planner_pm4_dwords_scanned = 0;
     uint64_t render_run_planner_smem_ranges_collected = 0;
+    uint64_t render_run_planner_smem_ranges_coalesced = 0;
     uint64_t render_run_planner_smem_bytes_collected = 0;
     uint64_t render_run_planner_texture_requests_collected = 0;
     uint64_t render_run_planner_upload_smem_before_encoder = 0;
