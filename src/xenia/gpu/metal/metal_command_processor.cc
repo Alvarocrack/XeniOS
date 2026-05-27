@@ -70,6 +70,7 @@ constexpr size_t kMaxPendingSharedMemoryWriteCapacity = 64;
 constexpr size_t kMaxSharedMemoryWaitSegmentsPerPending = 64;
 constexpr uint32_t kMaxVertexFetchSharedMemoryRanges = 96;
 constexpr uint32_t kMetalVertexFetchWarmMaxDraws = 64;
+constexpr uint32_t kMetalVertexFetchWarmMaxDwords = 4096;
 constexpr uint32_t kMetalVertexFetchWarmMaxRanges = 256;
 
 struct SharedMemoryRangeSegment {
@@ -690,12 +691,26 @@ const char* VertexFetchWarmerStopReasonName(size_t reason) {
     case 6:
       return "memory_or_wait_packet";
     case 7:
-      return "max_draws";
+      return "indirect_buffer";
     case 8:
-      return "max_ranges";
+      return "wait_reg_mem";
     case 9:
-      return "ring_end";
+      return "mem_write";
     case 10:
+      return "event_or_query";
+    case 11:
+      return "resolve_copy";
+    case 12:
+      return "unknown_guest_memory_write";
+    case 13:
+      return "max_draws";
+    case 14:
+      return "max_dwords";
+    case 15:
+      return "max_ranges";
+    case 16:
+      return "ring_end";
+    case 17:
       return "request_failed";
     default:
       return "invalid";
@@ -6863,8 +6878,22 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         return RenderRunPlannerStopReason::kShaderLoadOrUnknownShaderState;
       case VertexFetchWarmerStopReason::kMemoryOrWaitPacket:
         return RenderRunPlannerStopReason::kMemoryOrWaitPacket;
+      case VertexFetchWarmerStopReason::kIndirectBuffer:
+        return RenderRunPlannerStopReason::kIndirectBuffer;
+      case VertexFetchWarmerStopReason::kWaitRegMem:
+        return RenderRunPlannerStopReason::kWaitRegMem;
+      case VertexFetchWarmerStopReason::kMemWrite:
+        return RenderRunPlannerStopReason::kMemWrite;
+      case VertexFetchWarmerStopReason::kEventOrQuery:
+        return RenderRunPlannerStopReason::kEventOrQuery;
+      case VertexFetchWarmerStopReason::kResolveCopy:
+        return RenderRunPlannerStopReason::kResolveCopy;
+      case VertexFetchWarmerStopReason::kUnknownGuestMemoryWrite:
+        return RenderRunPlannerStopReason::kUnknownGuestMemoryWrite;
       case VertexFetchWarmerStopReason::kMaxDraws:
         return RenderRunPlannerStopReason::kBudgetDraws;
+      case VertexFetchWarmerStopReason::kMaxDwords:
+        return RenderRunPlannerStopReason::kBudgetDwords;
       case VertexFetchWarmerStopReason::kMaxRanges:
         return RenderRunPlannerStopReason::kBudgetSharedMemoryRanges;
       case VertexFetchWarmerStopReason::kRingEnd:
@@ -6916,6 +6945,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     uint32_t index_range_count = 0;
     uint32_t texture_request_count = 0;
     uint32_t draw_count = 0;
+    uint32_t pm4_dwords_scanned = 0;
     VertexFetchWarmerStopReason stop_reason =
         VertexFetchWarmerStopReason::kRingEnd;
 
@@ -6927,10 +6957,21 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
   auto scan_warm_ranges = [&]() {
     WarmScanResult result;
     xe::RingBuffer warm_reader = reader_;
+    const uint32_t initial_read_count_dwords =
+        static_cast<uint32_t>(warm_reader.read_count() / sizeof(uint32_t));
     RegisterFile warm_regs = *register_file_;
     uint64_t warm_bin_select = bin_select_;
     uint64_t warm_bin_mask = bin_mask_;
 
+    auto scanned_dwords = [&]() {
+      uint32_t remaining_dwords =
+          static_cast<uint32_t>(warm_reader.read_count() / sizeof(uint32_t));
+      return initial_read_count_dwords - remaining_dwords;
+    };
+    auto finalize = [&]() {
+      result.pm4_dwords_scanned = scanned_dwords();
+      return result;
+    };
     auto stop_with = [&](VertexFetchWarmerStopReason reason) {
       result.stop_reason = reason;
       return false;
@@ -6971,7 +7012,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       if (!append_invalid_range(result.vertex_ranges,
                                 result.vertex_range_count, range.start,
                                 range.length)) {
-        return result;
+        return finalize();
       }
     }
     auto append_future_dma_index_range = [&]() {
@@ -7001,7 +7042,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     auto append_future_draw_ranges = [&]() {
       if (warm_regs.Get<reg::RB_MODECONTROL>().edram_mode ==
           xenos::EdramMode::kCopy) {
-        return stop_with(VertexFetchWarmerStopReason::kMemoryOrWaitPacket);
+        return stop_with(VertexFetchWarmerStopReason::kResolveCopy);
       }
       if (!append_future_dma_index_range()) {
         return false;
@@ -7078,6 +7119,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     };
 
     while (true) {
+      if (scanned_dwords() >= kMetalVertexFetchWarmMaxDwords) {
+        result.stop_reason = VertexFetchWarmerStopReason::kMaxDwords;
+        break;
+      }
       if (!has_dwords(1)) {
         result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
         break;
@@ -7099,6 +7144,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
           break;
         }
+        if (scanned_dwords() + count > kMetalVertexFetchWarmMaxDwords) {
+          result.stop_reason = VertexFetchWarmerStopReason::kMaxDwords;
+          break;
+        }
         uint32_t base_index = packet & 0x7FFF;
         uint32_t write_one_reg = (packet >> 15) & 0x1;
         bool wrote = write_one_reg
@@ -7118,6 +7167,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
           break;
         }
+        if (scanned_dwords() + 2 > kMetalVertexFetchWarmMaxDwords) {
+          result.stop_reason = VertexFetchWarmerStopReason::kMaxDwords;
+          break;
+        }
         uint32_t reg_index_1 = packet & 0x7FF;
         uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
         uint32_t reg_data_1 = warm_reader.ReadAndSwap<uint32_t>();
@@ -7134,6 +7187,10 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
       if (!has_dwords(count)) {
         result.stop_reason = VertexFetchWarmerStopReason::kRingEnd;
+        break;
+      }
+      if (scanned_dwords() + count > kMetalVertexFetchWarmMaxDwords) {
+        result.stop_reason = VertexFetchWarmerStopReason::kMaxDwords;
         break;
       }
 
@@ -7263,20 +7320,36 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           goto finish_parse;
         case xenos::PM4_INDIRECT_BUFFER:
         case xenos::PM4_INDIRECT_BUFFER_PFD:
+          result.stop_reason = VertexFetchWarmerStopReason::kIndirectBuffer;
+          goto finish_parse;
         case xenos::PM4_WAIT_REG_MEM:
+        case xenos::PM4_WAIT_REG_EQ:
+        case xenos::PM4_WAIT_REG_GTE:
         case xenos::PM4_WAIT_FOR_IDLE:
-        case xenos::PM4_REG_RMW:
-        case xenos::PM4_REG_TO_MEM:
+        case xenos::PM4_WAIT_UNTIL_READ:
+        case xenos::PM4_WAIT_IB_PFD_COMPLETE:
+          result.stop_reason = VertexFetchWarmerStopReason::kWaitRegMem;
+          goto finish_parse;
         case xenos::PM4_MEM_WRITE:
+        case xenos::PM4_MEM_WRITE_CNTR:
         case xenos::PM4_COND_WRITE:
+        case xenos::PM4_REG_TO_MEM:
+          result.stop_reason = VertexFetchWarmerStopReason::kMemWrite;
+          goto finish_parse;
         case xenos::PM4_EVENT_WRITE:
         case xenos::PM4_EVENT_WRITE_SHD:
+        case xenos::PM4_EVENT_WRITE_CFL:
         case xenos::PM4_EVENT_WRITE_EXT:
         case xenos::PM4_EVENT_WRITE_ZPD:
         case xenos::PM4_INTERRUPT:
-        case xenos::PM4_XE_SWAP:
         case xenos::PM4_VIZ_QUERY:
-          result.stop_reason = VertexFetchWarmerStopReason::kMemoryOrWaitPacket;
+          result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+          goto finish_parse;
+        case xenos::PM4_REG_RMW:
+        case xenos::PM4_COND_EXEC:
+        case xenos::PM4_XE_SWAP:
+          result.stop_reason =
+              VertexFetchWarmerStopReason::kUnknownGuestMemoryWrite;
           goto finish_parse;
         default:
           mark_unsupported_packet(packet, count);
@@ -7285,12 +7358,14 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     }
 
   finish_parse:
-    return result;
+    return finalize();
   };
 
   ++backend_telemetry_.render_run_planner_runs;
   WarmScanResult scan_result = scan_warm_ranges();
   backend_telemetry_.render_run_planner_draws_covered += scan_result.draw_count;
+  backend_telemetry_.render_run_planner_pm4_dwords_scanned +=
+      scan_result.pm4_dwords_scanned;
   backend_telemetry_.render_run_planner_smem_ranges_collected +=
       scan_result.vertex_range_count + scan_result.index_range_count;
   backend_telemetry_.render_run_planner_texture_requests_collected +=
