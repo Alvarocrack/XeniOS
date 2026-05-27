@@ -253,10 +253,16 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       uint64_t tile_execute_reject_uint_transfer_view = 0;
       uint64_t tile_execute_reject_texture = 0;
       uint64_t tile_execute_reject_attachment = 0;
+      uint64_t tile_execute_reject_msaa_store = 0;
       uint64_t tile_execute_reject_pipeline = 0;
       uint64_t tile_execute_reject_dest_buffer = 0;
       uint64_t store_dontcare_eligible = 0;
       uint64_t store_dontcare_skipped_disabled = 0;
+      uint64_t store_dontcare_skipped_unproven = 0;
+      uint64_t store_dontcare_unproven_later_draw = 0;
+      uint64_t store_dontcare_unproven_transfer = 0;
+      uint64_t store_dontcare_unproven_ownership_live = 0;
+      uint64_t store_dontcare_unproven_descriptor = 0;
       uint64_t store_dontcare_attempt = 0;
       uint64_t store_dontcare_applied = 0;
     };
@@ -372,6 +378,17 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
       MTL::RenderPassDescriptor* active_render_pass_descriptor,
       uint32_t inactive_last_end_reason, uint32_t& written_address,
       uint32_t& written_length);
+  enum class StoreDontCareUnprovenReason {
+    kLaterDraw,
+    kTransfer,
+    kOwnershipLive,
+    kDescriptor,
+  };
+  void InvalidateTileDirectHostResolveStoreDontCareCandidates(
+      StoreDontCareUnprovenReason reason);
+  void FinalizeTileDirectHostResolveStoreActions(
+      MTL::RenderCommandEncoder* active_render_encoder,
+      MTL::RenderPassDescriptor* active_render_pass_descriptor);
 
  protected:
   // Virtual methods from RenderTargetCache
@@ -500,6 +517,15 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
                      MTL::RenderPipelineState*,
                      TileDirectHostResolvePipelineKey::Hasher>
       tile_direct_host_resolve_pipelines_;
+  struct TileDirectHostResolveStoreDontCareCandidate {
+    bool valid = false;
+    RenderTargetKey key = {};
+    MTL::Texture* texture = nullptr;
+  };
+  void RecordStoreDontCareUnproven(StoreDontCareUnprovenReason reason);
+  std::array<TileDirectHostResolveStoreDontCareCandidate,
+             xenos::kMaxColorRenderTargets>
+      tile_direct_host_resolve_store_dontcare_candidates_ = {};
 
   // Host depth store compute shaders (1x/2x/4x MSAA).
   MTL::ComputePipelineState* host_depth_store_pipelines_[3] = {};

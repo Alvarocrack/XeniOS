@@ -170,9 +170,15 @@ DEFINE_bool(
     "Metal");
 DEFINE_bool(
     metal_tile_direct_host_resolve_dontcare_store, false,
-    "Experimental: after a tile direct-host resolve, mark the source color "
-    "attachment store action DontCare. Disabled by default until AttachmentPlan "
-    "proves no later host render-target observer needs the attachment.",
+    "Experimental: mark a tile direct-host resolve source color attachment "
+    "StoreActionDontCare only when Xenos resolve semantics and render-target "
+    "ownership prove the source contents are dead.",
+    "Metal");
+DEFINE_bool(
+    metal_tile_direct_host_resolve_msaa_store, false,
+    "Allow tile direct-host resolves for MSAA source attachments even when the "
+    "source attachment store cannot be elided. Disabled by default because "
+    "compute resolve avoids raw MSAA attachment stores.",
     "Metal");
 DEFINE_bool(metal_use_heaps, true,
             "Use MTLHeap-backed texture allocations in Metal to reduce "
@@ -2343,8 +2349,95 @@ void MetalRenderTargetCache::MarkRenderPassDescriptorDirty(
   }
 }
 
+void MetalRenderTargetCache::RecordStoreDontCareUnproven(
+    StoreDontCareUnprovenReason reason) {
+  TelemetryStats::ResolveDirectHostTelemetry& direct_telemetry =
+      telemetry_.resolve_direct_host;
+  ++direct_telemetry.store_dontcare_skipped_unproven;
+  switch (reason) {
+    case StoreDontCareUnprovenReason::kLaterDraw:
+      ++direct_telemetry.store_dontcare_unproven_later_draw;
+      break;
+    case StoreDontCareUnprovenReason::kTransfer:
+      ++direct_telemetry.store_dontcare_unproven_transfer;
+      break;
+    case StoreDontCareUnprovenReason::kOwnershipLive:
+      ++direct_telemetry.store_dontcare_unproven_ownership_live;
+      break;
+    case StoreDontCareUnprovenReason::kDescriptor:
+      ++direct_telemetry.store_dontcare_unproven_descriptor;
+      break;
+  }
+}
+
+void MetalRenderTargetCache::
+    InvalidateTileDirectHostResolveStoreDontCareCandidates(
+        StoreDontCareUnprovenReason reason) {
+  for (auto& candidate :
+       tile_direct_host_resolve_store_dontcare_candidates_) {
+    if (!candidate.valid) {
+      continue;
+    }
+    RecordStoreDontCareUnproven(reason);
+    candidate = {};
+  }
+}
+
+void MetalRenderTargetCache::FinalizeTileDirectHostResolveStoreActions(
+    MTL::RenderCommandEncoder* active_render_encoder,
+    MTL::RenderPassDescriptor* active_render_pass_descriptor) {
+  if (!active_render_encoder || !active_render_pass_descriptor) {
+    InvalidateTileDirectHostResolveStoreDontCareCandidates(
+        StoreDontCareUnprovenReason::kDescriptor);
+    return;
+  }
+
+  TelemetryStats::ResolveDirectHostTelemetry& direct_telemetry =
+      telemetry_.resolve_direct_host;
+  MTL::RenderPassColorAttachmentDescriptorArray* color_attachments =
+      active_render_pass_descriptor->colorAttachments();
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    TileDirectHostResolveStoreDontCareCandidate& candidate =
+        tile_direct_host_resolve_store_dontcare_candidates_[i];
+    MTL::RenderPassColorAttachmentDescriptor* color_attachment =
+        color_attachments ? color_attachments->object(i) : nullptr;
+    const bool late_store_action =
+        color_attachment &&
+        color_attachment->storeAction() == MTL::StoreActionUnknown;
+    const bool candidate_matches_attachment =
+        candidate.valid && color_attachment &&
+        color_attachment->texture() == candidate.texture;
+    const bool ownership_live =
+        candidate_matches_attachment &&
+        IsRenderTargetOwnershipLive(candidate.key);
+    const bool discard_proven =
+        candidate_matches_attachment && !ownership_live;
+
+    if (late_store_action && color_attachment->texture()) {
+      if (discard_proven) {
+        ++direct_telemetry.store_dontcare_attempt;
+        active_render_encoder->setColorStoreAction(MTL::StoreActionDontCare,
+                                                   i);
+        ++direct_telemetry.store_dontcare_applied;
+      } else {
+        active_render_encoder->setColorStoreAction(MTL::StoreActionStore, i);
+        if (candidate.valid) {
+          RecordStoreDontCareUnproven(
+              ownership_live ? StoreDontCareUnprovenReason::kOwnershipLive
+                             : StoreDontCareUnprovenReason::kDescriptor);
+        }
+      }
+    } else if (candidate.valid) {
+      RecordStoreDontCareUnproven(StoreDontCareUnprovenReason::kDescriptor);
+    }
+    candidate = {};
+  }
+}
+
 void MetalRenderTargetCache::ClearCache() {
   ClearPendingDrawPassTransfers();
+  InvalidateTileDirectHostResolveStoreDontCareCandidates(
+      StoreDontCareUnprovenReason::kDescriptor);
 
   // Clear current bindings
   for (uint32_t i = 0; i < 4; ++i) {
@@ -3240,6 +3333,8 @@ bool MetalRenderTargetCache::EncodePendingDrawPassTransfers(
   if (!HasPendingDrawPassTransfers()) {
     return true;
   }
+  InvalidateTileDirectHostResolveStoreDontCareCandidates(
+      StoreDontCareUnprovenReason::kTransfer);
   ++telemetry_.pending_draw_pass_encode_attempts;
   if (!encoder) {
     ++telemetry_.pending_draw_pass_encode_failures;
@@ -3268,6 +3363,8 @@ bool MetalRenderTargetCache::FlushPendingDrawPassTransfers() {
   if (!HasPendingDrawPassTransfers()) {
     return true;
   }
+  InvalidateTileDirectHostResolveStoreDontCareCandidates(
+      StoreDontCareUnprovenReason::kTransfer);
   ++telemetry_.pending_draw_pass_flush_attempts;
   bool success = PerformTransfersAndResolveClears(
       1 + xenos::kMaxColorRenderTargets,
@@ -3954,6 +4051,10 @@ MTL::RenderPassDescriptor* MetalRenderTargetCache::GetRenderPassDescriptor(
       AttachmentLoadStoreActions color_load_store =
           GetRealAttachmentLoadStoreActions(color_needs_clear,
                                             !color_load_dontcare);
+      if (::cvars::metal_tile_direct_host_resolve &&
+          ::cvars::metal_tile_direct_host_resolve_dontcare_store) {
+        color_load_store.store = MTL::StoreActionUnknown;
+      }
       SetAttachmentLoadStoreActions(color_attachment, color_load_store);
       if (color_needs_clear) {
         color_attachment->setClearColor(
@@ -4825,8 +4926,8 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
     } else {
       ++direct_telemetry.tile_accept_fast;
     }
-    // This is source-side eligibility for a later liveness check. No store action
-    // is changed by this telemetry-only path.
+    // This is source-side eligibility only. No store action is changed by this
+    // telemetry-only path because there is no active tile encoder here.
     ++direct_telemetry.store_dontcare_eligible;
     tile_candidate_recorded = true;
     tile_candidate_pending = false;
@@ -4851,7 +4952,8 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
       IsResolveDirectHostRTFastCandidate(copy_shader);
   const bool copy_shader_is_full_color =
       !resolve_is_depth && IsResolveDirectHostRTFullColorCandidate(copy_shader);
-  if (resolve_has_clear) {
+  if (resolve_has_clear &&
+      (resolve_info.IsClearingDepth() || !resolve_info.IsClearingColor())) {
     record_tile_reject(direct_telemetry.tile_reject_copy_clear);
   } else if (resolve_is_depth) {
     record_tile_reject(direct_telemetry.tile_reject_depth);
@@ -6598,16 +6700,17 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 // - tile_accept_full_color: implemented for the same one-rectangle,
 //   non-scaled, non-uint, active-color-attachment window as tile_accept_fast,
 //   using tile/imageblock loads plus the full color resolve destination packing
-//   path. It intentionally still rejects gamma, depth, copy_clear, uint
-//   transfer views, and scaled resolves.
+//   path. It intentionally still rejects gamma, depth, unsupported copy_clear,
+//   uint transfer views, and scaled resolves.
 // - tile_reject_source_not_current_rt/multi_source_rect: not tile-local enough
 //   for this prototype. Multi-rect/alias cases need either the old compute path
 //   or a different per-rectangle strategy.
 // - tile_reject_depth: possible only with a separate depth/stencil tile path
 //   that preserves Xenos depth rounding/layout rules; not a color-path tweak.
-// - tile_reject_copy_clear: should become a deferred EDRAM ownership/clear
-//   transaction. It is not just a copy shader variant because the clear is a
-//   later visibility rule.
+// - tile_reject_copy_clear: resolve clears that cannot be represented as an
+//   in-pass clear of the same active color attachment. Other cases need a
+//   deferred EDRAM ownership/clear transaction because the clear is a later
+//   visibility rule, not just a copy shader variant.
 // - tile_reject_uint_transfer_view: technically possible only if the tile
 //   shader gets a uint/packed path that exactly matches the transfer view. Keep
 //   rejected until that representation is proven.
@@ -6623,21 +6726,25 @@ MetalRenderTargetCache::GetOrCreateTileDirectHostResolvePipeline(
 //   still active; remaining full_color rejects point at shader/pipeline bugs.
 //
 // Store elision:
-// - store_dontcare_eligible is only source-side eligibility: "if liveness later
-//   proves this host RT does not escape, the tile path could discard the color
-//   attachment store".
-// - store_dontcare_skipped_disabled/attempt/applied explain why source-eligible
-//   cases did or did not call setColorStoreAction(DontCare). The call is
-//   mechanically easy, but semantically valid only when no later host-RT
-//   observer needs the attachment contents. Keep the cvar opt-in until real RT
-//   liveness proof exists.
+// - store_dontcare_eligible is source-side potential only. Xenos copy resolves
+//   export to memory but preserve EDRAM. The active source color attachment can
+//   be discarded only if the post-resolve contents are represented without
+//   depending on the stored attachment.
+// - store_dontcare_skipped_disabled/skipped_unproven/attempt/applied explain why
+//   source-eligible cases did or did not call setColorStoreAction(DontCare).
+//   In-pass copy_clear writes the clear value back to the same attachment, so
+//   those clear contents still need to be stored by the current ownership model.
+// - tile_execute_reject_msaa_store means the tile shader could produce the copy,
+//   but the source is MSAA and the attachment store is not proven discardable.
+//   Prefer the compute direct-host path in that case because it writes the
+//   single-sample export without forcing a raw MSAA attachment store.
 //
 // Representative prototype telemetry:
 // - Fast subset covered: 360/360 in one sample, 478/480 in another; the missing
 //   fast cases were no-active-encoder timing, not shader capability.
 // - Not-yet-covered recurring buckets after the full_color expansion: depth,
-//   copy_clear, uint transfer view, format mismatch, scaled resolves, and
-//   no_active scheduling.
+//   non-color/same-RT copy_clear, uint transfer view, format mismatch, scaled
+//   resolves, and no_active scheduling.
 bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     const ResolvePlan& resolve_plan,
     MTL::RenderCommandEncoder* active_render_encoder,
@@ -6816,6 +6923,14 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     return reject_with(direct_telemetry.tile_execute_reject_attachment);
   }
 
+  // MSAA tile resolves are only beneficial if the source attachment store is
+  // elided. That proof happens at encoder end, so avoid speculatively choosing
+  // the tile path for MSAA unless explicitly requested for A/B testing.
+  if (key.msaa_samples != xenos::MsaaSamples::k1X &&
+      !::cvars::metal_tile_direct_host_resolve_msaa_store) {
+    return reject_with(direct_telemetry.tile_execute_reject_msaa_store);
+  }
+
   TransferAttachmentFormats attachment_formats;
   if (!GetActiveTransferAttachmentFormats(active_render_pass_descriptor,
                                           attachment_formats)) {
@@ -6970,17 +7085,15 @@ bool MetalRenderTargetCache::TryTileDirectHostResolveCopy(
     ++direct_telemetry.tile_accept_fast;
   }
   ++direct_telemetry.store_dontcare_eligible;
-  // Source-side eligibility is not attachment liveness proof. Keep storing
-  // until AttachmentPlan proves no later host RT observer can read this color.
-  const bool store_dontcare_liveness_proven = false;
-  if (::cvars::metal_tile_direct_host_resolve_dontcare_store &&
-      store_dontcare_liveness_proven) {
-    ++direct_telemetry.store_dontcare_attempt;
-    active_render_encoder->setColorStoreAction(MTL::StoreActionDontCare,
-                                               color_attachment_index);
-    ++direct_telemetry.store_dontcare_applied;
-  } else {
+  if (!::cvars::metal_tile_direct_host_resolve_dontcare_store) {
     ++direct_telemetry.store_dontcare_skipped_disabled;
+  } else {
+    TileDirectHostResolveStoreDontCareCandidate& candidate =
+        tile_direct_host_resolve_store_dontcare_candidates_
+            [color_attachment_index];
+    candidate.valid = true;
+    candidate.key = key;
+    candidate.texture = source_texture;
   }
   ++direct_telemetry.tile_execute_success;
   return true;

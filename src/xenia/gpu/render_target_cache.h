@@ -595,6 +595,10 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+  // Returns whether any EDRAM ownership range still names this render target as
+  // the latest contents backing.
+  bool IsRenderTargetOwnershipLive(RenderTargetKey key) const;
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;

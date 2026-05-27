@@ -1507,6 +1507,22 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(
   return false;
 }
 
+bool RenderTargetCache::IsRenderTargetOwnershipLive(RenderTargetKey key) const {
+  if (key.IsEmpty()) {
+    return false;
+  }
+  bool host_depth_encoding_different =
+      key.is_depth && GetPath() == Path::kHostRenderTargets &&
+      IsHostDepthEncodingDifferent(key.GetDepthFormat());
+  for (const auto& ownership_range_pair : ownership_ranges_) {
+    if (ownership_range_pair.second.IsOwnedBy(
+            key, host_depth_encoding_different)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void RenderTargetCache::ChangeOwnership(
     RenderTargetKey dest, uint32_t start_tiles_base_relative,
     uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,

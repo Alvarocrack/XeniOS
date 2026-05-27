@@ -1426,6 +1426,10 @@ void MetalCommandProcessor::ShutdownContext() {
   // End the render encoder directly (not via EndRenderEncoder — we release
   // the encoder object below after the command buffer completes).
   if (current_render_encoder_) {
+    if (render_target_cache_) {
+      render_target_cache_->FinalizeTileDirectHostResolveStoreActions(
+          current_render_encoder_, current_render_pass_descriptor_);
+    }
     UpdateSharedMemoryFenceForActiveRenderEncoder();
     current_render_encoder_->endEncoding();
   }
@@ -4531,6 +4535,11 @@ bool MetalCommandProcessor::DispatchDraw(
     const std::vector<Shader::VertexBinding>& vb_bindings,
     const VertexBindingRange* vertex_ranges, uint32_t vertex_range_count,
     IndexBufferInfo* index_buffer_info) {
+  if (render_target_cache_) {
+    render_target_cache_
+        ->InvalidateTileDirectHostResolveStoreDontCareCandidates(
+            MetalRenderTargetCache::StoreDontCareUnprovenReason::kLaterDraw);
+  }
   // Bind vertex buffers / descriptors.
   if (use_geometry_emulation || use_tessellation_emulation) {
     IRRuntimeVertexBuffers vertex_buffers = {};
@@ -6191,17 +6200,18 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_run_planner_resolve_tile_success +
       direct_host_stats.tile_execute_success;
   // The render-target cache reports source-side StoreActionDontCare potential.
-  // Until AttachmentPlan proves no later host observer needs the attachment,
-  // planner telemetry must keep these cases unproven even if the legacy
-  // experimental cvar still applies DontCare for A/B testing.
+  // Copy-only Xenos resolves preserve EDRAM contents, so direct tile resolves
+  // are not counted as proven until the RT ownership transaction proves the
+  // source contents are dead.
   const uint64_t planner_store_dontcare_eligible =
       backend_telemetry_.render_run_planner_store_dontcare_eligible +
       direct_host_stats.store_dontcare_eligible;
   const uint64_t planner_store_dontcare_proven =
-      backend_telemetry_.render_run_planner_store_dontcare_proven;
+      backend_telemetry_.render_run_planner_store_dontcare_proven +
+      direct_host_stats.store_dontcare_applied;
   const uint64_t planner_store_dontcare_rejected =
       backend_telemetry_.render_run_planner_store_dontcare_rejected +
-      direct_host_stats.store_dontcare_eligible;
+      direct_host_stats.store_dontcare_skipped_unproven;
 
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
@@ -6553,7 +6563,8 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       "tile total/accept={}/{} accept fast/full={}/{} "
       "tile_reject current/multi/depth/copy_clear/uint={}/{}/{}/{}/{} "
       "tile_execute attempt/success/reject={}/{}/{} "
-      "store_dontcare eligible/skipped_disabled/attempt/applied={}/{}/{}/{}",
+      "store_dontcare eligible/skipped_disabled/skipped_unproven/"
+      "attempt/applied={}/{}/{}/{}/{}",
       reason, direct_host_stats.direct_host_attempt,
       direct_host_stats.direct_host_success,
       direct_host_stats.direct_host_reject_gamma,
@@ -6574,13 +6585,15 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       direct_host_stats.tile_execute_reject,
       direct_host_stats.store_dontcare_eligible,
       direct_host_stats.store_dontcare_skipped_disabled,
+      direct_host_stats.store_dontcare_skipped_unproven,
       direct_host_stats.store_dontcare_attempt,
       direct_host_stats.store_dontcare_applied);
   XELOGI(
       "MetalTelemetry[{}]: resolve_direct_host tile_execute_reject_detail "
       "invalid/no_active/scaled/copy_clear/depth/shader/full_color/gamma/"
       "sample/exp_bias/format={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} "
-      "multi/current/uint/texture/attachment/pipeline/dest={}/{}/{}/{}/{}/{}/{}",
+      "multi/current/uint/texture/attachment/msaa_store/pipeline/dest="
+      "{}/{}/{}/{}/{}/{}/{}/{}",
       reason, direct_host_stats.tile_execute_reject_invalid,
       direct_host_stats.tile_execute_reject_no_active,
       direct_host_stats.tile_execute_reject_scaled,
@@ -6597,8 +6610,16 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       direct_host_stats.tile_execute_reject_uint_transfer_view,
       direct_host_stats.tile_execute_reject_texture,
       direct_host_stats.tile_execute_reject_attachment,
+      direct_host_stats.tile_execute_reject_msaa_store,
       direct_host_stats.tile_execute_reject_pipeline,
       direct_host_stats.tile_execute_reject_dest_buffer);
+  XELOGI(
+      "MetalTelemetry[{}]: resolve_direct_host store_dontcare_unproven_detail "
+      "later_draw/transfer/ownership_live/descriptor={}/{}/{}/{}",
+      reason, direct_host_stats.store_dontcare_unproven_later_draw,
+      direct_host_stats.store_dontcare_unproven_transfer,
+      direct_host_stats.store_dontcare_unproven_ownership_live,
+      direct_host_stats.store_dontcare_unproven_descriptor);
   XELOGI(
       "MetalTelemetry[{}]: resolve_direct_host tile_no_active_last_end "
       "reasons={{ {} }}",
@@ -6697,6 +6718,10 @@ void MetalCommandProcessor::EndRenderEncoder(RenderEncoderEndReason reason) {
       reason_index < kRenderEncoderEndReasonCount
           ? uint32_t(reason_index)
           : uint32_t(RenderEncoderEndReason::kUnknown);
+  if (render_target_cache_) {
+    render_target_cache_->FinalizeTileDirectHostResolveStoreActions(
+        current_render_encoder_, current_render_pass_descriptor_);
+  }
   UpdateSharedMemoryFenceForActiveRenderEncoder();
   current_render_encoder_->endEncoding();
   current_render_encoder_->release();
