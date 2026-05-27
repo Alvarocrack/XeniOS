@@ -2918,8 +2918,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
 
-  if (uses_vertex_fetch || guest_dma_index_buffer_read ||
-      shader_primitive_index_load || used_texture_mask) {
+  if (!current_render_encoder_ &&
+      (uses_vertex_fetch || guest_dma_index_buffer_read ||
+       shader_primitive_index_load || used_texture_mask)) {
     WarmVertexFetchSharedMemoryBeforeRenderPass(
         *vertex_shader, vertex_fetch_ranges.data(), vertex_fetch_range_count,
         memexport_used, used_texture_mask);
