@@ -7352,7 +7352,20 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         case xenos::PM4_REG_TO_MEM:
           result.stop_reason = VertexFetchWarmerStopReason::kMemWrite;
           goto finish_parse;
-        case xenos::PM4_EVENT_WRITE:
+        case xenos::PM4_EVENT_WRITE: {
+          if (count != 1) {
+            result.stop_reason = VertexFetchWarmerStopReason::kEventOrQuery;
+            goto finish_parse;
+          }
+          uint32_t initiator = warm_reader.ReadAndSwap<uint32_t>();
+          uint32_t event_type = initiator & 0x3F;
+          if (!WriteSpeculativeRegister(warm_regs,
+                                        XE_GPU_REG_VGT_EVENT_INITIATOR,
+                                        event_type)) {
+            mark_unsupported_packet(packet, count);
+            goto finish_parse;
+          }
+        } break;
         case xenos::PM4_EVENT_WRITE_SHD:
         case xenos::PM4_EVENT_WRITE_CFL:
         case xenos::PM4_EVENT_WRITE_EXT:
