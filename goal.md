@@ -486,6 +486,31 @@ Validation:
 Purpose: solve the original upload-before-render-pass problem without a draw
 queue.
 
+Immediate correction from the May 27 Gears telemetry:
+
+- The `PM4_EVENT_WRITE_EXT` barrier was successfully narrowed from a generic stop
+  to a fixed 12-byte crossed-write range, but render-pass churn did not improve
+  because the next deterministic scanner wall became shader loads.
+- The measured blocker is `shader_load_or_unknown_shader_state`, dominated by
+  `PM4_IM_LOAD` (`0x27`) and `PM4_IM_LOAD_IMMEDIATE` (`0x2B`).
+- UploadPlan v1 must therefore carry scan-local active shader state:
+  `Shader* scan_vertex_shader` and `Shader* scan_pixel_shader`. These are
+  pointers to shader-cache objects only, not copied draw records.
+- `PM4_IM_LOAD` and `PM4_IM_LOAD_IMMEDIATE` may be crossed only by loading the
+  shader through the existing shader cache, updating the scan-local active shader
+  pointer, and using the scan-local vertex shader for later vertex-fetch range
+  collection.
+- Pointer shader loads are guest-memory reads. They may not be crossed if their
+  source range overlaps a guest-memory write range crossed earlier by the scanner.
+- Embedded shader loads (`PM4_IM_LOAD_IMMEDIATE`) do not add a guest-memory read
+  dependency, but they still update only scan-local active shader state.
+- After any scan-local shader change, speculative texture preload must not reuse
+  the current draw's texture mask. Texture work should be skipped or collected
+  only when the future shader texture mask is proven separately.
+- If a scan-local future shader has memexport, the scanner must stop before
+  planning across that draw. UploadPlan cannot move host materialization across a
+  future render-pass shared-memory write.
+
 Scope:
 
 - Start with upload/materialization only.
@@ -514,7 +539,7 @@ Build path:
    - conservative vertex fetch ranges
    - guest DMA index range
    - shader primitive index range
-   - texture request mask
+   - texture request mask only when it is proven for the scan-local shader state
 7. Coalesce/deduplicate shared-memory ranges.
 8. Call `RequestSharedMemoryRanges` before `BeginRenderEncoderForDraw`.
 9. Call `texture_cache_->RequestTextures` before `BeginRenderEncoderForDraw`.
@@ -567,12 +592,25 @@ Hard stops:
 - `PM4_EVENT_WRITE_ZPD`
 - query begin/end/resolve boundaries
 - unknown type-3 packet
-- shader load or unknown shader state mutation
+- shader load or unknown shader state mutation, except `PM4_IM_LOAD` and
+  `PM4_IM_LOAD_IMMEDIATE` after the scan-local shader-state rules in Patch 5 are
+  implemented
 - draw with memexport
 - `RB_MODECONTROL` with `EdramMode::kCopy`
 - render target/depth state change not proven compatible
 - any packet that may write guest memory
 - budget exhaustion
+
+StopPlan must expose the remaining wall directly in telemetry. At minimum,
+shader-state stops must report opcode counts, and separately tracked shader-load
+crossing telemetry must report:
+
+- pointer shader loads crossed
+- immediate shader loads crossed
+- pointer shader load overlap stops
+- shader load out-of-bounds stops
+- future memexport stops
+- texture preload skips after shader state changes
 
 Why this is correct:
 
