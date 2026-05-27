@@ -7068,7 +7068,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     Shader* warm_pixel_shader = active_pixel_shader();
     uint64_t warm_bin_select = bin_select_;
     uint64_t warm_bin_mask = bin_mask_;
-    bool texture_preload_safe_after_shader_state = true;
+    bool scan_shader_state_changed = false;
 
     auto scanned_dwords = [&]() {
       uint32_t remaining_dwords =
@@ -7174,9 +7174,11 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       switch (shader_type) {
         case xenos::ShaderType::kVertex:
           warm_vertex_shader = shader;
+          scan_shader_state_changed = true;
           return true;
         case xenos::ShaderType::kPixel:
           warm_pixel_shader = shader;
+          scan_shader_state_changed = true;
           return true;
       }
       ++backend_telemetry_.render_run_planner_im_load_invalid_type_stops;
@@ -7202,6 +7204,25 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         shader->AnalyzeUcode(pipeline_cache_->ucode_disasm_buffer());
       }
       return true;
+    };
+    auto get_scan_shader_texture_mask = [&](Shader* shader) {
+      if (!shader) {
+        return uint32_t(0);
+      }
+      if (!analyze_scan_shader(shader)) {
+        return uint32_t(0);
+      }
+      uint32_t texture_mask = 0;
+      for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+        if (binding.fetch_constant < xenos::kTextureFetchConstantCount) {
+          texture_mask |= uint32_t(1) << binding.fetch_constant;
+        }
+      }
+      return texture_mask;
+    };
+    auto get_scan_used_texture_mask = [&]() {
+      return get_scan_shader_texture_mask(warm_vertex_shader) |
+             get_scan_shader_texture_mask(warm_pixel_shader);
     };
     auto scan_shader_memexport_used = [&]() {
       if (!analyze_scan_shader(warm_vertex_shader) ||
@@ -7317,17 +7338,17 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         }
       }
 
-      if (texture_cache_ && used_texture_mask) {
-        if (!texture_preload_safe_after_shader_state) {
-          ++backend_telemetry_
-                .render_run_planner_texture_after_shader_load_skipped;
-        } else if (crossed_guest_write_range_count) {
+      uint32_t scan_texture_mask =
+          scan_shader_state_changed ? get_scan_used_texture_mask()
+                                    : used_texture_mask;
+      if (texture_cache_ && scan_texture_mask) {
+        if (crossed_guest_write_range_count) {
           ++backend_telemetry_
                 .render_run_planner_texture_after_guest_write_skipped;
         } else {
           MetalTextureCache::PreloadTexturesResult preload_result =
               texture_cache_->PreloadTexturesFromRegisterFile(
-                  warm_regs, used_texture_mask);
+                  warm_regs, scan_texture_mask);
           result.texture_request_count += preload_result.request_count;
           result.texture_load_count += preload_result.load_count;
         }
@@ -7664,7 +7685,6 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           if (!set_scan_shader(shader_type, shader, opcode)) {
             goto finish_parse;
           }
-          texture_preload_safe_after_shader_state = false;
           ++backend_telemetry_.render_run_planner_im_load_crossed;
         } break;
         case xenos::PM4_IM_LOAD_IMMEDIATE: {
@@ -7693,7 +7713,6 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
           }
           warm_reader.AdvanceRead(size_dwords * sizeof(uint32_t));
           warm_reader.AdvanceRead((count - 2 - size_dwords) * sizeof(uint32_t));
-          texture_preload_safe_after_shader_state = false;
           ++backend_telemetry_.render_run_planner_im_load_immediate_crossed;
         } break;
         case xenos::PM4_LOAD_CONSTANT_CONTEXT:
