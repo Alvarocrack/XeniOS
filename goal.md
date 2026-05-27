@@ -846,11 +846,12 @@ Minimum checks after each patch:
 git status --short --branch
 git diff --check
 rg -n "PreparedDraw|pending_draw_run_|FlushPendingDrawRun|QueuePreparedDraw|EncodePreparedDraw|DeferredDraw" src/xenia/gpu/metal
-./xb build --config=release --target=xenia-gpu-metal
+./xb build --config release --disable-lto
 ```
 
-If the exact build target name differs locally, use the closest existing Metal
-GPU target from this checkout and record the command used in the patch notes.
+Use only `./xb build --config release --disable-lto` for build validation unless
+the user explicitly gives a new build command later. Do not substitute
+target-specific Metal builds.
 
 Runtime checks:
 
