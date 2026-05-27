@@ -2944,8 +2944,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       (uses_vertex_fetch || guest_dma_index_buffer_read ||
        shader_primitive_index_load || used_texture_mask)) {
     WarmVertexFetchSharedMemoryBeforeRenderPass(
-        *vertex_shader, vertex_fetch_ranges.data(), vertex_fetch_range_count,
-        memexport_used, used_texture_mask);
+        vertex_fetch_ranges.data(), vertex_fetch_range_count, memexport_used,
+        used_texture_mask);
   }
   if (shared_memory_ && vertex_fetch_range_count &&
       !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
@@ -4895,6 +4895,7 @@ bool MetalCommandProcessor::IssueCopy() {
           written_length)) {
     InvalidateRenderEncoderStateAfterDrawPassTransfers(
         MetalRenderTargetCache::kDrawPassTransferEncoderMutationPipeline);
+    WarmRenderRunAfterCopy();
     return true;
   }
 
@@ -4916,6 +4917,7 @@ bool MetalCommandProcessor::IssueCopy() {
     return false;
   }
 
+  WarmRenderRunAfterCopy();
   return true;
 }
 
@@ -7021,10 +7023,37 @@ void MetalCommandProcessor::RecordVertexFetchWarmerUnsupportedPacket(
       [opcode] += payload_dword_count;
 }
 
+uint32_t MetalCommandProcessor::GetActiveShaderTextureMaskForPreflight() {
+  auto get_shader_texture_mask = [&](Shader* shader) {
+    if (!shader) {
+      return uint32_t(0);
+    }
+    if (!shader->is_ucode_analyzed()) {
+      shader->AnalyzeUcode(pipeline_cache_->ucode_disasm_buffer());
+    }
+    uint32_t mask = 0;
+    for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+      if (binding.fetch_constant < xenos::kTextureFetchConstantCount) {
+        mask |= uint32_t(1) << binding.fetch_constant;
+      }
+    }
+    return mask;
+  };
+  return get_shader_texture_mask(active_vertex_shader()) |
+         get_shader_texture_mask(active_pixel_shader());
+}
+
+void MetalCommandProcessor::WarmRenderRunAfterCopy() {
+  if (current_render_encoder_) {
+    return;
+  }
+  WarmVertexFetchSharedMemoryBeforeRenderPass(
+      nullptr, 0, false, GetActiveShaderTextureMaskForPreflight());
+}
+
 void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
-    const Shader& vertex_shader, const SharedMemory::Range* current_ranges,
-    uint32_t current_range_count, bool current_draw_memexport_used,
-    uint32_t used_texture_mask) {
+    const SharedMemory::Range* current_ranges, uint32_t current_range_count,
+    bool current_draw_memexport_used, uint32_t used_texture_mask) {
   ++backend_telemetry_.vertex_fetch_warmer_attempts;
   auto map_stop_reason =
       [](VertexFetchWarmerStopReason reason) -> RenderRunPlannerStopReason {
