@@ -6091,6 +6091,24 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (tile_no_active_last_end_reasons.empty()) {
     tile_no_active_last_end_reasons = "none";
   }
+  const uint64_t planner_resolve_tile_attempt =
+      backend_telemetry_.render_run_planner_resolve_tile_attempt +
+      direct_host_stats.tile_execute_attempt;
+  const uint64_t planner_resolve_tile_success =
+      backend_telemetry_.render_run_planner_resolve_tile_success +
+      direct_host_stats.tile_execute_success;
+  // The render-target cache reports source-side StoreActionDontCare potential.
+  // Until AttachmentPlan proves no later host observer needs the attachment,
+  // planner telemetry must keep these cases unproven even if the legacy
+  // experimental cvar still applies DontCare for A/B testing.
+  const uint64_t planner_store_dontcare_eligible =
+      backend_telemetry_.render_run_planner_store_dontcare_eligible +
+      direct_host_stats.store_dontcare_eligible;
+  const uint64_t planner_store_dontcare_proven =
+      backend_telemetry_.render_run_planner_store_dontcare_proven;
+  const uint64_t planner_store_dontcare_rejected =
+      backend_telemetry_.render_run_planner_store_dontcare_rejected +
+      direct_host_stats.store_dontcare_eligible;
 
   XELOGI(
       "MetalTelemetry[{}]: swaps={} draws={} prepare_consts={} pipelines "
@@ -6128,11 +6146,9 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.render_run_planner_miss_active_texture_upload,
       backend_telemetry_.render_run_planner_miss_active_guest_index_copy,
       render_run_planner_host_miss_sources,
-      backend_telemetry_.render_run_planner_resolve_tile_attempt,
-      backend_telemetry_.render_run_planner_resolve_tile_success,
-      backend_telemetry_.render_run_planner_store_dontcare_eligible,
-      backend_telemetry_.render_run_planner_store_dontcare_proven,
-      backend_telemetry_.render_run_planner_store_dontcare_rejected,
+      planner_resolve_tile_attempt, planner_resolve_tile_success,
+      planner_store_dontcare_eligible, planner_store_dontcare_proven,
+      planner_store_dontcare_rejected,
       render_run_planner_stop_reasons);
   XELOGI(
       "MetalTelemetry[{}]: render_encoder begin_calls={} reused={} created={} "
