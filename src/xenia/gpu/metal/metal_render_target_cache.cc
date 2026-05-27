@@ -2368,13 +2368,13 @@ bool MetalRenderTargetCache::PrepareResolveDestinationBuffer(
   if (!destination.buffer) {
     return false;
   }
-  // TODO(xenios-jp): Route resolve/export destination residency through a
-  // command-processor preflight reason instead of calling shared memory
-  // directly. A direct request here can lazily open the shared-memory upload
-  // blit encoder and end an active render pass; the residency planner should
-  // discover and batch these ranges before opening the render encoder.
-  return shared->RequestRange(resolve_info.copy_dest_extent_start,
-                              resolve_info.copy_dest_extent_length);
+  // TODO(xenios-jp): Move resolve/export destination residency into a
+  // command-processor preflight before the render encoder is opened. Keeping it
+  // classified here makes the remaining active shared-memory upload breaks
+  // visible as resolve_copy_dest telemetry.
+  return command_processor_.RequestSharedMemoryRange(
+      MetalCommandProcessor::SharedMemoryRequestReason::kResolveCopyDest,
+      resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
 }
 
 MTL::ComputePipelineState* MetalRenderTargetCache::GetResolvePipeline(

@@ -616,10 +616,21 @@ class TextureCache {
     kBase,
     kMips,
   };
+  virtual void BeginDirectTextureDataRangeSharedMemoryRequest(
+      TextureDataRangeSource, uint32_t, uint32_t) {}
+  virtual void EndDirectTextureDataRangeSharedMemoryRequest() {}
   virtual bool RequestTextureDataRange(Texture& texture,
                                        TextureDataRangeSource source,
                                        uint32_t start, uint32_t length) {
-    return shared_memory().RequestRange(start, length);
+    // TODO(xenios-jp): Metal must not reach this base direct shared-memory
+    // request while a render encoder is active. It bypasses
+    // MetalCommandProcessor's request reason scope and appears as
+    // shared_memory_upload_low_level unknown; route Metal texture residency
+    // through the backend preflight instead.
+    BeginDirectTextureDataRangeSharedMemoryRequest(source, start, length);
+    bool requested = shared_memory().RequestRange(start, length);
+    EndDirectTextureDataRangeSharedMemoryRequest();
+    return requested;
   }
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is

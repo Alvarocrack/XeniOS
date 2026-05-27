@@ -95,6 +95,7 @@ bool MetalSharedMemory::UploadRanges(
     XELOGE("MetalSharedMemory::UploadRanges: upload buffer pool is null");
     return false;
   }
+  command_processor_.RecordSharedMemoryUploadRangeBatch(num_upload_ranges);
 
   void* xbox_ram = memory().TranslatePhysical(0);
   if (!xbox_ram) {

@@ -724,8 +724,28 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     return command_processor_->RequestSharedMemoryRanges(
         reason, ranges.data(), static_cast<uint32_t>(ranges.size()));
   }
+  // TODO(xenios-jp): This direct fallback bypasses the CP reason scope and will
+  // show up as shared_memory_upload_low_level unknown if it ever opens a Metal
+  // shared-memory upload blit encoder. Metal texture upload paths should keep a
+  // command processor and use the classified preflight above.
   return shared_memory().RequestRanges(ranges.data(),
                                        static_cast<uint32_t>(ranges.size()));
+}
+
+void MetalTextureCache::BeginDirectTextureDataRangeSharedMemoryRequest(
+    TextureDataRangeSource source, uint32_t start, uint32_t length) {
+  (void)source;
+  (void)start;
+  (void)length;
+  if (command_processor_) {
+    command_processor_->BeginTextureCacheBaseDirectSharedMemoryUpload();
+  }
+}
+
+void MetalTextureCache::EndDirectTextureDataRangeSharedMemoryRequest() {
+  if (command_processor_) {
+    command_processor_->EndTextureCacheBaseDirectSharedMemoryUpload();
+  }
 }
 
 bool MetalTextureCache::RequestTextureDataRange(

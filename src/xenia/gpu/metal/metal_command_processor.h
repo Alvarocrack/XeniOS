@@ -120,10 +120,18 @@ class MetalCommandProcessor final : public CommandProcessor {
     kTextureBase,
     kTextureMips,
     kTextureBaseAndMips,
+    kResolveCopyDest,
     kCount,
   };
   static constexpr size_t kSharedMemoryRequestReasonCount =
       static_cast<size_t>(SharedMemoryRequestReason::kCount);
+  enum class SharedMemoryUploadDirectSource : uint32_t {
+    kNone,
+    kTextureCacheBaseRequestTextureDataRange,
+    kCount,
+  };
+  static constexpr size_t kSharedMemoryUploadDirectSourceCount =
+      static_cast<size_t>(SharedMemoryUploadDirectSource::kCount);
   enum class SharedMemoryPlannerStopReason : uint32_t {
     kAlreadyResident,
     kUploadBeforeRenderEncoder,
@@ -143,10 +151,15 @@ class MetalCommandProcessor final : public CommandProcessor {
       TransferRequestSource source = TransferRequestSource::kUnknown);
   bool RequestSharedMemoryRange(SharedMemoryRequestReason reason,
                                 uint32_t start, uint32_t length);
+  bool RequestSharedMemoryRangeBeforeDrawPass(SharedMemoryRequestReason reason,
+                                              uint32_t start, uint32_t length);
   bool RequestSharedMemoryRanges(SharedMemoryRequestReason reason,
                                  const SharedMemory::Range* ranges,
                                  uint32_t range_count);
+  void BeginTextureCacheBaseDirectSharedMemoryUpload();
+  void EndTextureCacheBaseDirectSharedMemoryUpload();
   void RecordSharedMemoryPlannerStop(SharedMemoryPlannerStopReason reason);
+  void RecordSharedMemoryUploadRangeBatch(uint32_t page_range_count);
   MTL::BlitCommandEncoder* GetSharedMemoryUploadBlitEncoder();
   void EndSharedMemoryUploadBlitEncoder();
 
@@ -538,6 +551,8 @@ class MetalCommandProcessor final : public CommandProcessor {
         transfer_request_sources_active = {};
     std::array<uint64_t, kTransferRequestSourceCount>
         transfer_request_sources_no_active = {};
+    std::array<uint64_t, kTransferRequestSourceCount>
+        transfer_request_render_encoder_ends = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_calls_total = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
@@ -549,6 +564,10 @@ class MetalCommandProcessor final : public CommandProcessor {
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_invalid_input_ranges = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_invalid_input_ranges_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_invalid_input_ranges_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_upload_calls_total = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_upload_calls_active = {};
@@ -559,18 +578,69 @@ class MetalCommandProcessor final : public CommandProcessor {
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_upload_page_ranges_after_coalesce = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_before_coalesce_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_after_coalesce_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_before_coalesce_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_page_ranges_after_coalesce_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_upload_bytes = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_bytes_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_request_upload_bytes_no_active = {};
     std::array<uint64_t, kSharedMemoryRequestReasonCount>
         shared_memory_request_failures = {};
     std::array<uint64_t, kSharedMemoryPlannerStopReasonCount>
         shared_memory_planner_stop_reasons = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_range_calls_total = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_range_calls_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_range_calls_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_range_page_ranges = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_blit_requests_total = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_blit_requests_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_blit_requests_no_active = {};
+    std::array<uint64_t, kSharedMemoryRequestReasonCount>
+        shared_memory_upload_blit_render_encoder_ends = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_range_calls_total = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_range_calls_active = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_range_calls_no_active = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_range_page_ranges = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_blit_requests_total = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_blit_requests_active = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_blit_requests_no_active = {};
+    std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>
+        shared_memory_upload_unknown_direct_blit_render_encoder_ends = {};
     uint64_t vertex_fetch_warmer_attempts = 0;
     uint64_t vertex_fetch_warmer_used = 0;
     uint64_t vertex_fetch_warmer_skipped = 0;
     uint64_t vertex_fetch_warmer_draws = 0;
     uint64_t vertex_fetch_warmer_ranges = 0;
+    uint64_t vertex_fetch_warmer_index_ranges = 0;
     std::array<uint64_t, kVertexFetchWarmerStopReasonCount>
         vertex_fetch_warmer_stop_reasons = {};
+    std::array<uint64_t, 4> vertex_fetch_warmer_unsupported_packet_types = {};
+    std::array<uint64_t, 128>
+        vertex_fetch_warmer_unsupported_type3_opcodes = {};
+    std::array<uint64_t, 128>
+        vertex_fetch_warmer_unsupported_type3_payload_dwords = {};
+    uint64_t vertex_fetch_warmer_unsupported_no_packet = 0;
 
     uint64_t pending_transfer_encode_attempts = 0;
     uint64_t pending_transfer_encode_successes = 0;
@@ -654,6 +724,8 @@ class MetalCommandProcessor final : public CommandProcessor {
                                    uint32_t range_count) const;
   bool HasActiveSharedMemoryWritePending() const;
   void RecordVertexFetchWarmerStop(VertexFetchWarmerStopReason reason);
+  void RecordVertexFetchWarmerUnsupportedPacket(uint32_t packet,
+                                                uint32_t payload_dword_count);
   void WarmVertexFetchSharedMemoryBeforeRenderPass(
       const Shader& vertex_shader, const SharedMemory::Range* current_ranges,
       uint32_t current_range_count, bool current_draw_memexport_used);
@@ -748,6 +820,13 @@ class MetalCommandProcessor final : public CommandProcessor {
   MTL::SharedEvent* wait_shared_event_ = nullptr;
   uint64_t wait_shared_event_value_ = 0;
   MTL::Fence* shared_memory_fence_ = nullptr;
+  SharedMemoryRequestReason current_shared_memory_upload_reason_ =
+      SharedMemoryRequestReason::kUnknown;
+  SharedMemoryUploadDirectSource current_shared_memory_upload_direct_source_ =
+      SharedMemoryUploadDirectSource::kNone;
+  SharedMemoryUploadDirectSource previous_shared_memory_upload_direct_source_ =
+      SharedMemoryUploadDirectSource::kNone;
+  uint32_t shared_memory_upload_direct_source_depth_ = 0;
 
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;

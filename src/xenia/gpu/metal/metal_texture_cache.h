@@ -142,6 +142,9 @@ class MetalTextureCache : public TextureCache {
                                     uint32_t texture_count,
                                     uint64_t base_outdated_mask,
                                     uint64_t mips_outdated_mask) override;
+  void BeginDirectTextureDataRangeSharedMemoryRequest(
+      TextureDataRangeSource source, uint32_t start, uint32_t length) override;
+  void EndDirectTextureDataRangeSharedMemoryRequest() override;
   bool RequestTextureDataRange(Texture& texture, TextureDataRangeSource source,
                                uint32_t start, uint32_t length) override;
 

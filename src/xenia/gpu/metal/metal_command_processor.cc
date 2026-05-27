@@ -200,6 +200,18 @@ bool WriteSpeculativeRegisterRangeFromRing(xe::RingBuffer* ring,
   return true;
 }
 
+bool WriteSpeculativeOneRegisterFromRing(xe::RingBuffer* ring,
+                                         RegisterFile& regs, uint32_t index,
+                                         uint32_t count) {
+  if (index >= RegisterFile::kRegisterCount) {
+    return false;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    regs.values[index] = ring->ReadAndSwap<uint32_t>();
+  }
+  return true;
+}
+
 bool GetTextureSize(MTL::Texture* texture, uint32_t& width_out,
                     uint32_t& height_out) {
   if (!texture) {
@@ -553,7 +565,22 @@ const char* SharedMemoryRequestReasonName(size_t reason) {
       return "texture_mips";
     case Reason::kTextureBaseAndMips:
       return "texture_base_and_mips";
+    case Reason::kResolveCopyDest:
+      return "resolve_copy_dest";
     case Reason::kCount:
+      break;
+  }
+  return "invalid";
+}
+
+const char* SharedMemoryUploadDirectSourceName(size_t source) {
+  using Source = MetalCommandProcessor::SharedMemoryUploadDirectSource;
+  switch (static_cast<Source>(source)) {
+    case Source::kNone:
+      return "none";
+    case Source::kTextureCacheBaseRequestTextureDataRange:
+      return "texture_cache_base";
+    case Source::kCount:
       break;
   }
   return "invalid";
@@ -2811,7 +2838,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
 
-  if (vertex_fetch_range_count) {
+  if (uses_vertex_fetch || guest_dma_index_buffer_read ||
+      shader_primitive_index_load) {
     WarmVertexFetchSharedMemoryBeforeRenderPass(
         *vertex_shader, vertex_fetch_ranges.data(), vertex_fetch_range_count,
         memexport_used);
@@ -5464,6 +5492,24 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (transfer_request_sources.empty()) {
     transfer_request_sources = "none";
   }
+  std::string transfer_request_render_end_sources;
+  for (size_t i = 0;
+       i < backend_telemetry_.transfer_request_render_encoder_ends.size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_.transfer_request_render_encoder_ends[i];
+    if (!count) {
+      continue;
+    }
+    if (!transfer_request_render_end_sources.empty()) {
+      transfer_request_render_end_sources += ", ";
+    }
+    transfer_request_render_end_sources +=
+        fmt::format("{}={}", TransferRequestSourceName(i), count);
+  }
+  if (transfer_request_render_end_sources.empty()) {
+    transfer_request_render_end_sources = "none";
+  }
 
   auto format_shared_memory_request_triplets =
       [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& total,
@@ -5505,6 +5551,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
         }
         return formatted;
       };
+  auto format_shared_memory_request_pairs =
+      [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& first,
+         const std::array<uint64_t, kSharedMemoryRequestReasonCount>& second) {
+        std::string formatted;
+        for (size_t i = 0; i < first.size(); ++i) {
+          if (!first[i] && !second[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted += fmt::format("{}={}/{}", SharedMemoryRequestReasonName(i),
+                                   first[i], second[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
   auto format_shared_memory_request_page_counts =
       [](const std::array<uint64_t, kSharedMemoryRequestReasonCount>& before,
          const std::array<uint64_t, kSharedMemoryRequestReasonCount>& after) {
@@ -5536,6 +5601,12 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   std::string shared_memory_request_invalid_ranges =
       format_shared_memory_request_counts(
           backend_telemetry_.shared_memory_request_invalid_input_ranges);
+  std::string shared_memory_request_invalid_ranges_active =
+      format_shared_memory_request_pairs(
+          backend_telemetry_
+              .shared_memory_request_invalid_input_ranges_active,
+          backend_telemetry_
+              .shared_memory_request_invalid_input_ranges_no_active);
   std::string shared_memory_request_upload_calls =
       format_shared_memory_request_triplets(
           backend_telemetry_.shared_memory_request_upload_calls_total,
@@ -5547,9 +5618,25 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
               .shared_memory_request_upload_page_ranges_before_coalesce,
           backend_telemetry_
               .shared_memory_request_upload_page_ranges_after_coalesce);
+  std::string shared_memory_request_upload_pages_active =
+      format_shared_memory_request_page_counts(
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_before_coalesce_active,
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_after_coalesce_active);
+  std::string shared_memory_request_upload_pages_no_active =
+      format_shared_memory_request_page_counts(
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_before_coalesce_no_active,
+          backend_telemetry_
+              .shared_memory_request_upload_page_ranges_after_coalesce_no_active);
   std::string shared_memory_request_upload_bytes =
       format_shared_memory_request_counts(
           backend_telemetry_.shared_memory_request_upload_bytes);
+  std::string shared_memory_request_upload_bytes_active =
+      format_shared_memory_request_pairs(
+          backend_telemetry_.shared_memory_request_upload_bytes_active,
+          backend_telemetry_.shared_memory_request_upload_bytes_no_active);
   std::string shared_memory_request_failures =
       format_shared_memory_request_counts(
           backend_telemetry_.shared_memory_request_failures);
@@ -5569,6 +5656,88 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (shared_memory_planner_stop_reasons.empty()) {
     shared_memory_planner_stop_reasons = "none";
   }
+  std::string shared_memory_upload_range_calls =
+      format_shared_memory_request_triplets(
+          backend_telemetry_.shared_memory_upload_range_calls_total,
+          backend_telemetry_.shared_memory_upload_range_calls_active,
+          backend_telemetry_.shared_memory_upload_range_calls_no_active);
+  std::string shared_memory_upload_range_page_ranges =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_upload_range_page_ranges);
+  std::string shared_memory_upload_blit_requests =
+      format_shared_memory_request_triplets(
+          backend_telemetry_.shared_memory_upload_blit_requests_total,
+          backend_telemetry_.shared_memory_upload_blit_requests_active,
+          backend_telemetry_.shared_memory_upload_blit_requests_no_active);
+  std::string shared_memory_upload_blit_render_ends =
+      format_shared_memory_request_counts(
+          backend_telemetry_.shared_memory_upload_blit_render_encoder_ends);
+  auto format_shared_memory_direct_source_triplets =
+      [](const std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>& total,
+         const std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>&
+             active,
+         const std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>&
+             no_active) {
+        std::string formatted;
+        for (size_t i = 0; i < total.size(); ++i) {
+          if (!total[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted += fmt::format(
+              "{}={}/{}/{}", SharedMemoryUploadDirectSourceName(i), total[i],
+              active[i], no_active[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  auto format_shared_memory_direct_source_counts =
+      [](const std::array<uint64_t, kSharedMemoryUploadDirectSourceCount>&
+             values) {
+        std::string formatted;
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!values[i]) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted += fmt::format(
+              "{}={}", SharedMemoryUploadDirectSourceName(i), values[i]);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  std::string shared_memory_upload_unknown_direct_range_calls =
+      format_shared_memory_direct_source_triplets(
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_range_calls_total,
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_range_calls_active,
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_range_calls_no_active);
+  std::string shared_memory_upload_unknown_direct_range_page_ranges =
+      format_shared_memory_direct_source_counts(
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_range_page_ranges);
+  std::string shared_memory_upload_unknown_direct_blit_requests =
+      format_shared_memory_direct_source_triplets(
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_blit_requests_total,
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_blit_requests_active,
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_blit_requests_no_active);
+  std::string shared_memory_upload_unknown_direct_blit_render_ends =
+      format_shared_memory_direct_source_counts(
+          backend_telemetry_
+              .shared_memory_upload_unknown_direct_blit_render_encoder_ends);
   std::string vertex_fetch_warmer_stop_reasons;
   for (size_t i = 0;
        i < backend_telemetry_.vertex_fetch_warmer_stop_reasons.size(); ++i) {
@@ -5584,6 +5753,53 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   }
   if (vertex_fetch_warmer_stop_reasons.empty()) {
     vertex_fetch_warmer_stop_reasons = "none";
+  }
+  std::string vertex_fetch_warmer_unsupported_packet_types;
+  for (size_t i = 0;
+       i < backend_telemetry_.vertex_fetch_warmer_unsupported_packet_types.size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_.vertex_fetch_warmer_unsupported_packet_types[i];
+    if (!count) {
+      continue;
+    }
+    if (!vertex_fetch_warmer_unsupported_packet_types.empty()) {
+      vertex_fetch_warmer_unsupported_packet_types += ", ";
+    }
+    vertex_fetch_warmer_unsupported_packet_types +=
+        fmt::format("type{}={}", i, count);
+  }
+  if (backend_telemetry_.vertex_fetch_warmer_unsupported_no_packet) {
+    if (!vertex_fetch_warmer_unsupported_packet_types.empty()) {
+      vertex_fetch_warmer_unsupported_packet_types += ", ";
+    }
+    vertex_fetch_warmer_unsupported_packet_types += fmt::format(
+        "no_packet={}",
+        backend_telemetry_.vertex_fetch_warmer_unsupported_no_packet);
+  }
+  if (vertex_fetch_warmer_unsupported_packet_types.empty()) {
+    vertex_fetch_warmer_unsupported_packet_types = "none";
+  }
+  std::string vertex_fetch_warmer_unsupported_type3_opcodes;
+  for (size_t i = 0; i < backend_telemetry_
+                             .vertex_fetch_warmer_unsupported_type3_opcodes
+                             .size();
+       ++i) {
+    uint64_t count =
+        backend_telemetry_.vertex_fetch_warmer_unsupported_type3_opcodes[i];
+    if (!count) {
+      continue;
+    }
+    if (!vertex_fetch_warmer_unsupported_type3_opcodes.empty()) {
+      vertex_fetch_warmer_unsupported_type3_opcodes += ", ";
+    }
+    vertex_fetch_warmer_unsupported_type3_opcodes += fmt::format(
+        "0x{:02X}={}/{}", i, count,
+        backend_telemetry_
+            .vertex_fetch_warmer_unsupported_type3_payload_dwords[i]);
+  }
+  if (vertex_fetch_warmer_unsupported_type3_opcodes.empty()) {
+    vertex_fetch_warmer_unsupported_type3_opcodes = "none";
   }
 
   std::string pending_rejections;
@@ -5783,29 +5999,55 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       backend_telemetry_.end_encoder_no_active, end_reasons);
   XELOGI(
       "MetalTelemetry[{}]: transfer_request sources "
-      "total/active/no_active={{ {} }}",
-      reason, transfer_request_sources);
+      "total/active/no_active={{ {} }} render_end={{ {} }}",
+      reason, transfer_request_sources, transfer_request_render_end_sources);
   XELOGI(
       "MetalTelemetry[{}]: shared_memory requests "
       "total/active/no_active={{ {} }} input_ranges={{ {} }} invalid={{ {} }} "
-      "failures={{ {} }}",
+      "invalid active/no_active={{ {} }} failures={{ {} }}",
       reason, shared_memory_request_calls, shared_memory_request_input_ranges,
-      shared_memory_request_invalid_ranges, shared_memory_request_failures);
+      shared_memory_request_invalid_ranges,
+      shared_memory_request_invalid_ranges_active, shared_memory_request_failures);
   XELOGI(
       "MetalTelemetry[{}]: shared_memory uploads "
       "calls total/active/no_active={{ {} }} pages before/after={{ {} }} "
-      "bytes={{ {} }} planner_stops={{ {} }}",
+      "pages active before/after={{ {} }} pages no_active before/after={{ {} }} "
+      "bytes={{ {} }} bytes active/no_active={{ {} }} planner_stops={{ {} }}",
       reason, shared_memory_request_upload_calls, shared_memory_request_upload_pages,
-      shared_memory_request_upload_bytes, shared_memory_planner_stop_reasons);
+      shared_memory_request_upload_pages_active,
+      shared_memory_request_upload_pages_no_active,
+      shared_memory_request_upload_bytes,
+      shared_memory_request_upload_bytes_active,
+      shared_memory_planner_stop_reasons);
+  XELOGI(
+      "MetalTelemetry[{}]: shared_memory_upload_low_level "
+      "ranges total/active/no_active={{ {} }} input_page_ranges={{ {} }} "
+      "blit total/active/no_active={{ {} }} render_end={{ {} }} "
+      "unknown_direct ranges total/active/no_active={{ {} }} "
+      "input_page_ranges={{ {} }} blit total/active/no_active={{ {} }} "
+      "render_end={{ {} }}",
+      reason, shared_memory_upload_range_calls,
+      shared_memory_upload_range_page_ranges, shared_memory_upload_blit_requests,
+      shared_memory_upload_blit_render_ends,
+      shared_memory_upload_unknown_direct_range_calls,
+      shared_memory_upload_unknown_direct_range_page_ranges,
+      shared_memory_upload_unknown_direct_blit_requests,
+      shared_memory_upload_unknown_direct_blit_render_ends);
   XELOGI(
       "MetalTelemetry[{}]: vertex_fetch_warmer attempts/used/skipped={}/{}/{} "
-      "draws/ranges={}/{} stops={{ {} }}",
+      "draws/ranges/index_ranges={}/{}/{} stops={{ {} }}",
       reason, backend_telemetry_.vertex_fetch_warmer_attempts,
       backend_telemetry_.vertex_fetch_warmer_used,
       backend_telemetry_.vertex_fetch_warmer_skipped,
       backend_telemetry_.vertex_fetch_warmer_draws,
       backend_telemetry_.vertex_fetch_warmer_ranges,
+      backend_telemetry_.vertex_fetch_warmer_index_ranges,
       vertex_fetch_warmer_stop_reasons);
+  XELOGI(
+      "MetalTelemetry[{}]: vertex_fetch_warmer_unsupported "
+      "packet_types={{ {} }} type3_opcodes packets/payload_dwords={{ {} }}",
+      reason, vertex_fetch_warmer_unsupported_packet_types,
+      vertex_fetch_warmer_unsupported_type3_opcodes);
   XELOGI(
       "MetalTelemetry[{}]: descriptor requests/cache_hit/rebuild={}/{}/{} "
       "dirty_marks={} dirty_reasons={{ {} }} compat_checks={} "
@@ -6223,6 +6465,15 @@ bool MetalCommandProcessor::RequestSharedMemoryRange(
   return RequestSharedMemoryRanges(reason, &range, 1);
 }
 
+bool MetalCommandProcessor::RequestSharedMemoryRangeBeforeDrawPass(
+    SharedMemoryRequestReason reason, uint32_t start, uint32_t length) {
+  SharedMemory::Range range = {start, length};
+  if (current_render_encoder_ && AnySharedMemoryRangeInvalid(&range, 1)) {
+    EndRenderEncoder(RenderEncoderEndReason::kSharedMemoryUploadBeforeDrawPass);
+  }
+  return RequestSharedMemoryRanges(reason, &range, 1);
+}
+
 bool MetalCommandProcessor::RequestSharedMemoryRanges(
     SharedMemoryRequestReason reason, const SharedMemory::Range* ranges,
     uint32_t range_count) {
@@ -6249,10 +6500,23 @@ bool MetalCommandProcessor::RequestSharedMemoryRanges(
   }
 
   SharedMemory::RequestRangeStats stats;
+  SharedMemoryRequestReason previous_upload_reason =
+      current_shared_memory_upload_reason_;
+  current_shared_memory_upload_reason_ = reason;
   const bool success = shared_memory_->RequestRanges(ranges, range_count, &stats);
+  current_shared_memory_upload_reason_ = previous_upload_reason;
   if (reason_valid) {
     backend_telemetry_.shared_memory_request_invalid_input_ranges[reason_index] +=
         stats.invalid_input_ranges;
+    if (was_active) {
+      backend_telemetry_
+          .shared_memory_request_invalid_input_ranges_active[reason_index] +=
+          stats.invalid_input_ranges;
+    } else {
+      backend_telemetry_
+          .shared_memory_request_invalid_input_ranges_no_active[reason_index] +=
+          stats.invalid_input_ranges;
+    }
     backend_telemetry_
         .shared_memory_request_upload_page_ranges_before_coalesce[reason_index] +=
         stats.upload_page_ranges_before_coalesce;
@@ -6261,6 +6525,26 @@ bool MetalCommandProcessor::RequestSharedMemoryRanges(
         stats.upload_page_ranges_after_coalesce;
     backend_telemetry_.shared_memory_request_upload_bytes[reason_index] +=
         stats.upload_bytes;
+    if (was_active) {
+      backend_telemetry_
+          .shared_memory_request_upload_page_ranges_before_coalesce_active
+              [reason_index] += stats.upload_page_ranges_before_coalesce;
+      backend_telemetry_
+          .shared_memory_request_upload_page_ranges_after_coalesce_active
+              [reason_index] += stats.upload_page_ranges_after_coalesce;
+      backend_telemetry_.shared_memory_request_upload_bytes_active[reason_index] +=
+          stats.upload_bytes;
+    } else {
+      backend_telemetry_
+          .shared_memory_request_upload_page_ranges_before_coalesce_no_active
+              [reason_index] += stats.upload_page_ranges_before_coalesce;
+      backend_telemetry_
+          .shared_memory_request_upload_page_ranges_after_coalesce_no_active
+              [reason_index] += stats.upload_page_ranges_after_coalesce;
+      backend_telemetry_
+          .shared_memory_request_upload_bytes_no_active[reason_index] +=
+          stats.upload_bytes;
+    }
     if (stats.upload_bytes) {
       ++backend_telemetry_.shared_memory_request_upload_calls_total[reason_index];
       if (was_active) {
@@ -6291,12 +6575,74 @@ bool MetalCommandProcessor::RequestSharedMemoryRanges(
   return success;
 }
 
+void MetalCommandProcessor::BeginTextureCacheBaseDirectSharedMemoryUpload() {
+  if (shared_memory_upload_direct_source_depth_++ == 0) {
+    previous_shared_memory_upload_direct_source_ =
+        current_shared_memory_upload_direct_source_;
+    current_shared_memory_upload_direct_source_ =
+        SharedMemoryUploadDirectSource::kTextureCacheBaseRequestTextureDataRange;
+  }
+}
+
+void MetalCommandProcessor::EndTextureCacheBaseDirectSharedMemoryUpload() {
+  if (!shared_memory_upload_direct_source_depth_) {
+    return;
+  }
+  if (--shared_memory_upload_direct_source_depth_ == 0) {
+    current_shared_memory_upload_direct_source_ =
+        previous_shared_memory_upload_direct_source_;
+    previous_shared_memory_upload_direct_source_ =
+        SharedMemoryUploadDirectSource::kNone;
+  }
+}
+
 void MetalCommandProcessor::RecordSharedMemoryPlannerStop(
     SharedMemoryPlannerStopReason reason) {
   const size_t reason_index = static_cast<size_t>(reason);
   if (reason_index < kSharedMemoryPlannerStopReasonCount) {
     ++backend_telemetry_.shared_memory_planner_stop_reasons[reason_index];
   }
+}
+
+void MetalCommandProcessor::RecordSharedMemoryUploadRangeBatch(
+    uint32_t page_range_count) {
+  const size_t reason_index =
+      static_cast<size_t>(current_shared_memory_upload_reason_);
+  if (reason_index >= kSharedMemoryRequestReasonCount) {
+    return;
+  }
+  ++backend_telemetry_.shared_memory_upload_range_calls_total[reason_index];
+  const bool was_active = current_render_encoder_ != nullptr;
+  if (current_render_encoder_) {
+    ++backend_telemetry_.shared_memory_upload_range_calls_active[reason_index];
+  } else {
+    ++backend_telemetry_
+          .shared_memory_upload_range_calls_no_active[reason_index];
+  }
+  backend_telemetry_.shared_memory_upload_range_page_ranges[reason_index] +=
+      page_range_count;
+  if (current_shared_memory_upload_reason_ !=
+      SharedMemoryRequestReason::kUnknown) {
+    return;
+  }
+  const size_t source_index =
+      static_cast<size_t>(current_shared_memory_upload_direct_source_);
+  if (source_index >= kSharedMemoryUploadDirectSourceCount) {
+    return;
+  }
+  ++backend_telemetry_
+        .shared_memory_upload_unknown_direct_range_calls_total[source_index];
+  if (was_active) {
+    ++backend_telemetry_
+          .shared_memory_upload_unknown_direct_range_calls_active[source_index];
+  } else {
+    ++backend_telemetry_
+          .shared_memory_upload_unknown_direct_range_calls_no_active
+              [source_index];
+  }
+  backend_telemetry_
+      .shared_memory_upload_unknown_direct_range_page_ranges[source_index] +=
+      page_range_count;
 }
 
 bool MetalCommandProcessor::AnySharedMemoryRangeInvalid(
@@ -6331,6 +6677,23 @@ void MetalCommandProcessor::RecordVertexFetchWarmerStop(
   if (reason_index < kVertexFetchWarmerStopReasonCount) {
     ++backend_telemetry_.vertex_fetch_warmer_stop_reasons[reason_index];
   }
+}
+
+void MetalCommandProcessor::RecordVertexFetchWarmerUnsupportedPacket(
+    uint32_t packet, uint32_t payload_dword_count) {
+  const uint32_t packet_type = packet >> 30;
+  if (packet_type < backend_telemetry_
+                        .vertex_fetch_warmer_unsupported_packet_types.size()) {
+    ++backend_telemetry_
+          .vertex_fetch_warmer_unsupported_packet_types[packet_type];
+  }
+  if (packet_type != 3) {
+    return;
+  }
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  ++backend_telemetry_.vertex_fetch_warmer_unsupported_type3_opcodes[opcode];
+  backend_telemetry_.vertex_fetch_warmer_unsupported_type3_payload_dwords
+      [opcode] += payload_dword_count;
 }
 
 void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
@@ -6373,6 +6736,9 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
   uint64_t warm_bin_mask = bin_mask_;
   std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges> warm_ranges;
   uint32_t warm_range_count = 0;
+  std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>
+      warm_index_ranges;
+  uint32_t warm_index_range_count = 0;
   uint32_t warm_draw_count = 0;
   VertexFetchWarmerStopReason stop_reason =
       VertexFetchWarmerStopReason::kRingEnd;
@@ -6381,13 +6747,68 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     stop_reason = reason;
     return false;
   };
+  auto stop_unsupported_no_packet = [&]() {
+    ++backend_telemetry_.vertex_fetch_warmer_unsupported_no_packet;
+    return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+  };
+  auto mark_unsupported_packet = [&](uint32_t unsupported_packet,
+                                     uint32_t payload_dword_count) {
+    RecordVertexFetchWarmerUnsupportedPacket(unsupported_packet,
+                                             payload_dword_count);
+    stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+  };
+  auto stop_unsupported_packet = [&](uint32_t unsupported_packet,
+                                     uint32_t payload_dword_count) {
+    mark_unsupported_packet(unsupported_packet, payload_dword_count);
+    return false;
+  };
   auto has_dwords = [&](uint32_t dword_count) {
     return warm_reader.read_count() >= dword_count * sizeof(uint32_t);
+  };
+  auto append_invalid_range =
+      [&](std::array<SharedMemory::Range, kMetalVertexFetchWarmMaxRanges>&
+              ranges,
+          uint32_t& range_count, uint32_t start, uint32_t length) {
+        if (!length || shared_memory_->IsRangeValid(start, length)) {
+          return true;
+        }
+        if (range_count >= ranges.size()) {
+          return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
+        }
+        ranges[range_count++] = {start, length};
+        return true;
+      };
+  auto append_future_dma_index_range = [&]() {
+    reg::VGT_DRAW_INITIATOR vgt_draw_initiator =
+        warm_regs.Get<reg::VGT_DRAW_INITIATOR>();
+    if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA) {
+      return true;
+    }
+    reg::VGT_DMA_SIZE vgt_dma_size = warm_regs.Get<reg::VGT_DMA_SIZE>();
+    uint32_t guest_index_count =
+        std::min(vgt_draw_initiator.num_indices, vgt_dma_size.num_words);
+    if (!guest_index_count) {
+      return true;
+    }
+    uint32_t index_size_log2 =
+        vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 1 : 2;
+    uint32_t guest_index_base =
+        warm_regs[XE_GPU_REG_VGT_DMA_BASE] & ~uint32_t((1u << index_size_log2) - 1);
+    uint32_t guest_index_bytes = guest_index_count << index_size_log2;
+    if (guest_index_base > SharedMemory::kBufferSize ||
+        SharedMemory::kBufferSize - guest_index_base < guest_index_bytes) {
+      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+    }
+    return append_invalid_range(warm_index_ranges, warm_index_range_count,
+                                guest_index_base, guest_index_bytes);
   };
   auto append_future_draw_ranges = [&]() {
     if (warm_regs.Get<reg::RB_MODECONTROL>().edram_mode ==
         xenos::EdramMode::kCopy) {
       return stop_with(VertexFetchWarmerStopReason::kMemoryOrWaitPacket);
+    }
+    if (!append_future_dma_index_range()) {
+      return false;
     }
 
     std::array<SharedMemory::Range, kMaxVertexFetchSharedMemoryRanges>
@@ -6396,18 +6817,15 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     if (!CollectVertexFetchSharedMemoryRanges(
             warm_regs, vertex_shader, draw_ranges.data(),
             uint32_t(draw_ranges.size()), &draw_range_count, false)) {
-      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+      return stop_unsupported_no_packet();
     }
 
     for (uint32_t i = 0; i < draw_range_count; ++i) {
       const SharedMemory::Range& range = draw_ranges[i];
-      if (shared_memory_->IsRangeValid(range.start, range.length)) {
-        continue;
+      if (!append_invalid_range(warm_ranges, warm_range_count, range.start,
+                                range.length)) {
+        return false;
       }
-      if (warm_range_count >= warm_ranges.size()) {
-        return stop_with(VertexFetchWarmerStopReason::kMaxRanges);
-      }
-      warm_ranges[warm_range_count++] = range;
     }
 
     ++warm_draw_count;
@@ -6416,22 +6834,24 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
     }
     return true;
   };
-  auto parse_draw_packet = [&](uint32_t count_remaining) {
+  auto parse_draw_packet = [&](uint32_t draw_packet,
+                               uint32_t payload_dword_count,
+                               uint32_t count_remaining) {
     if (!count_remaining) {
-      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+      return stop_unsupported_packet(draw_packet, payload_dword_count);
     }
     reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
     vgt_draw_initiator.value = warm_reader.ReadAndSwap<uint32_t>();
     --count_remaining;
     if (!WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DRAW_INITIATOR,
                                   vgt_draw_initiator.value)) {
-      return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+      return stop_unsupported_packet(draw_packet, payload_dword_count);
     }
 
     switch (vgt_draw_initiator.source_select) {
       case xenos::SourceSelect::kDMA: {
         if (count_remaining < 2) {
-          return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+          return stop_unsupported_packet(draw_packet, payload_dword_count);
         }
         uint32_t vgt_dma_base = warm_reader.ReadAndSwap<uint32_t>();
         reg::VGT_DMA_SIZE vgt_dma_size;
@@ -6441,13 +6861,13 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
                                       vgt_dma_base) ||
             !WriteSpeculativeRegister(warm_regs, XE_GPU_REG_VGT_DMA_SIZE,
                                       vgt_dma_size.value)) {
-          return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+          return stop_unsupported_packet(draw_packet, payload_dword_count);
         }
       } break;
       case xenos::SourceSelect::kAutoIndex:
         break;
       default:
-        return stop_with(VertexFetchWarmerStopReason::kUnsupportedPacket);
+        return stop_unsupported_packet(draw_packet, payload_dword_count);
     }
 
     warm_reader.AdvanceRead(count_remaining * sizeof(uint32_t));
@@ -6478,9 +6898,13 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       }
       uint32_t base_index = packet & 0x7FFF;
       uint32_t write_one_reg = (packet >> 15) & 0x1;
-      if (write_one_reg || !WriteSpeculativeRegisterRangeFromRing(
-                               &warm_reader, warm_regs, base_index, count)) {
-        stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+      bool wrote = write_one_reg
+                       ? WriteSpeculativeOneRegisterFromRing(
+                             &warm_reader, warm_regs, base_index, count)
+                       : WriteSpeculativeRegisterRangeFromRing(
+                             &warm_reader, warm_regs, base_index, count);
+      if (!wrote) {
+        mark_unsupported_packet(packet, count);
         break;
       }
       continue;
@@ -6497,7 +6921,7 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
       uint32_t reg_data_2 = warm_reader.ReadAndSwap<uint32_t>();
       if (!WriteSpeculativeRegister(warm_regs, reg_index_1, reg_data_1) ||
           !WriteSpeculativeRegister(warm_regs, reg_index_2, reg_data_2)) {
-        stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+        mark_unsupported_packet(packet, 2);
         break;
       }
       continue;
@@ -6520,6 +6944,55 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
 
     switch (opcode) {
       case xenos::PM4_NOP:
+        warm_reader.AdvanceRead(count * sizeof(uint32_t));
+        break;
+      case xenos::PM4_SET_BIN_MASK_LO:
+      case xenos::PM4_SET_BIN_MASK_HI:
+      case xenos::PM4_SET_BIN_SELECT_LO:
+      case xenos::PM4_SET_BIN_SELECT_HI: {
+        if (count < 1) {
+          mark_unsupported_packet(packet, count);
+          goto finish_parse;
+        }
+        uint32_t value = warm_reader.ReadAndSwap<uint32_t>();
+        switch (opcode) {
+          case xenos::PM4_SET_BIN_MASK_LO:
+            warm_bin_mask = (warm_bin_mask & 0xFFFFFFFF00000000ull) | value;
+            break;
+          case xenos::PM4_SET_BIN_MASK_HI:
+            warm_bin_mask =
+                (warm_bin_mask & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+            break;
+          case xenos::PM4_SET_BIN_SELECT_LO:
+            warm_bin_select =
+                (warm_bin_select & 0xFFFFFFFF00000000ull) | value;
+            break;
+          case xenos::PM4_SET_BIN_SELECT_HI:
+            warm_bin_select =
+                (warm_bin_select & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+            break;
+        }
+        warm_reader.AdvanceRead((count - 1) * sizeof(uint32_t));
+      } break;
+      case xenos::PM4_SET_BIN_MASK:
+      case xenos::PM4_SET_BIN_SELECT: {
+        if (count < 2) {
+          mark_unsupported_packet(packet, count);
+          goto finish_parse;
+        }
+        uint64_t val_hi = warm_reader.ReadAndSwap<uint32_t>();
+        uint64_t val_lo = warm_reader.ReadAndSwap<uint32_t>();
+        if (opcode == xenos::PM4_SET_BIN_MASK) {
+          warm_bin_mask = (val_hi << 32) | val_lo;
+        } else {
+          warm_bin_select = (val_hi << 32) | val_lo;
+        }
+        warm_reader.AdvanceRead((count - 2) * sizeof(uint32_t));
+      } break;
+      case xenos::PM4_SET_BIN_BASE_OFFSET:
+      case xenos::PM4_CONTEXT_UPDATE:
+        // These packets do not affect register state or guest-memory read
+        // residency, so the bounded preflight can safely step over them.
         warm_reader.AdvanceRead(count * sizeof(uint32_t));
         break;
       case xenos::PM4_SET_CONSTANT: {
@@ -6545,12 +7018,12 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
             base = 0x2000 + index;
             break;
           default:
-            stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+            mark_unsupported_packet(packet, count);
             goto finish_parse;
         }
         if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
                                                    base, countm1)) {
-          stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+          mark_unsupported_packet(packet, count);
           goto finish_parse;
         }
       } break;
@@ -6561,18 +7034,18 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         uint32_t countm1 = count - 1;
         if (!WriteSpeculativeRegisterRangeFromRing(&warm_reader, warm_regs,
                                                    index, countm1)) {
-          stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+          mark_unsupported_packet(packet, count);
           goto finish_parse;
         }
       } break;
       case xenos::PM4_DRAW_INDX:
         warm_reader.AdvanceRead(sizeof(uint32_t));
-        if (!parse_draw_packet(count - 1)) {
+        if (!parse_draw_packet(packet, count, count - 1)) {
           goto finish_parse;
         }
         break;
       case xenos::PM4_DRAW_INDX_2:
-        if (!parse_draw_packet(count)) {
+        if (!parse_draw_packet(packet, count, count)) {
           goto finish_parse;
         }
         break;
@@ -6603,33 +7076,46 @@ void MetalCommandProcessor::WarmVertexFetchSharedMemoryBeforeRenderPass(
         stop_reason = VertexFetchWarmerStopReason::kMemoryOrWaitPacket;
         goto finish_parse;
       default:
-        stop_reason = VertexFetchWarmerStopReason::kUnsupportedPacket;
+        mark_unsupported_packet(packet, count);
         goto finish_parse;
     }
   }
 
 finish_parse:
-  if (!warm_range_count) {
+  if (!warm_range_count && !warm_index_range_count) {
     finish(stop_reason, false);
     return;
   }
-  if (!RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
+  if (warm_range_count &&
+      !RequestSharedMemoryRanges(SharedMemoryRequestReason::kVertexFetch,
                                  warm_ranges.data(), warm_range_count)) {
     finish(VertexFetchWarmerStopReason::kRequestFailed, false);
     return;
   }
+  if (warm_index_range_count &&
+      !RequestSharedMemoryRanges(SharedMemoryRequestReason::kGuestIndex,
+                                 warm_index_ranges.data(),
+                                 warm_index_range_count)) {
+    finish(VertexFetchWarmerStopReason::kRequestFailed, false);
+    return;
+  }
   backend_telemetry_.vertex_fetch_warmer_draws += warm_draw_count;
-  backend_telemetry_.vertex_fetch_warmer_ranges += warm_range_count;
+  backend_telemetry_.vertex_fetch_warmer_ranges +=
+      warm_range_count + warm_index_range_count;
+  backend_telemetry_.vertex_fetch_warmer_index_ranges +=
+      warm_index_range_count;
   finish(stop_reason, true);
 }
 
 MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
     TransferRequestSource source) {
   const size_t source_index = static_cast<size_t>(source);
+  const bool ends_render_encoder = current_render_encoder_ != nullptr;
   if (source_index < kTransferRequestSourceCount) {
     ++backend_telemetry_.transfer_request_sources_total[source_index];
-    if (current_render_encoder_) {
+    if (ends_render_encoder) {
       ++backend_telemetry_.transfer_request_sources_active[source_index];
+      ++backend_telemetry_.transfer_request_render_encoder_ends[source_index];
     } else {
       ++backend_telemetry_.transfer_request_sources_no_active[source_index];
     }
@@ -6647,6 +7133,50 @@ MTL::BlitCommandEncoder*
 MetalCommandProcessor::GetSharedMemoryUploadBlitEncoder() {
   if (shared_memory_upload_blit_encoder_) {
     return shared_memory_upload_blit_encoder_;
+  }
+
+  // TODO(xenios-jp): If shared_memory_upload_low_level reports
+  // render_end={ unknown=N }, a shared-memory upload reached this low-level
+  // blit path without RequestSharedMemoryRange(s) setting a CP reason. The
+  // current Metal-facing direct escape hatches are the texture-cache direct
+  // shared_memory().RequestRange(s) fallbacks; route or hard-fail those through
+  // MetalCommandProcessor before broadening the residency warmer.
+  const size_t reason_index =
+      static_cast<size_t>(current_shared_memory_upload_reason_);
+  if (reason_index < kSharedMemoryRequestReasonCount) {
+    ++backend_telemetry_.shared_memory_upload_blit_requests_total[reason_index];
+    const bool was_active = current_render_encoder_ != nullptr;
+    if (current_render_encoder_) {
+      ++backend_telemetry_
+            .shared_memory_upload_blit_requests_active[reason_index];
+      ++backend_telemetry_
+            .shared_memory_upload_blit_render_encoder_ends[reason_index];
+    } else {
+      ++backend_telemetry_
+            .shared_memory_upload_blit_requests_no_active[reason_index];
+    }
+    if (current_shared_memory_upload_reason_ ==
+        SharedMemoryRequestReason::kUnknown) {
+      const size_t source_index =
+          static_cast<size_t>(current_shared_memory_upload_direct_source_);
+      if (source_index < kSharedMemoryUploadDirectSourceCount) {
+        ++backend_telemetry_
+              .shared_memory_upload_unknown_direct_blit_requests_total
+                  [source_index];
+        if (was_active) {
+          ++backend_telemetry_
+                .shared_memory_upload_unknown_direct_blit_requests_active
+                    [source_index];
+          ++backend_telemetry_
+                .shared_memory_upload_unknown_direct_blit_render_encoder_ends
+                    [source_index];
+        } else {
+          ++backend_telemetry_
+                .shared_memory_upload_unknown_direct_blit_requests_no_active
+                    [source_index];
+        }
+      }
+    }
   }
 
   MTL::CommandBuffer* command_buffer =

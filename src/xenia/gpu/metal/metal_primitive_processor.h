@@ -49,6 +49,9 @@ class MetalPrimitiveProcessor : public PrimitiveProcessor {
       xenos::IndexFormat format, uint32_t index_count, bool coalign_for_simd,
       uint32_t coalignment_original_address,
       size_t& backend_handle_out) override;
+  bool RequestGuestIndexSharedMemoryRange(
+      uint32_t guest_index_base, uint32_t guest_index_buffer_needed_bytes,
+      ProcessedIndexBufferType index_buffer_type) override;
 
  private:
   MetalCommandProcessor& command_processor_;

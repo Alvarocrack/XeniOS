@@ -81,6 +81,19 @@ void MetalPrimitiveProcessor::EndFrame() {
   converted_index_buffers_.clear();
 }
 
+bool MetalPrimitiveProcessor::RequestGuestIndexSharedMemoryRange(
+    uint32_t guest_index_base, uint32_t guest_index_buffer_needed_bytes,
+    ProcessedIndexBufferType index_buffer_type) {
+  MetalCommandProcessor::SharedMemoryRequestReason reason =
+      MetalCommandProcessor::SharedMemoryRequestReason::kGuestIndex;
+  if (index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
+    reason = MetalCommandProcessor::SharedMemoryRequestReason::
+        kShaderPrimitiveIndex;
+  }
+  return command_processor_.RequestSharedMemoryRangeBeforeDrawPass(
+      reason, guest_index_base, guest_index_buffer_needed_bytes);
+}
+
 MTL::Buffer* MetalPrimitiveProcessor::GetConvertedIndexBuffer(
     size_t handle, uint64_t& offset_bytes_out) const {
   if (handle >= converted_index_buffers_.size()) {
