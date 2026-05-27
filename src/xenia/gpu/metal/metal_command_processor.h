@@ -517,6 +517,12 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t render_run_planner_miss_active_smem_upload = 0;
     uint64_t render_run_planner_miss_active_texture_upload = 0;
     uint64_t render_run_planner_miss_active_guest_index_copy = 0;
+    std::array<uint64_t, kRenderRunPlannerStopReasonCount>
+        render_run_planner_miss_active_smem_upload_by_stop = {};
+    std::array<uint64_t, kRenderRunPlannerStopReasonCount>
+        render_run_planner_miss_active_texture_upload_by_stop = {};
+    std::array<uint64_t, kRenderRunPlannerStopReasonCount>
+        render_run_planner_miss_active_guest_index_copy_by_stop = {};
     uint64_t render_run_planner_resolve_tile_attempt = 0;
     uint64_t render_run_planner_resolve_tile_success = 0;
     uint64_t render_run_planner_store_dontcare_eligible = 0;
@@ -802,6 +808,8 @@ class MetalCommandProcessor final : public CommandProcessor {
                                    uint32_t range_count) const;
   bool HasActiveSharedMemoryWritePending() const;
   void RecordRenderRunPlannerStop(RenderRunPlannerStopReason reason);
+  void RecordRenderRunPlannerMissActiveByStop(
+      std::array<uint64_t, kRenderRunPlannerStopReasonCount>& counters);
   void RecordVertexFetchWarmerStop(VertexFetchWarmerStopReason reason);
   void RecordVertexFetchWarmerUnsupportedPacket(uint32_t packet,
                                                 uint32_t payload_dword_count);
@@ -930,6 +938,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_set<MTL::Heap*> render_encoder_heap_usage_set_;
   BackendTelemetryStats backend_telemetry_;
   uint64_t backend_telemetry_last_dump_swap_ = 0;
+  RenderRunPlannerStopReason last_render_run_planner_stop_reason_ =
+      RenderRunPlannerStopReason::kNoWork;
 
   // Shared memory for Xbox 360 memory access
   std::unique_ptr<MetalSharedMemory> shared_memory_;

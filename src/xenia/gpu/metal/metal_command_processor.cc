@@ -2740,6 +2740,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         // preflight/lookahead so compatible draw runs can keep the render
         // encoder open without reordering texture upload work.
         ++backend_telemetry_.render_run_planner_miss_active_texture_upload;
+        RecordRenderRunPlannerMissActiveByStop(
+            backend_telemetry_
+                .render_run_planner_miss_active_texture_upload_by_stop);
         EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
       }
     }
@@ -2890,6 +2893,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       // Fallback for paths that could not request textures in the main
       // pre-render-encoder block, such as missing draw-pass descriptors.
       ++backend_telemetry_.render_run_planner_miss_active_texture_upload;
+      RecordRenderRunPlannerMissActiveByStop(
+          backend_telemetry_
+              .render_run_planner_miss_active_texture_upload_by_stop);
       EndRenderEncoder(RenderEncoderEndReason::kTextureUploadBeforeDrawPass);
     }
     if (!EnsureCommandBuffer()) {
@@ -5960,6 +5966,37 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
   if (render_run_planner_stop_reasons.empty()) {
     render_run_planner_stop_reasons = "none";
   }
+  auto format_render_run_planner_stop_counts =
+      [](const std::array<uint64_t, kRenderRunPlannerStopReasonCount>& counts) {
+        std::string formatted;
+        for (size_t i = 0; i < counts.size(); ++i) {
+          uint64_t count = counts[i];
+          if (!count) {
+            continue;
+          }
+          if (!formatted.empty()) {
+            formatted += ", ";
+          }
+          formatted +=
+              fmt::format("{}={}", RenderRunPlannerStopReasonName(i), count);
+        }
+        if (formatted.empty()) {
+          formatted = "none";
+        }
+        return formatted;
+      };
+  std::string render_run_planner_miss_active_smem_by_stop =
+      format_render_run_planner_stop_counts(
+          backend_telemetry_
+              .render_run_planner_miss_active_smem_upload_by_stop);
+  std::string render_run_planner_miss_active_texture_by_stop =
+      format_render_run_planner_stop_counts(
+          backend_telemetry_
+              .render_run_planner_miss_active_texture_upload_by_stop);
+  std::string render_run_planner_miss_active_guest_index_by_stop =
+      format_render_run_planner_stop_counts(
+          backend_telemetry_
+              .render_run_planner_miss_active_guest_index_copy_by_stop);
   std::string render_run_planner_host_miss_sources;
   for (size_t i = 0;
        i < backend_telemetry_
@@ -6207,6 +6244,12 @@ void MetalCommandProcessor::MaybeDumpBackendTelemetry(const char* reason,
       planner_store_dontcare_eligible, planner_store_dontcare_proven,
       planner_store_dontcare_rejected,
       render_run_planner_stop_reasons);
+  XELOGI(
+      "MetalTelemetry[{}]: render_run_planner_miss_active_by_stop "
+      "smem={{ {} }} texture={{ {} }} guest_index={{ {} }}",
+      reason, render_run_planner_miss_active_smem_by_stop,
+      render_run_planner_miss_active_texture_by_stop,
+      render_run_planner_miss_active_guest_index_by_stop);
   XELOGI(
       "MetalTelemetry[{}]: render_encoder begin_calls={} reused={} created={} "
       "descriptor_restarts={} resource_resets={} desc_fail={} create_fail={} "
@@ -6608,6 +6651,8 @@ void MetalCommandProcessor::ResetBackendTelemetry() {
   backend_telemetry_last_dump_swap_ = backend_telemetry_.swaps;
   backend_telemetry_ = BackendTelemetryStats();
   backend_telemetry_.swaps = backend_telemetry_last_dump_swap_;
+  last_render_run_planner_stop_reason_ =
+      RenderRunPlannerStopReason::kNoWork;
 }
 
 void MetalCommandProcessor::EnsureCommandBufferAutoreleasePool() {
@@ -6807,6 +6852,9 @@ bool MetalCommandProcessor::RequestSharedMemoryRanges(
         ++backend_telemetry_
               .shared_memory_request_upload_calls_active[reason_index];
         ++backend_telemetry_.render_run_planner_miss_active_smem_upload;
+        RecordRenderRunPlannerMissActiveByStop(
+            backend_telemetry_
+                .render_run_planner_miss_active_smem_upload_by_stop);
       } else {
         ++backend_telemetry_
               .shared_memory_request_upload_calls_no_active[reason_index];
@@ -6931,10 +6979,21 @@ bool MetalCommandProcessor::HasActiveSharedMemoryWritePending() const {
 
 void MetalCommandProcessor::RecordRenderRunPlannerStop(
     RenderRunPlannerStopReason reason) {
+  last_render_run_planner_stop_reason_ = reason;
   const size_t reason_index = static_cast<size_t>(reason);
   if (reason_index < kRenderRunPlannerStopReasonCount) {
     ++backend_telemetry_.render_run_planner_stop_reasons[reason_index];
   }
+}
+
+void MetalCommandProcessor::RecordRenderRunPlannerMissActiveByStop(
+    std::array<uint64_t, kRenderRunPlannerStopReasonCount>& counters) {
+  size_t reason_index =
+      static_cast<size_t>(last_render_run_planner_stop_reason_);
+  if (reason_index >= counters.size()) {
+    reason_index = static_cast<size_t>(RenderRunPlannerStopReason::kNoWork);
+  }
+  ++counters[reason_index];
 }
 
 void MetalCommandProcessor::RecordVertexFetchWarmerStop(
@@ -7923,10 +7982,16 @@ MTL::CommandBuffer* MetalCommandProcessor::RequestTransferCommandBuffer(
                   [source_index];
         if (source == TransferRequestSource::kGuestIndexCopy) {
           ++backend_telemetry_.render_run_planner_miss_active_guest_index_copy;
+          RecordRenderRunPlannerMissActiveByStop(
+              backend_telemetry_
+                  .render_run_planner_miss_active_guest_index_copy_by_stop);
         } else if (source == TransferRequestSource::kSharedMemoryUpload &&
                    current_shared_memory_upload_reason_ ==
                        SharedMemoryRequestReason::kUnknown) {
           ++backend_telemetry_.render_run_planner_miss_active_smem_upload;
+          RecordRenderRunPlannerMissActiveByStop(
+              backend_telemetry_
+                  .render_run_planner_miss_active_smem_upload_by_stop);
         }
       }
     } else {
